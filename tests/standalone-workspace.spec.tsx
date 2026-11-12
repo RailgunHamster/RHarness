@@ -269,3 +269,91 @@ it('expands Personal Assistant into full-screen chat-app mode with self/bot bubb
   expect(shell.getAttribute('data-fullscreen')).toBeNull()
   expect(document.body.style.overflow).toBe('')
 })
+
+it('renders inline ephemeral live status & streaming text bubbles in both Personal Assistant and Engineering Chat, then replaces them once settled', async () => {
+  let activePhase = true
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+    url.includes('panel/messages')
+      ? {
+          messages: [{ id: 'pm-1', sender: 'operator', text: '请帮我检查构建配置', at: '2026-11-08T09:00:00Z' }],
+          next: 1,
+          receipts: {},
+          topics: [{ conversation: 'main', title: '构建检查', messageCount: 1, ticketCount: 1, status: 'running', updatedAt: '2026-11-08T09:00:00Z' }],
+          liveRuns: activePhase
+            ? [{
+                sessionId: 'worker-demo123456',
+                role: 'worker',
+                title: '构建检查',
+                ticketId: 'demo123456',
+                ticketTitle: '检查构建配置',
+                startedAt: '2026-11-08T09:00:01Z',
+                stepCount: 2,
+                phaseLabel: { zh: '📂 正在读取文件 (tsconfig.json)…', en: '📂 Reading file (tsconfig.json)…' },
+                streamingText: '已定位配置项，正在核对编译参数…',
+              }]
+            : [],
+        }
+      : url.includes('assistant/messages')
+        ? {
+            messages: activePhase
+              ? [{ id: 'am-1', sender: 'operator', text: '帮我查一下最近的笔记', at: '2026-11-08T09:00:00Z' }]
+              : [
+                  { id: 'am-1', sender: 'operator', text: '帮我查一下最近的笔记', at: '2026-11-08T09:00:00Z' },
+                  { id: 'am-2', sender: 'claw-assistant', bot: true, text: '已为您查到笔记全文如下。', at: '2026-11-08T09:00:05Z' },
+                ],
+            liveRun: activePhase
+              ? {
+                  sessionId: 'claw-assistant-main',
+                  role: 'assistant',
+                  title: 'Claw 个人助理',
+                  startedAt: '2026-11-08T09:00:01Z',
+                  stepCount: 2,
+                  phaseLabel: { zh: '🔍 正在检索思源笔记 (最近笔记)…', en: '🔍 Searching SiYuan notes…' },
+                  streamingText: '正在为您整理检索结果…',
+                }
+              : null,
+          }
+        : {
+            sessions: [{ id: 'claw-assistant-main', title: 'Claw', status: activePhase ? 'running' : 'idle', model: { provider: 'stepfun', model: 'step-3.7-flash' } }],
+            assistantMessages: activePhase
+              ? [{ id: 'am-1', sender: 'operator', text: '帮我查一下最近的笔记', at: '2026-11-08T09:00:00Z' }]
+              : [
+                  { id: 'am-1', sender: 'operator', text: '帮我查一下最近的笔记', at: '2026-11-08T09:00:00Z' },
+                  { id: 'am-2', sender: 'claw-assistant', bot: true, text: '已为您查到笔记全文如下。', at: '2026-11-08T09:00:05Z' },
+                ],
+            assistantLiveRun: activePhase
+              ? {
+                  sessionId: 'claw-assistant-main',
+                  role: 'assistant',
+                  title: 'Claw 个人助理',
+                  startedAt: '2026-11-08T09:00:01Z',
+                  stepCount: 2,
+                  phaseLabel: { zh: '🔍 正在检索思源笔记 (最近笔记)…', en: '🔍 Searching SiYuan notes…' },
+                  streamingText: '正在为您整理检索结果…',
+                }
+              : null,
+          },
+  ), { status: 200, headers: { 'content-type': 'application/json' } })))
+
+  await act(async () => root.render(<StandaloneRoot />))
+
+  // 1. Engineering Chat shows the inline Worker ephemeral live bubble with tool status & streaming text
+  const workerBubble = container.querySelector<HTMLElement>('[data-testid="panel-live-bubble-worker-demo123456"]')!
+  expect(workerBubble).not.toBeNull()
+  expect(workerBubble.textContent).toContain('正在读取文件 (tsconfig.json)')
+  expect(workerBubble.textContent).toContain('已定位配置项，正在核对编译参数')
+
+  // 2. Switch to Personal Assistant -> shows the inline Assistant ephemeral live bubble
+  const assistantTab = container.querySelector<HTMLButtonElement>('[data-testid="view-tab-assistant"]')!
+  await act(async () => { assistantTab.click() })
+  const asstLiveBubble = container.querySelector<HTMLElement>('[data-testid="assistant-live-bubble"]')!
+  expect(asstLiveBubble).not.toBeNull()
+  expect(asstLiveBubble.textContent).toContain('正在检索思源笔记')
+  expect(asstLiveBubble.textContent).toContain('正在为您整理检索结果')
+
+  // 3. Once the turn completes (`liveRun: null` + final bot reply arrives), the ephemeral bubble disappears and final reply renders
+  activePhase = false
+  await act(async () => { await new Promise(r => setTimeout(r, 750)) })
+  expect(container.querySelector('[data-testid="assistant-live-bubble"]')).toBeNull()
+  expect(container.textContent).toContain('已为您查到笔记全文如下。')
+})

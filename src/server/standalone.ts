@@ -115,8 +115,10 @@ import {
   addFeishuMessageReaction,
   buildClawFeedPluginTools,
   buildPersonalSkillsPluginTools,
+  createFeishuStreamingCardSession,
   executePersonalSkillLocal,
   executePersonalSkillWithRemoteFallback,
+  formatAgentToolStatusLabel,
   getClawFeedSinkEndpoints,
   getFeishuBridgeRuntimeStatus,
   inspectClawFeedPluginRepo,
@@ -124,6 +126,7 @@ import {
   removeFeishuMessageReaction,
   sendFeishuDirectMessage,
   startNativeFeishuDmBridge,
+  type FeishuStreamingCardSession,
 } from '../app/personal-skills.ts'
 import {
   defaultLocalNode,
@@ -137,7 +140,7 @@ import {
 } from '../app/worker-nodes.ts'
 import { KV } from '../kv.ts'
 import { key, latestReport, threadKey, waitsForPerson, type Ticket } from '../core/index.ts'
-import type { PanelMessageReceipt, PanelTopicSummary, PipelineRow } from '../client/standalone-api.ts'
+import type { LiveSessionRunInfo, PanelMessageReceipt, PanelTopicSummary, PipelineRow } from '../client/standalone-api.ts'
 
 export interface StandaloneServerOptions {
   port?: number
@@ -1009,8 +1012,158 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     }
   }
 
+  const summarizeSessionLiveRun = (sessionId: string): LiveSessionRunInfo | undefined => {
+    const detail = host.getSessionDetail(sessionId)
+    if (!detail || detail.status !== 'running') return undefined
+
+    const role: LiveSessionRunInfo['role'] =
+      sessionId === ASSISTANT_SESSION_ID
+        ? 'assistant'
+        : sessionId.startsWith('worker-')
+          ? 'worker'
+          : 'eval'
+
+    const events = detail.events ?? []
+    let lastUserIdx = -1
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]!.type === 'user/message') {
+        lastUserIdx = i
+        break
+      }
+    }
+    const turnEvents = lastUserIdx >= 0 ? events.slice(lastUserIdx + 1) : events
+    const startedAt = (lastUserIdx >= 0 ? events[lastUserIdx]?.at : events[0]?.at) ?? new Date().toISOString()
+
+    let stepCount = 0
+    const pendingTools = new Map<string, { name: string; args?: unknown }>()
+    let latestToolCall: { name: string; args?: unknown; running: boolean } | undefined
+    let streamingText = ''
+    let sawToolAfterLastStream = false
+
+    for (const ev of turnEvents) {
+      const d = (ev.data ?? {}) as Record<string, unknown>
+      if (ev.type === 'step/start') {
+        stepCount++
+      } else if (ev.type === 'tool/call') {
+        const tName = String(d.tool ?? d.name ?? '').trim()
+        const callId = String(d.toolCallId ?? d.callId ?? `call-${stepCount}-${tName}`)
+        if (tName) {
+          pendingTools.set(callId, { name: tName, args: d.arguments })
+          latestToolCall = { name: tName, args: d.arguments, running: true }
+          sawToolAfterLastStream = true
+        }
+      } else if (ev.type === 'tool/result') {
+        const callId = String(d.toolCallId ?? d.callId ?? '')
+        if (callId && pendingTools.has(callId)) {
+          const finished = pendingTools.get(callId)!
+          pendingTools.delete(callId)
+          if (pendingTools.size === 0) {
+            latestToolCall = { name: finished.name, args: finished.args, running: false }
+          }
+        } else if (latestToolCall) {
+          latestToolCall = { ...latestToolCall, running: false }
+        }
+      } else if (ev.type === 'assistant/step') {
+        if (typeof d.text === 'string' && d.text.trim()) {
+          streamingText = d.text
+          sawToolAfterLastStream = false
+        }
+      }
+    }
+
+    const effectiveStep = Math.max(1, stepCount)
+    const activePending = [...pendingTools.values()].at(-1)
+    const toolForStatus = activePending
+      ? { ...activePending, running: true }
+      : latestToolCall
+
+    let phaseLabel: { zh: string; en: string }
+    let activeToolInfo: LiveSessionRunInfo['activeTool'] | undefined
+
+    if (toolForStatus && (toolForStatus.running || sawToolAfterLastStream || !streamingText)) {
+      const formatted = formatAgentToolStatusLabel(toolForStatus.name, toolForStatus.args)
+      activeToolInfo = {
+        name: toolForStatus.name,
+        ...(formatted.argSummary ? { argSummary: formatted.argSummary } : {}),
+        running: toolForStatus.running,
+      }
+      phaseLabel = toolForStatus.running
+        ? { zh: `${formatted.zh}…`, en: `${formatted.en}…` }
+        : { zh: '⏳ 已获取工具结果，正在整理回复…', en: '⏳ Tool finished, composing reply…' }
+    } else if (streamingText) {
+      phaseLabel = { zh: '✍️ 正在流式生成回复…', en: '✍️ Streaming reply…' }
+    } else if (role === 'eval') {
+      phaseLabel = { zh: '⚖️ Eval 正在评估请求与准入规则…', en: '⚖️ Eval is assessing request…' }
+    } else if (role === 'worker') {
+      phaseLabel = {
+        zh: `🛠️ Worker 正在分析与执行工单 (第 ${effectiveStep} 步)…`,
+        en: `🛠️ Worker is executing ticket (step ${effectiveStep})…`,
+      }
+    } else {
+      phaseLabel = { zh: '⏳ 正在思考…', en: '⏳ Thinking…' }
+    }
+
+    const ticketId = role === 'worker' ? sessionId.slice('worker-'.length) : undefined
+    const ticket = ticketId && runtime ? runtime.store.tickets.get(ticketId) : undefined
+
+    return {
+      sessionId,
+      role,
+      title: detail.title,
+      ...(ticketId ? { ticketId } : {}),
+      ...(ticket?.title ? { ticketTitle: ticket.title } : {}),
+      ...(detail.model ? { model: detail.model } : {}),
+      startedAt,
+      stepCount: effectiveStep,
+      phaseLabel,
+      ...(activeToolInfo ? { activeTool: activeToolInfo } : {}),
+      ...(streamingText ? { streamingText } : {}),
+    }
+  }
+
+  const buildPanelConversationLiveRuns = (conversation: string): LiveSessionRunInfo[] => {
+    if (!runtime) return []
+    const runs: LiveSessionRunInfo[] = []
+    const tKey = `panel:${conversation}`
+    const th = runtime.store.threads.get(tKey)
+
+    const evalRun = summarizeSessionLiveRun(runtime.masterId)
+    if (evalRun && (th?.evaluating || (th?.pending?.length ?? 0) > 0 || conversation === 'main')) {
+      runs.push(evalRun)
+    }
+
+    const candidateTicketIds = new Set<string>(th?.subscriptions ?? [])
+    for (const tk of runtime.store.tickets.open()) {
+      const origTr = runtime.store.triggers.get(tk.origin.triggerId)
+      if (origTr?.threads[0] && threadKey(origTr.threads[0]) === tKey) {
+        candidateTicketIds.add(tk.id)
+      }
+    }
+    for (const tid of candidateTicketIds) {
+      const workerRun = summarizeSessionLiveRun(`worker-${tid}`)
+      if (workerRun) runs.push(workerRun)
+    }
+    return runs
+  }
+
   const enrichAssistantMessage = (m: AssistantStoredMessage): AssistantStoredMessage => {
-    const withHandoff = m.handoff ? { ...m, handoff: resolveHandoffStatus(runtime, m.handoff) } : m
+    let withHandoff = m
+    if (m.handoff) {
+      const resolvedHandoff = resolveHandoffStatus(runtime, m.handoff)
+      const liveRun =
+        resolvedHandoff.state === 'evaluating'
+          ? summarizeSessionLiveRun(runtime.masterId)
+          : resolvedHandoff.ticketState === 'running' && resolvedHandoff.ticketId
+            ? summarizeSessionLiveRun(`worker-${resolvedHandoff.ticketId}`)
+            : undefined
+      withHandoff = {
+        ...m,
+        handoff: {
+          ...resolvedHandoff,
+          ...(liveRun ? { liveRun } : {}),
+        } as typeof resolvedHandoff,
+      }
+    }
     if (withHandoff.bot && (!withHandoff.replyMeta || (withHandoff.replyMeta.durationMs ?? 0) > 300_000)) {
       const computed = buildAssistantReplyMeta(withHandoff.replyMeta?.turn, undefined, withHandoff.text)
       const updated = { ...withHandoff, replyMeta: computed }
@@ -1026,7 +1179,109 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     return withHandoff
   }
 
-  const pendingFeishuDmQueue: { messageId: string; reactionId?: string }[] = []
+  interface PendingFeishuDmTurn {
+    messageId: string
+    assistantMsgId: string
+    reactionId?: string
+    streamCard: FeishuStreamingCardSession
+  }
+  const pendingFeishuDmQueue: PendingFeishuDmTurn[] = []
+  const trackedFeishuHandoffTriggers = new Set<string>()
+
+  const startFeishuEngineeringHandoffTracker = (
+    initialHandoff: ReturnType<typeof resolveHandoffStatus>,
+  ) => {
+    if (!initialHandoff?.triggerId || trackedFeishuHandoffTriggers.has(initialHandoff.triggerId)) return
+    if (!loadStandaloneFeishuCredentials()) return
+    trackedFeishuHandoffTriggers.add(initialHandoff.triggerId)
+
+    void (async () => {
+      const engCard = await createFeishuStreamingCardSession({
+        headerTitle: '🛠️ 工程管线实时追踪 (Eval → Worker)',
+        headerTemplate: 'indigo',
+        initialText: `⚖️ **Eval 正在研判准入与路由…**\n> 摘要：${initialHandoff.summary || initialHandoff.originalText.slice(0, 80)}`,
+        debounceMs: 350,
+      })
+
+      const startedMs = Date.now()
+      const maxTrackMs = 9 * 60 * 1000 // Close cleanly before Feishu's 10-minute streaming timeout
+
+      const pollLoop = async () => {
+        while (!runtime.lifetime.aborted && Date.now() - startedMs < maxTrackMs) {
+          const current = resolveHandoffStatus(runtime, initialHandoff)
+          const shortId = current.ticketId ? `#${current.ticketId.slice(0, 6)}` : ''
+
+          if (current.state === 'rejected') {
+            await engCard.finish(
+              `✕ **工程评估已拒收**\n\n**拒收原因**：${current.refusalReason ?? '该请求无需创建工程代码工单。'}`,
+            )
+            return
+          }
+
+          if (current.attentionQuestion && current.ticketId) {
+            await engCard.finish(
+              `⚠️ **工程工单 ${shortId} 待您拍板**\n**${current.ticketTitle ?? ''}**\n\n${current.attentionQuestion}`,
+            )
+            return
+          }
+
+          if (
+            current.state === 'accepted' &&
+            (current.ticketState === 'completed' || current.ticketState === 'failed' || current.ticketState === 'stopped')
+          ) {
+            const icon = current.ticketState === 'completed' ? '✅ **工程工单已完成交付**' : `📌 **工程工单已结束 (${current.ticketState})**`
+            await engCard.finish(
+              `${icon} ${shortId}\n**${current.ticketTitle ?? ''}**${current.nodeName ? ` · 节点 \`${current.nodeName}\`` : ''}\n\n${current.reportSummary ?? '工单处理已结束。'}`,
+            )
+            return
+          }
+
+          if (current.state === 'evaluating') {
+            const evalLive = summarizeSessionLiveRun(runtime.masterId)
+            engCard.update(
+              [
+                `⚖️ **Eval 正在评估工程请求…**`,
+                `> ${evalLive?.phaseLabel.zh ?? '正在读取上下文与核对准入策略…'}`,
+                initialHandoff.summary ? `\n**需求摘要**：${initialHandoff.summary}` : '',
+              ]
+                .filter(Boolean)
+                .join('\n'),
+            )
+          } else if (current.state === 'accepted' && current.ticketId) {
+            const workerLive = summarizeSessionLiveRun(`worker-${current.ticketId}`)
+            if (current.ticketState === 'waiting' && !workerLive && current.reportSummary) {
+              await engCard.finish(
+                `💬 **工程工单 ${shortId} 阶段汇报**\n**${current.ticketTitle ?? ''}**\n\n${current.reportSummary}`,
+              )
+              return
+            }
+            const lines = [
+              `🛠️ **工程工单 ${shortId} 正在执行**：${current.ticketTitle ?? ''}${current.nodeName ? ` (\`${current.nodeName}\`)` : ''}`,
+              `> ${workerLive ? `${workerLive.phaseLabel.zh} · 第 ${workerLive.stepCount} 步` : '⏳ 正在准备独立 Git Worktree 执行环境…'}`,
+            ]
+            if (workerLive?.streamingText) {
+              lines.push('', workerLive.streamingText.slice(-1400))
+            }
+            engCard.update(lines.join('\n'))
+          }
+
+          await new Promise(r => setTimeout(r, 1200))
+        }
+
+        const latest = resolveHandoffStatus(runtime, initialHandoff)
+        const shortId = latest.ticketId ? `#${latest.ticketId.slice(0, 6)}` : ''
+        await engCard.finish(
+          `⏳ **工程工单 ${shortId} 仍在后台持续运行中**\n**${latest.ticketTitle ?? latest.summary}**\n\n可在 RHarness 网页工作台实时查看后续完整进展。`,
+        )
+      }
+
+      try {
+        await pollLoop()
+      } catch {
+        await engCard.abort()
+      }
+    })()
+  }
 
   const broadcastAssistantStateToPeers = async (mode: 'merge' | 'replace' = 'merge'): Promise<void> => {
     if (!runtime) return
@@ -1079,39 +1334,79 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     )
   }
 
-  host.ctx.on('session/event' as never, ((session: { id: string }, event: { type: string; data?: { turn?: number; model?: { provider: string; model: string; reasoningEffort?: string }; tool?: string; name?: string; message?: { content?: { type: string; text?: string }[] } } }) => {
+  host.ctx.on('session/event' as never, ((session: { id: string }, event: { type: string; data?: { turn?: number; model?: { provider: string; model: string; reasoningEffort?: string }; tool?: string; name?: string; arguments?: unknown; output?: unknown; text?: string; streaming?: boolean; message?: { content?: { type: string; text?: string }[] } } }) => {
     if (event.type === 'tool/result' && (event.data?.tool === 'orchestrator_report' || event.data?.name === 'orchestrator_report')) {
       tryAutoMergeTicket(session.id)
     }
-    if (session.id === ASSISTANT_SESSION_ID && event.type === 'assistant/message' && runtime) {
-      const text = (event.data?.message?.content ?? [])
-        .map(part => (part.type === 'text' && typeof part.text === 'string' ? part.text : ''))
-        .join('')
-        .trim()
-      if (text) {
-        const list = runtime.store.get(KV.assistant.messages) ?? []
-        const replyMeta = buildAssistantReplyMeta(event.data?.turn, event.data?.model, text)
-        list.push({
-          id: `asst-reply-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          sender: 'claw-assistant',
-          bot: true,
-          text,
-          at: new Date().toISOString(),
-          replyMeta,
-        })
-        runtime.store.set(KV.assistant.messages, list)
-        void broadcastAssistantStateToPeers('merge')
-        const pendingFeishu = pendingFeishuDmQueue.shift()
-        if (pendingFeishu) {
-          void (async () => {
-            try {
-              await sendFeishuDirectMessage(text)
-            } finally {
-              if (pendingFeishu.reactionId) {
-                await removeFeishuMessageReaction(pendingFeishu.messageId, pendingFeishu.reactionId)
+    if (session.id === ASSISTANT_SESSION_ID && runtime) {
+      const activeFeishu = pendingFeishuDmQueue[0]
+      if (activeFeishu) {
+        if (event.type === 'tool/call') {
+          const toolName = String(event.data?.tool ?? event.data?.name ?? '').trim()
+          if (toolName) {
+            const label = formatAgentToolStatusLabel(toolName, event.data?.arguments)
+            activeFeishu.streamCard.update(`> ${label.zh}…`)
+          }
+        } else if (
+          event.type === 'tool/result' &&
+          (event.data?.tool === 'assistant_forward_to_engineering' || event.data?.name === 'assistant_forward_to_engineering')
+        ) {
+          const outObj = (event.data?.output ?? {}) as { handoff?: ReturnType<typeof resolveHandoffStatus> }
+          if (outObj.handoff) {
+            startFeishuEngineeringHandoffTracker(outObj.handoff)
+          }
+        } else if (event.type === 'assistant/step' && typeof event.data?.text === 'string' && event.data.text.trim()) {
+          activeFeishu.streamCard.update(event.data.text)
+        } else if (event.type === 'turn/error') {
+          const failedTurn = pendingFeishuDmQueue.shift()
+          if (failedTurn) {
+            void (async () => {
+              try {
+                await failedTurn.streamCard.abort('⚠️ **处理过程中遇到异常，请稍后重试。**')
+              } finally {
+                if (failedTurn.reactionId) {
+                  await removeFeishuMessageReaction(failedTurn.messageId, failedTurn.reactionId)
+                }
               }
+            })()
+          }
+        }
+      }
+
+      if (event.type === 'assistant/message') {
+        const text = (event.data?.message?.content ?? [])
+          .map(part => (part.type === 'text' && typeof part.text === 'string' ? part.text : ''))
+          .join('')
+          .trim()
+        if (text) {
+          const list = runtime.store.get(KV.assistant.messages) ?? []
+          const replyMeta = buildAssistantReplyMeta(event.data?.turn, event.data?.model, text)
+          list.push({
+            id: `asst-reply-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            sender: 'claw-assistant',
+            bot: true,
+            text,
+            at: new Date().toISOString(),
+            replyMeta,
+          })
+          runtime.store.set(KV.assistant.messages, list)
+          void broadcastAssistantStateToPeers('merge')
+          const pendingFeishu = pendingFeishuDmQueue.shift()
+          if (pendingFeishu) {
+            const linkedUserMsg = list.find(m => m.id === pendingFeishu.assistantMsgId)
+            if (linkedUserMsg?.handoff) {
+              startFeishuEngineeringHandoffTracker(resolveHandoffStatus(runtime, linkedUserMsg.handoff))
             }
-          })()
+            void (async () => {
+              try {
+                await pendingFeishu.streamCard.finish(text)
+              } finally {
+                if (pendingFeishu.reactionId) {
+                  await removeFeishuMessageReaction(pendingFeishu.messageId, pendingFeishu.reactionId)
+                }
+              }
+            })()
+          }
         }
       }
     }
@@ -1126,6 +1421,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       setTimeout(() => {
         while (pendingFeishuDmQueue.length > 0) {
           const item = pendingFeishuDmQueue.shift()!
+          void item.streamCard.abort()
           if (item.reactionId) {
             void removeFeishuMessageReaction(item.messageId, item.reactionId)
           }
@@ -1386,8 +1682,16 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         onOwnerMessage: async ({ messageId, text, createTimeMs, reactionId }) => {
           const parsedBtw = parseBtwSideQuestion(text)
           if (parsedBtw.isBtw && isPluginEnabled('dsh-self-improving')) {
-            const sideAnswer = await runEphemeralBtwSideQuestion(parsedBtw.question)
-            return `💡 **[/btw 旁路快问 · 不计入对话历史]**\n\n${sideAnswer}`
+            const btwCard = await createFeishuStreamingCardSession({
+              initialText: '💡 **[/btw 旁路快问] 正在思考…**',
+            })
+            try {
+              const sideAnswer = await runEphemeralBtwSideQuestion(parsedBtw.question)
+              await btwCard.finish(`💡 **[/btw 旁路快问 · 不计入对话历史]**\n\n${sideAnswer}`)
+            } finally {
+              if (reactionId) await removeFeishuMessageReaction(messageId, reactionId)
+            }
+            return undefined
           }
 
           const msgId = `asst-feishu-${messageId}`
@@ -1437,9 +1741,14 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             await sc.rename({ sessionId: ASSISTANT_SESSION_ID as never, title: 'Claw 个人助理' })
             const resolved = await sc.resolveAgent(ASSISTANT_SESSION_ID as never)
             if ('agent' in resolved && resolved.agent) {
+              const streamCard = await createFeishuStreamingCardSession({
+                initialText: '⏳ **正在思考…**',
+              })
               pendingFeishuDmQueue.push({
                 messageId,
+                assistantMsgId: msgId,
                 ...(reactionId ? { reactionId } : {}),
+                streamCard,
               })
               resolved.agent.followup({
                 id: msgId,
@@ -1607,7 +1916,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           return
         }
 
-        // Read the local panel conversation, including stored agent replies, message receipts, and topic summaries.
+        // Read the local panel conversation, including stored agent replies, message receipts, live runs, and topic summaries.
         if (req.method === 'GET' && sub === 'panel/messages') {
           const conversation = String(url.searchParams.get('conversation') ?? 'main').trim() || 'main'
           const after = Number(url.searchParams.get('after') ?? '0')
@@ -1616,7 +1925,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           const messages = await Promise.all(all.slice(after).map(async message => ({ ...message,
             ...(message.content ? { content: await panelWireContent(message.content) } : {}) })))
           const { receipts, topics } = buildPanelReceiptsAndTopics(runtime, conversation)
-          sendJson(res, 200, { conversation, messages, next: all.length, receipts, topics })
+          const liveRuns = buildPanelConversationLiveRuns(conversation)
+          sendJson(res, 200, { conversation, messages, next: all.length, receipts, topics, liveRuns })
           return
         }
 
@@ -1703,6 +2013,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             memoryBackups: listAndPurgeMemoryBackups(stateDir),
             plugins: pluginsList,
             assistantMessages,
+            assistantLiveRun: summarizeSessionLiveRun(ASSISTANT_SESSION_ID) ?? null,
             assistantChatBackups: listAndPurgeAssistantChatBackups(stateDir),
             assistantContextConfig: getAssistantContextConfig(),
             clawfeedItems: runtime.store.get(KV.clawfeed.items) ?? [],
@@ -1860,6 +2171,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           )
           sendJson(res, 200, {
             messages: refreshed,
+            liveRun: summarizeSessionLiveRun(ASSISTANT_SESSION_ID) ?? null,
             chatBackups: listAndPurgeAssistantChatBackups(stateDir),
             contextConfig: getAssistantContextConfig(),
           })

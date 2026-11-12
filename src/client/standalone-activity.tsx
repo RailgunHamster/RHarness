@@ -12,6 +12,7 @@ import {
   type ClawFeedItemInfo,
   type DeviceGroupSummary,
   type Lang,
+  type LiveSessionRunInfo,
   type MemoryBackupInfo,
   type MemoryEntryInfo,
   type ModelProfilesState,
@@ -260,6 +261,7 @@ export function LiveWorkspace({
     memoryBackups?: MemoryBackupInfo[]
     plugins?: PluginDescriptorInfo[]
     assistantMessages?: AssistantMessageInfo[]
+    assistantLiveRun?: LiveSessionRunInfo | null
     assistantChatBackups?: AssistantChatBackupInfo[]
     assistantContextConfig?: AssistantContextConfigInfo
     clawfeedItems?: ClawFeedItemInfo[]
@@ -321,6 +323,7 @@ export function LiveWorkspace({
           ...(result.memoryBackups ? { memoryBackups: result.memoryBackups } : {}),
           ...(result.plugins ? { plugins: result.plugins } : {}),
           ...(result.assistantMessages ? { assistantMessages: result.assistantMessages } : {}),
+          ...(result.assistantLiveRun !== undefined ? { assistantLiveRun: result.assistantLiveRun } : {}),
           ...(result.assistantChatBackups ? { assistantChatBackups: result.assistantChatBackups } : {}),
           ...(result.assistantContextConfig ? { assistantContextConfig: result.assistantContextConfig } : {}),
           ...(result.clawfeedItems ? { clawfeedItems: result.clawfeedItems } : {}),

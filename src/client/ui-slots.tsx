@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Button, Input, Modal, Tag } from './controls.tsx'
+import { Button, Input, Modal, StateDot, Tag } from './controls.tsx'
 import {
   MAX_PANEL_IMAGES,
   MAX_PANEL_IMAGE_BYTES,
@@ -17,6 +17,7 @@ import {
   type AssistantMessageInfo,
   type ClawFeedItemInfo,
   type Lang,
+  type LiveSessionRunInfo,
   type MemoryEntryInfo,
   type PendingUserQuestionInfo,
   type PluginDescriptorInfo,
@@ -294,9 +295,99 @@ export function PendingDecisionsPanel({
   )
 }
 
+/**
+ * Reusable inline ephemeral live chat bubble displayed directly inside the conversation stream
+ * for `Personal Assistant (Claw)`, `Engineering Eval`, and `Worker` while a turn is in progress.
+ * Automatically disappears as soon as the final durable reply settles into the message list.
+ */
+export function InlineLiveAgentBubble({
+  run,
+  fallbackRole = 'assistant',
+  fallbackModel,
+  startedAtFallback,
+  lang,
+  testId,
+  bubbleStyle = false,
+}: {
+  run?: LiveSessionRunInfo | null | undefined
+  fallbackRole?: 'assistant' | 'eval' | 'worker'
+  fallbackModel?: { provider: string; model: string; reasoningEffort?: string } | null | undefined
+  startedAtFallback?: number | undefined
+  lang: Lang
+  testId?: string | undefined
+  bubbleStyle?: boolean | undefined
+}) {
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 300)
+    return () => clearInterval(timer)
+  }, [])
+
+  const role = run?.role ?? fallbackRole
+  const model = run?.model ?? fallbackModel
+  const parsedStart = run?.startedAt ? Date.parse(run.startedAt) : NaN
+  const baseStart = Number.isFinite(parsedStart) ? parsedStart : (startedAtFallback ?? nowMs)
+  const elapsedSec = Math.max(0, (nowMs - baseStart) / 1000).toFixed(1)
+
+  const authorTitle =
+    role === 'eval'
+      ? (lang === 'zh' ? '⚖️ Eval 主控评估' : '⚖️ Eval')
+      : role === 'worker'
+        ? (lang === 'zh'
+            ? `🛠️ Worker ${run?.ticketId ? `#${run.ticketId.slice(0, 6)}` : ''}${run?.ticketTitle ? ` · ${run.ticketTitle}` : ''}`
+            : `🛠️ Worker ${run?.ticketId ? `#${run.ticketId.slice(0, 6)}` : ''}`)
+        : (lang === 'zh' ? '个人助理' : 'Assistant')
+
+  const phaseText = run
+    ? run.phaseLabel[lang]
+    : role === 'eval'
+      ? (lang === 'zh' ? '⚖️ Eval 正在评估请求与准入规则…' : '⚖️ Eval is assessing request…')
+      : role === 'worker'
+        ? (lang === 'zh' ? '🛠️ Worker 正在准备并执行工单…' : '🛠️ Worker is executing ticket…')
+        : (lang === 'zh' ? '⏳ 正在思考…' : '⏳ Thinking…')
+
+  return (
+    <article
+      className={bubbleStyle ? 'dt-panel-message dt-chat-bubble dt-live-ephemeral-bubble' : 'dt-panel-message dt-live-ephemeral-bubble'}
+      data-bot="true"
+      data-sender={bubbleStyle ? 'bot' : undefined}
+      data-testid={testId}
+      aria-live="polite"
+    >
+      <div className="dt-session-reply-head">
+        <div className="dt-msg-receipt-main">
+          <strong>{authorTitle}</strong>
+          {model && (
+            <Tag tone="info">
+              {model.provider} / {model.model}
+              {model.reasoningEffort ? ` · ${model.reasoningEffort}` : ''}
+            </Tag>
+          )}
+          {run && run.stepCount > 1 && (
+            <Tag tone="neutral">
+              {lang === 'zh' ? `第 ${run.stepCount} 步` : `Step ${run.stepCount}`}
+            </Tag>
+          )}
+        </div>
+        <div className="dt-msg-head-actions">
+          <span className="dt-mono dt-hint">{elapsedSec}s</span>
+        </div>
+      </div>
+
+      <div className="dt-live-status-bar">
+        <StateDot state="ongoing" />
+        <span>{phaseText}</span>
+      </div>
+
+      {run?.streamingText && <MarkdownLite text={run.streamingText} />}
+    </article>
+  )
+}
+
 export function PersonalAssistantSlotView(props: {
   lang: Lang
   messages: AssistantMessageInfo[]
+  liveRun?: LiveSessionRunInfo | null | undefined
   chatBackups?: AssistantChatBackupInfo[] | undefined
   memories: MemoryEntryInfo[]
   pendingQuestions?: PendingUserQuestionInfo[] | undefined
@@ -316,6 +407,7 @@ export function PersonalAssistantSlotView(props: {
   const {
     lang,
     messages,
+    liveRun,
     chatBackups = [],
     memories,
     pendingQuestions = [],
@@ -345,10 +437,43 @@ export function PersonalAssistantSlotView(props: {
   const [refusalInputFor, setRefusalInputFor] = useState<string | null>(null)
   const [refusalReasonDraft, setRefusalReasonDraft] = useState('该内容属于日常问答或备忘，无需创建代码工单。')
   const [ephemeralBtwCard, setEphemeralBtwCard] = useState<{ question: string; answer: string; at: string } | null>(null)
+  const [optimisticUserMsg, setOptimisticUserMsg] = useState<AssistantMessageInfo | null>(null)
+  const [pendingTurnSinceMs, setPendingTurnSinceMs] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const historyRef = useRef<HTMLDivElement>(null)
   const composerInputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Clear optimistic user bubble and pending turn tracker once the server message / bot reply arrives
+  useEffect(() => {
+    if (optimisticUserMsg) {
+      const matchedInServer = messages.some(
+        m => !m.bot && (m.id === optimisticUserMsg.id || (m.text === optimisticUserMsg.text && Date.parse(m.at) >= Date.parse(optimisticUserMsg.at) - 5000)),
+      )
+      if (matchedInServer) setOptimisticUserMsg(null)
+    }
+    if (pendingTurnSinceMs !== null) {
+      const botArrived = messages.some(m => m.bot && Date.parse(m.at) >= pendingTurnSinceMs - 1000)
+      if (botArrived) {
+        setPendingTurnSinceMs(null)
+      }
+    }
+  }, [messages, optimisticUserMsg, pendingTurnSinceMs])
+
+  // Fast poll while waiting for turn startup before `liveRun` is observed on parent state
+  useEffect(() => {
+    if (pendingTurnSinceMs === null) return
+    const timer = setInterval(() => {
+      void onRefresh()
+    }, 550)
+    const safety = setTimeout(() => {
+      setPendingTurnSinceMs(curr => (curr === pendingTurnSinceMs ? null : curr))
+    }, 90_000)
+    return () => {
+      clearInterval(timer)
+      clearTimeout(safety)
+    }
+  }, [pendingTurnSinceMs, onRefresh])
 
   useEffect(() => {
     if (!chatFullscreen) return
@@ -367,7 +492,8 @@ export function PersonalAssistantSlotView(props: {
     }
   }, [chatFullscreen])
 
-  const latestMsgKey = `${messages.length}:${messages.at(-1)?.id ?? ''}:${messages.at(-1)?.text.length ?? 0}`
+  const showAssistantLiveBubble = Boolean(liveRun || pendingTurnSinceMs !== null)
+  const latestMsgKey = `${messages.length}:${messages.at(-1)?.id ?? ''}:${messages.at(-1)?.text.length ?? 0}:${showAssistantLiveBubble}:${liveRun?.phaseLabel.zh ?? ''}:${liveRun?.streamingText?.length ?? 0}`
   useEffect(() => {
     if (!follow || !historyRef.current) return
     const el = historyRef.current
@@ -494,14 +620,35 @@ export function PersonalAssistantSlotView(props: {
     event?.preventDefault()
     const text = draft.trim()
     if ((!text && !images.length) || busy || readingImages) return
+    const isBtw = /^\/btw(?:\s+|$)/i.test(text)
+    const nowMs = Date.now()
+    const nowIso = new Date(nowMs).toISOString()
+    const content = [
+      ...(text ? [{ type: 'text' as const, text }] : []),
+      ...images.map(({ type, mediaType, data, name }) => ({ type, mediaType, data, name })),
+    ]
+    const prevDraft = draft
+    const prevImages = images
+
+    // 0ms optimistic UI: clear composer & show user bubble + live thinking indicator immediately
+    setDraft('')
+    setImages([])
+    setFollow(true)
+    if (!isBtw) {
+      setOptimisticUserMsg({
+        id: `optimistic-${nowMs}`,
+        sender: 'operator',
+        text,
+        content,
+        at: nowIso,
+      })
+    }
+    setPendingTurnSinceMs(nowMs)
     setBusy(true)
     setError(null)
     try {
-      const content = [
-        ...(text ? [{ type: 'text' as const, text }] : []),
-        ...images.map(({ type, mediaType, data, name }) => ({ type, mediaType, data, name })),
-      ]
       const res = await standaloneFetch<{
+        message?: AssistantMessageInfo
         ephemeralBtw?: boolean
         question?: string
         answer?: string
@@ -510,9 +657,11 @@ export function PersonalAssistantSlotView(props: {
         text,
         content,
       })
-      setDraft('')
-      setImages([])
+      if (res.message?.id && !isBtw) {
+        setOptimisticUserMsg(curr => (curr ? { ...curr, id: res.message!.id } : null))
+      }
       if (res.ephemeralBtw && res.answer) {
+        setPendingTurnSinceMs(null)
         setEphemeralBtwCard({
           question: res.question ?? text,
           answer: res.answer,
@@ -522,6 +671,10 @@ export function PersonalAssistantSlotView(props: {
         await onRefresh()
       }
     } catch (err) {
+      setOptimisticUserMsg(null)
+      setPendingTurnSinceMs(null)
+      setDraft(prevDraft)
+      setImages(prevImages)
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setBusy(false)
@@ -594,6 +747,10 @@ export function PersonalAssistantSlotView(props: {
 
   const pinnedMemories = memories.filter(m => m.pinned)
   const locked = busy || readingImages
+  const displayMessages =
+    optimisticUserMsg && !messages.some(m => m.id === optimisticUserMsg.id)
+      ? [...messages, optimisticUserMsg]
+      : messages
 
   return (
     <div className="dt-form" data-testid="personal-assistant-view">
@@ -853,24 +1010,24 @@ export function PersonalAssistantSlotView(props: {
             if (node) setFollow(node.scrollHeight - node.scrollTop - node.clientHeight < 60)
           }}
         >
-          {messages.length === 0 ? (
+          {displayMessages.length === 0 && !showAssistantLiveBubble ? (
             <p className="dt-hint">
               {lang === 'zh' ? '发送文字或图片开始与个人助理对话。' : 'Send text or images to chat with Personal Assistant.'}
             </p>
           ) : (
-            messages.map((msg, idx) => {
+            displayMessages.map((msg, idx) => {
               const isBot = Boolean(msg.bot)
               const handoff = msg.handoff
               const replyMeta = msg.replyMeta
               const replyModel = replyMeta?.model ?? (isBot ? activeAssistantModel : undefined)
               const isDetailOpen = Boolean(expandedDetailIds[msg.id])
               const resetAt = contextConfig?.contextResetAt
-              const prevMsg = idx > 0 ? messages[idx - 1] : undefined
+              const prevMsg = idx > 0 ? displayMessages[idx - 1] : undefined
               const showResetDividerBefore = Boolean(
                 resetAt && msg.at >= resetAt && (!prevMsg || prevMsg.at < resetAt),
               )
               const showResetDividerAfterLast = Boolean(
-                resetAt && idx === messages.length - 1 && msg.at < resetAt,
+                resetAt && idx === displayMessages.length - 1 && msg.at < resetAt,
               )
               const msgImages = (msg.content ?? []).filter(
                 (part): part is { type: 'image'; mediaType: string; data: string; name?: string } => part.type === 'image',
@@ -1101,6 +1258,24 @@ export function PersonalAssistantSlotView(props: {
                           </div>
                         )}
 
+                        {handoff.liveRun && (
+                          <div className="dt-live-status-bar" data-testid={`handoff-live-status-${msg.id}`}>
+                            <StateDot state="ongoing" />
+                            <span>
+                              {handoff.liveRun.phaseLabel[lang]}
+                              {handoff.liveRun.stepCount > 1
+                                ? (lang === 'zh' ? ` · 第 ${handoff.liveRun.stepCount} 步` : ` · Step ${handoff.liveRun.stepCount}`)
+                                : ''}
+                            </span>
+                          </div>
+                        )}
+
+                        {handoff.liveRun?.streamingText && (
+                          <div className="dt-hint" style={{ fontSize: 12.5 }}>
+                            <MarkdownLite text={handoff.liveRun.streamingText} />
+                          </div>
+                        )}
+
                         {handoff.reportSummary && !handoff.attentionQuestion && (
                           <div className="dt-hint" style={{ fontSize: 12 }}>
                             <MarkdownLite text={handoff.reportSummary} />
@@ -1161,6 +1336,17 @@ export function PersonalAssistantSlotView(props: {
                 </div>
               )
             })
+          )}
+          {showAssistantLiveBubble && (
+            <InlineLiveAgentBubble
+              run={liveRun}
+              fallbackRole="assistant"
+              fallbackModel={activeAssistantModel}
+              startedAtFallback={pendingTurnSinceMs ?? undefined}
+              lang={lang}
+              testId="assistant-live-bubble"
+              bubbleStyle
+            />
           )}
         </div>
         {/* 30-Day Protected Chat Backup & Recovery Vault (`assistant-chat-backups/`) */}

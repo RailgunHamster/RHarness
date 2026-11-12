@@ -32,6 +32,7 @@ import {
   type DayModeOverrideInfo,
   type DeviceGroupSummary,
   type Lang,
+  type LiveSessionRunInfo,
   type MemoryBackupInfo,
   type MemoryCategoryInfo,
   type MemoryEntryInfo,
@@ -2117,6 +2118,7 @@ export function StandaloneRoot() {
   const [memoryBackups, setMemoryBackups] = useState<MemoryBackupInfo[]>([])
   const [plugins, setPlugins] = useState<PluginDescriptorInfo[]>([])
   const [assistantMessages, setAssistantMessages] = useState<AssistantMessageInfo[]>([])
+  const [assistantLiveRun, setAssistantLiveRun] = useState<LiveSessionRunInfo | null>(null)
   const [assistantChatBackups, setAssistantChatBackups] = useState<AssistantChatBackupInfo[]>([])
   const [assistantContextConfig, setAssistantContextConfig] = useState<AssistantContextConfigInfo>()
   const [clawfeedItems, setClawfeedItems] = useState<ClawFeedItemInfo[]>([])
@@ -2134,6 +2136,7 @@ export function StandaloneRoot() {
     memoryBackups?: MemoryBackupInfo[]
     plugins?: PluginDescriptorInfo[]
     assistantMessages?: AssistantMessageInfo[]
+    assistantLiveRun?: LiveSessionRunInfo | null
     assistantChatBackups?: AssistantChatBackupInfo[]
     assistantContextConfig?: AssistantContextConfigInfo
     clawfeedItems?: ClawFeedItemInfo[]
@@ -2150,6 +2153,7 @@ export function StandaloneRoot() {
     if (meta.memoryBackups) setMemoryBackups(meta.memoryBackups)
     if (meta.plugins) setPlugins(meta.plugins)
     if (meta.assistantMessages) setAssistantMessages(meta.assistantMessages)
+    if (meta.assistantLiveRun !== undefined) setAssistantLiveRun(meta.assistantLiveRun)
     if (meta.assistantChatBackups) setAssistantChatBackups(meta.assistantChatBackups)
     if (meta.assistantContextConfig) setAssistantContextConfig(meta.assistantContextConfig)
     if (meta.clawfeedItems) setClawfeedItems(meta.clawfeedItems)
@@ -2162,14 +2166,31 @@ export function StandaloneRoot() {
     try {
       const res = await standaloneFetch<{
         messages: AssistantMessageInfo[]
+        liveRun?: LiveSessionRunInfo | null
         chatBackups?: AssistantChatBackupInfo[]
         contextConfig?: AssistantContextConfigInfo
       }>('assistant/messages', 'GET')
       setAssistantMessages(res.messages)
+      if (res.liveRun !== undefined) setAssistantLiveRun(res.liveRun)
       if (res.chatBackups) setAssistantChatBackups(res.chatBackups)
       if (res.contextConfig) setAssistantContextConfig(res.contextConfig)
     } catch {}
   }, [])
+
+  const hasActiveAssistantOrHandoffRun = Boolean(
+    assistantLiveRun ||
+      assistantMessages.some(
+        m => m.handoff && (m.handoff.state === 'evaluating' || m.handoff.ticketState === 'running'),
+      ),
+  )
+
+  useEffect(() => {
+    if (viewMode !== 'assistant' || !hasActiveAssistantOrHandoffRun) return
+    const timer = setInterval(() => {
+      void refreshAssistantMessages()
+    }, 650)
+    return () => clearInterval(timer)
+  }, [viewMode, hasActiveAssistantOrHandoffRun, refreshAssistantMessages])
 
   const enabledSlots = useMemo(() => getEnabledUIViewSlots(plugins), [plugins])
   useEffect(() => {
@@ -2327,6 +2348,7 @@ export function StandaloneRoot() {
         {viewMode === 'assistant' && <PersonalAssistantSlotView
           lang={lang}
           messages={assistantMessages}
+          liveRun={assistantLiveRun}
           chatBackups={assistantChatBackups}
           memories={memories}
           pendingQuestions={pendingQuestions}

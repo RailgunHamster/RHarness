@@ -1,16 +1,17 @@
 /** Inline local conversation with topic sidebar, per-message ticket receipt cards, persistent drafts, and image input. */
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { Button, Input, Modal, Switch, Tag } from './controls.tsx'
+import { Button, Input, Modal, StateDot, Switch, Tag } from './controls.tsx'
 import { MarkdownText as MarkdownLite } from './markdown-view.tsx'
 import {
   formatSmartTimestamp,
   standaloneFetch,
   type Lang,
+  type LiveSessionRunInfo,
   type PanelMessageReceipt,
   type PanelTopicSummary,
   type PendingUserQuestionInfo,
 } from './standalone-api.ts'
-import { PendingDecisionsPanel } from './ui-slots.tsx'
+import { InlineLiveAgentBubble, PendingDecisionsPanel } from './ui-slots.tsx'
 import {
   PANEL_IMAGE_MEDIA_TYPES,
   MAX_PANEL_IMAGES,
@@ -53,12 +54,14 @@ function readImage(file: File): Promise<PanelImageDraft> {
 
 function MessageReceiptCard({
   receipt,
+  liveRun,
   lang,
   inspectedSessionId,
   onInspectSession,
   onAnswered,
 }: {
   receipt: PanelMessageReceipt
+  liveRun?: LiveSessionRunInfo | undefined
   lang: Lang
   inspectedSessionId?: string | undefined
   onInspectSession?: ((sessionId: string, ticketId?: string) => void) | undefined
@@ -132,6 +135,18 @@ function MessageReceiptCard({
             : (lang === 'zh' ? '在右侧检视执行流' : 'Inspect execution')}
         </button>}
       </div>
+
+      {liveRun && (
+        <div className="dt-live-status-bar">
+          <StateDot state="ongoing" />
+          <span>
+            {liveRun.phaseLabel[lang]}
+            {liveRun.stepCount > 1
+              ? (lang === 'zh' ? ` · 第 ${liveRun.stepCount} 步` : ` · Step ${liveRun.stepCount}`)
+              : ''}
+          </span>
+        </div>
+      )}
 
       {receipt.attentionQuestion && receipt.ticketId && (
         <div className="dt-banner" style={{ display: 'flex', flexDirection: 'column', gap: 8 }} data-testid={`receipt-attention-${receipt.ticketId}`}>
@@ -383,6 +398,7 @@ function ConversationForm({
   const [error, setError] = useState('')
   const [messages, setMessages] = useState<PanelMessage[]>([])
   const [receipts, setReceipts] = useState<Record<string, PanelMessageReceipt>>({})
+  const [liveRuns, setLiveRuns] = useState<LiveSessionRunInfo[]>([])
   const [loaded, setLoaded] = useState(false)
   const [refresh, setRefresh] = useState(0)
   const [follow, setFollow] = useState(true)
@@ -435,6 +451,7 @@ function ConversationForm({
     let timer: ReturnType<typeof setTimeout> | undefined
     let cursor: number | undefined
     const poll = async () => {
+      let nextDelay = 2000
       try {
         const previous = cursor
         const result = await standaloneFetch<{
@@ -442,17 +459,20 @@ function ConversationForm({
           next?: number
           receipts?: Record<string, PanelMessageReceipt>
           topics?: PanelTopicSummary[]
+          liveRuns?: LiveSessionRunInfo[]
         }>(`panel/messages?conversation=${encodeURIComponent(conversation)}${cursor === undefined ? '' : `&after=${cursor}`}`, 'GET', undefined, controller.signal)
         if (controller.signal.aborted) return
         if (previous !== undefined && result.next !== undefined && result.next < previous) { cursor = undefined; return }
         cursor = result.next
         setMessages(current => previous === undefined ? result.messages : [...current, ...result.messages])
         if (result.receipts) setReceipts(result.receipts)
+        setLiveRuns(result.liveRuns ?? [])
+        if ((result.liveRuns?.length ?? 0) > 0) nextDelay = 800
         if (result.topics) onTopics(result.topics)
         setLoaded(true)
         setError('')
       } catch (err) { if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err)) }
-      finally { if (!controller.signal.aborted) timer = setTimeout(() => { void poll() }, 2000) }
+      finally { if (!controller.signal.aborted) timer = setTimeout(() => { void poll() }, nextDelay) }
     }
     void poll()
     return () => { controller.abort(); clearTimeout(timer) }
@@ -460,7 +480,7 @@ function ConversationForm({
   useEffect(() => {
     if (visible) setFollow(true)
   }, [visible, conversation])
-  const latestPanelKey = `${messages.length}:${messages.at(-1)?.id ?? ''}:${messages.at(-1)?.text.length ?? 0}`
+  const latestPanelKey = `${messages.length}:${messages.at(-1)?.id ?? ''}:${messages.at(-1)?.text.length ?? 0}:${liveRuns.map(r => `${r.sessionId}:${r.phaseLabel.zh}:${r.streamingText?.length ?? 0}`).join('|')}:${busy}`
   useEffect(() => {
     if (!follow || !history.current) return
     history.current.scrollTop = history.current.scrollHeight
@@ -594,6 +614,13 @@ function ConversationForm({
             <img src={imageSource(image)} alt={image.name || (lang === 'zh' ? '图片' : 'Image')} loading="lazy" /></a>)}</div>
           {receipt && <MessageReceiptCard
             receipt={receipt}
+            liveRun={
+              receipt.sessionId
+                ? liveRuns.find(r => r.sessionId === receipt.sessionId)
+                : receipt.kind === 'evaluating'
+                  ? liveRuns.find(r => r.role === 'eval')
+                  : undefined
+            }
             lang={lang}
             inspectedSessionId={inspectedSessionId}
             onInspectSession={onInspectSession}
@@ -601,6 +628,21 @@ function ConversationForm({
           />}
         </article>
       })}
+      {busy && liveRuns.length === 0 && (
+        <InlineLiveAgentBubble
+          fallbackRole="eval"
+          lang={lang}
+          testId="panel-live-sending-bubble"
+        />
+      )}
+      {liveRuns.map(run => (
+        <InlineLiveAgentBubble
+          key={run.sessionId}
+          run={run}
+          lang={lang}
+          testId={`panel-live-bubble-${run.sessionId}`}
+        />
+      ))}
     </div>
     {!follow && <Button size="sm" variant="ghost" onClick={() => setFollow(true)}>{lang === 'zh' ? '回到最新消息' : 'Jump to latest'}</Button>}
 

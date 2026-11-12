@@ -189,6 +189,20 @@ export interface MemoryBackupInfo {
   count: number
   entries: MemoryEntryInfo[]
 }
+export interface LiveSessionRunInfo {
+  sessionId: string
+  role: 'assistant' | 'eval' | 'worker'
+  title: string
+  ticketId?: string
+  ticketTitle?: string
+  model?: { provider: string; model: string; reasoningEffort?: string }
+  startedAt: string
+  stepCount: number
+  phaseLabel: { zh: string; en: string }
+  activeTool?: { name: string; argSummary?: string; running: boolean }
+  streamingText?: string
+}
+
 export interface EngineeringHandoffInfo {
   triggerId: string
   originalMessageId?: string
@@ -205,6 +219,7 @@ export interface EngineeringHandoffInfo {
   refusalReason?: string
   attentionQuestion?: string
   reportSummary?: string
+  liveRun?: LiveSessionRunInfo
 }
 export interface PendingUserQuestionInfo {
   id: string
@@ -299,6 +314,7 @@ export interface SessionsPayload {
   memoryBackups?: MemoryBackupInfo[]
   plugins?: PluginDescriptorInfo[]
   assistantMessages?: AssistantMessageInfo[]
+  assistantLiveRun?: LiveSessionRunInfo | null
   assistantChatBackups?: AssistantChatBackupInfo[]
   assistantContextConfig?: AssistantContextConfigInfo
   clawfeedItems?: ClawFeedItemInfo[]

@@ -6,6 +6,7 @@
  * (or environment variables), keeping the public codebase completely free of personal topology details.
  */
 import { execFile, execFileSync, spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { homedir } from 'node:os'
@@ -629,6 +630,358 @@ export async function sendFeishuDirectMessage(
     return { ok: false, error: `code=${data.code} msg=${data.msg}` }
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+export function extractCompactToolArgPreview(args: unknown): string | undefined {
+  if (!args || typeof args !== 'object') return undefined
+  const rec = args as Record<string, unknown>
+  for (const k of ['query', 'hpath', 'id', 'url', 'url_or_bv', 'summary', 'title', 'path', 'command', 'cmd', 'sql', 'tool_name']) {
+    const val = rec[k]
+    if (typeof val === 'string' && val.trim()) {
+      const clean = val.trim().replace(/\s+/g, ' ')
+      return clean.length > 44 ? `${clean.slice(0, 44)}…` : clean
+    }
+  }
+  return undefined
+}
+
+export function formatAgentToolStatusLabel(
+  toolName: string,
+  args?: unknown,
+): { zh: string; en: string; argSummary?: string } {
+  const argSummary = extractCompactToolArgPreview(args)
+  const suffix = argSummary ? ` (${argSummary})` : ''
+  const table: Record<string, { zh: string; en: string }> = {
+    siyuan_search: { zh: `🔍 正在检索思源笔记${suffix}`, en: `🔍 Searching SiYuan notes${suffix}` },
+    siyuan_read: { zh: `📖 正在读取思源文档${suffix}`, en: `📖 Reading SiYuan document${suffix}` },
+    siyuan_notebooks: { zh: '📚 正在读取思源笔记本目录', en: '📚 Listing SiYuan notebooks' },
+    memory_search: { zh: `🧠 正在检索长期记忆与知识库${suffix}`, en: `🧠 Searching memory & notes${suffix}` },
+    memory_list: { zh: '🧠 正在读取长期记忆列表', en: '🧠 Listing memories' },
+    memory_save: { zh: `💾 正在写入长期记忆${suffix}`, en: `💾 Saving memory${suffix}` },
+    memory_consolidate: { zh: '✨ 正在提炼与整理记忆', en: '✨ Consolidating memories' },
+    lcm_grep: { zh: `🗂️ 正在检索无损历史归档${suffix}`, en: `🗂️ Searching lossless archive${suffix}` },
+    lcm_expand: { zh: '🗂️ 正在展开历史对话原文', en: '🗂️ Expanding archived messages' },
+    research_search: { zh: `🌐 正在联网搜索资料${suffix}`, en: `🌐 Searching the web${suffix}` },
+    web_readability: { zh: `📄 正在提取网页正文${suffix}`, en: `📄 Extracting web article${suffix}` },
+    browser_tabs: { zh: '🌍 正在读取已登录浏览器标签页', en: '🌍 Inspecting Chrome tabs' },
+    browser_open_tab: { zh: `🌍 正在打开浏览器页面${suffix}`, en: `🌍 Opening browser tab${suffix}` },
+    todo_list: { zh: '📋 正在读取飞书待办清单', en: '📋 Reading Feishu Todos' },
+    todo_write: { zh: `📋 正在更新飞书待办与日历${suffix}`, en: `📋 Updating Feishu Todo${suffix}` },
+    calendar_add: { zh: `📅 正在写入飞书日历提醒${suffix}`, en: `📅 Adding Feishu Calendar event${suffix}` },
+    email_check: { zh: '✉️ 正在检查未读邮件', en: '✉️ Checking unread emails' },
+    email_read: { zh: '✉️ 正在读取邮件正文', en: '✉️ Reading email content' },
+    market_summary: { zh: '📈 正在读取最新行情快照', en: '📈 Reading market snapshot' },
+    orders_report: { zh: `🛒 正在查询历史订单数据${suffix}`, en: `🛒 Querying shopping orders${suffix}` },
+    data_sql_query: { zh: `📊 正在执行 SQL 数据分析${suffix}`, en: `📊 Running SQL analytics${suffix}` },
+    toolkit_status: { zh: '🧰 正在查询云端工具箱状态', en: '🧰 Checking Cloud Toolkit' },
+    toolkit_download: { zh: `⬇️ 正在启动云端视频下载${suffix}`, en: `⬇️ Starting cloud download${suffix}` },
+    toolkit_list_files: { zh: '🎬 正在读取云端媒体库列表', en: '🎬 Listing cloud media files' },
+    assistant_forward_to_engineering: { zh: `🚀 正在打包原话递交工程引擎${suffix}`, en: `🚀 Forwarding verbatim request to Engineering${suffix}` },
+    assistant_ask_user: { zh: '💬 正在整理待确认选项', en: '💬 Preparing question options' },
+    orchestrator_route: { zh: '⚖️ Eval 正在研判准入并派发工单', en: '⚖️ Eval routing request' },
+    orchestrator_eval: { zh: '⚖️ Eval 正在读取评估上下文', en: '⚖️ Eval inspecting candidate' },
+    orchestrator_eval_read: { zh: '⚖️ Eval 正在展开上下文消息', en: '⚖️ Eval reading thread context' },
+    orchestrator_eval_decide: { zh: '⚖️ Eval 正在提交准入裁决', en: '⚖️ Eval recording decision' },
+    orchestrator_read: { zh: `🔎 正在读取系统资源${suffix}`, en: `🔎 Reading resource${suffix}` },
+    orchestrator_report: { zh: '📝 Worker 正在生成工单交付汇报', en: '📝 Worker preparing ticket report' },
+    orchestrator_ack: { zh: '👋 Worker 已确认接手后续消息', en: '👋 Worker acknowledging follow-up' },
+    orchestrator_reply: { zh: '💬 正在发送渠道回复', en: '💬 Sending channel reply' },
+    bash: { zh: `💻 正在执行终端命令${suffix}`, en: `💻 Running shell command${suffix}` },
+    shell: { zh: `💻 正在执行终端命令${suffix}`, en: `💻 Running shell command${suffix}` },
+    exec: { zh: `💻 正在执行命令${suffix}`, en: `💻 Executing command${suffix}` },
+    read: { zh: `📂 正在读取文件${suffix}`, en: `📂 Reading file${suffix}` },
+    read_file: { zh: `📂 正在读取文件${suffix}`, en: `📂 Reading file${suffix}` },
+    edit: { zh: `✏️ 正在修改代码文件${suffix}`, en: `✏️ Editing file${suffix}` },
+    write: { zh: `✏️ 正在写入文件${suffix}`, en: `✏️ Writing file${suffix}` },
+    str_replace: { zh: `✏️ 正在修改代码文件${suffix}`, en: `✏️ Updating file${suffix}` },
+    grep: { zh: `🔎 正在搜索代码库${suffix}`, en: `🔎 Searching codebase${suffix}` },
+    glob: { zh: `🔎 正在查找文件${suffix}`, en: `🔎 Finding files${suffix}` },
+  }
+  const hit = table[toolName]
+  if (hit) {
+    return { ...hit, ...(argSummary ? { argSummary } : {}) }
+  }
+  return {
+    zh: `🔧 正在调用 ${toolName}${suffix}`,
+    en: `🔧 Calling ${toolName}${suffix}`,
+    ...(argSummary ? { argSummary } : {}),
+  }
+}
+
+export function sanitizeFeishuCardMarkdown(raw: string): string {
+  // Feishu CardKit JSON 2.0 markdown requires no leading spaces before triple-backtick code fences and <= 30KB total card size
+  const normalized = raw.replace(/^[ \t]+(```)/gm, '$1').trim() || '…'
+  const buf = Buffer.from(normalized, 'utf8')
+  if (buf.length <= 25_000) return normalized
+  const sliced = buf.subarray(0, 24_500).toString('utf8')
+  return `${sliced}\n\n*(内容较长，完整内容请在 RHarness 网页工作台查看)*`
+}
+
+export interface FeishuStreamingCardSession {
+  readonly active: boolean
+  readonly cardId?: string
+  readonly messageId?: string
+  /** Throttled/debounced in-place update of the CardKit 2.0 markdown body (status or streaming typewriter text). */
+  update: (markdown: string) => void
+  /** Flushes the final Markdown body, closes `streaming_mode: false`, or falls back to `sendFeishuDirectMessage` if CardKit was unavailable. */
+  finish: (finalMarkdown: string) => Promise<{ ok: boolean; messageId?: string; usedCardKit: boolean }>
+  /** Closes `streaming_mode: false` cleanly if an error occurs mid-turn. */
+  abort: (fallbackNotice?: string) => Promise<void>
+}
+
+/**
+ * Starts a native Feishu CardKit 2.0 Streaming Card session (`streaming_mode: true`):
+ * 1. Creates a CardKit JSON 2.0 entity (`POST /open-apis/cardkit/v1/cards`).
+ * 2. Sends it once via `POST /open-apis/im/v1/messages` (`msg_type: "interactive"`).
+ * 3. Streams status transitions and cumulative typewriter Markdown via `PUT .../elements/md_main/content`
+ *    with a 250ms debounce (~4 QPS, well within Feishu's 10 QPS per-card cap) and strictly monotonic `sequence`.
+ * 4. Always closes `streaming_mode: false` via `PATCH .../settings` on completion or error.
+ */
+export async function createFeishuStreamingCardSession(options: {
+  initialText?: string
+  headerTitle?: string
+  headerTemplate?: 'blue' | 'indigo' | 'wathet' | 'green' | 'orange' | 'red'
+  receiveId?: string
+  receiveIdType?: 'open_id' | 'chat_id'
+  debounceMs?: number
+} = {}): Promise<FeishuStreamingCardSession> {
+  const cred = loadStandaloneFeishuCredentials()
+  const receiveIdType = options.receiveIdType ?? 'open_id'
+  const target = options.receiveId || (receiveIdType === 'chat_id' ? cred?.dmChatId : cred?.ownerOpenId) || ''
+  const debounceMs = Math.max(120, options.debounceMs ?? 250)
+  const initialContent = sanitizeFeishuCardMarkdown(options.initialText ?? '⏳ **正在思考…**')
+
+  if (!cred || !target) {
+    return {
+      active: false,
+      update: () => {},
+      finish: async finalMd => {
+        const r = await sendFeishuDirectMessage(finalMd, options.receiveId, receiveIdType)
+        return { ok: r.ok, ...(r.messageId ? { messageId: r.messageId } : {}), usedCardKit: false }
+      },
+      abort: async () => {},
+    }
+  }
+
+  let cardId: string | undefined
+  let sentMessageId: string | undefined
+  try {
+    const token = await getFeishuTenantToken(cred)
+    const cardPayload: Record<string, unknown> = {
+      schema: '2.0',
+      config: {
+        update_multi: true,
+        streaming_mode: true,
+        streaming_config: {
+          print_frequency_ms: { default: 35, android: 30, ios: 35, pc: 40 },
+          print_step: { default: 2, android: 2, ios: 2, pc: 2 },
+          print_strategy: 'fast',
+        },
+      },
+      ...(options.headerTitle
+        ? {
+            header: {
+              title: { tag: 'plain_text', content: options.headerTitle },
+              template: options.headerTemplate ?? 'blue',
+            },
+          }
+        : {}),
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            element_id: 'md_main',
+            content: initialContent,
+          },
+        ],
+      },
+    }
+
+    const createRes = await fetch('https://open.feishu.cn/open-apis/cardkit/v1/cards', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({
+        type: 'card_json',
+        data: JSON.stringify(cardPayload),
+      }),
+      signal: AbortSignal.timeout(10_000),
+    })
+    const createData = (await createRes.json()) as { code?: number; data?: { card_id?: string } }
+    if (createData.code === 0 && createData.data?.card_id) {
+      cardId = createData.data.card_id
+      const sendRes = await fetch(
+        `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${token}`,
+            'content-type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify({
+            receive_id: target,
+            msg_type: 'interactive',
+            content: JSON.stringify({
+              type: 'card',
+              data: { card_id: cardId },
+            }),
+          }),
+          signal: AbortSignal.timeout(12_000),
+        },
+      )
+      const sendData = (await sendRes.json()) as { code?: number; data?: { message_id?: string } }
+      if (sendData.code === 0 && sendData.data?.message_id) {
+        sentMessageId = sendData.data.message_id
+      } else {
+        // Close unused card entity cleanly and fall back
+        void fetch(`https://open.feishu.cn/open-apis/cardkit/v1/cards/${encodeURIComponent(cardId)}/settings`, {
+          method: 'PATCH',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({ settings: JSON.stringify({ config: { streaming_mode: false } }), sequence: 1, uuid: randomUUID() }),
+          signal: AbortSignal.timeout(6000),
+        }).catch(() => {})
+        cardId = undefined
+      }
+    }
+  } catch {
+    cardId = undefined
+  }
+
+  if (!cardId || !sentMessageId) {
+    return {
+      active: false,
+      update: () => {},
+      finish: async finalMd => {
+        const r = await sendFeishuDirectMessage(finalMd, target, receiveIdType)
+        return { ok: r.ok, ...(r.messageId ? { messageId: r.messageId } : {}), usedCardKit: false }
+      },
+      abort: async fallbackNotice => {
+        if (fallbackNotice?.trim()) {
+          await sendFeishuDirectMessage(fallbackNotice.trim(), target, receiveIdType)
+        }
+      },
+    }
+  }
+
+  const activeCardId = cardId
+  let sequence = 0
+  let lastSentContent = initialContent
+  let pendingContent: string | undefined
+  let debounceTimer: ReturnType<typeof setTimeout> | undefined
+  let lastPutAt = Date.now()
+  let closed = false
+  let queue: Promise<void> = Promise.resolve()
+
+  const putContentNow = (contentToWrite: string) => {
+    const clean = sanitizeFeishuCardMarkdown(contentToWrite)
+    if (clean === lastSentContent) return
+    lastSentContent = clean
+    lastPutAt = Date.now()
+    queue = queue.then(async () => {
+      if (closed) return
+      const seq = ++sequence
+      try {
+        const token = await getFeishuTenantToken(cred)
+        await fetch(
+          `https://open.feishu.cn/open-apis/cardkit/v1/cards/${encodeURIComponent(activeCardId)}/elements/md_main/content`,
+          {
+            method: 'PUT',
+            headers: {
+              authorization: `Bearer ${token}`,
+              'content-type': 'application/json; charset=utf-8',
+            },
+            body: JSON.stringify({
+              content: clean,
+              sequence: seq,
+              uuid: randomUUID(),
+            }),
+            signal: AbortSignal.timeout(8000),
+          },
+        )
+      } catch {}
+    })
+  }
+
+  const closeStreamingMode = () => {
+    queue = queue.then(async () => {
+      if (closed) return
+      closed = true
+      const seq = ++sequence
+      try {
+        const token = await getFeishuTenantToken(cred)
+        await fetch(
+          `https://open.feishu.cn/open-apis/cardkit/v1/cards/${encodeURIComponent(activeCardId)}/settings`,
+          {
+            method: 'PATCH',
+            headers: {
+              authorization: `Bearer ${token}`,
+              'content-type': 'application/json; charset=utf-8',
+            },
+            body: JSON.stringify({
+              settings: JSON.stringify({ config: { streaming_mode: false } }),
+              sequence: seq,
+              uuid: randomUUID(),
+            }),
+            signal: AbortSignal.timeout(8000),
+          },
+        )
+      } catch {}
+    })
+  }
+
+  return {
+    active: true,
+    cardId: activeCardId,
+    messageId: sentMessageId,
+    update: (markdown: string) => {
+      if (closed) return
+      pendingContent = markdown
+      const elapsed = Date.now() - lastPutAt
+      if (elapsed >= debounceMs && !debounceTimer) {
+        const next = pendingContent
+        pendingContent = undefined
+        putContentNow(next)
+      } else if (!debounceTimer) {
+        debounceTimer = setTimeout(() => {
+          debounceTimer = undefined
+          if (!closed && pendingContent !== undefined) {
+            const next = pendingContent
+            pendingContent = undefined
+            putContentNow(next)
+          }
+        }, Math.max(40, debounceMs - elapsed))
+      }
+    },
+    finish: async (finalMarkdown: string) => {
+      if (debounceTimer) {
+        clearTimeout(debounceTimer)
+        debounceTimer = undefined
+      }
+      pendingContent = undefined
+      if (!closed) {
+        putContentNow(finalMarkdown)
+        closeStreamingMode()
+      }
+      await queue
+      return { ok: true, messageId: sentMessageId, usedCardKit: true }
+    },
+    abort: async (fallbackNotice?: string) => {
+      if (debounceTimer) {
+        clearTimeout(debounceTimer)
+        debounceTimer = undefined
+      }
+      pendingContent = undefined
+      if (!closed) {
+        if (fallbackNotice?.trim()) {
+          putContentNow(fallbackNotice.trim())
+        }
+        closeStreamingMode()
+      }
+      await queue
+    },
   }
 }
 

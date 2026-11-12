@@ -12,9 +12,11 @@ import {
 } from '../src/app/memory-plugin.ts'
 import {
   buildSiyuanSearchQueries,
+  formatAgentToolStatusLabel,
   isSiyuanNotebookBlocked,
   isSiyuanPathBlocked,
   redactSensitiveNoteContent,
+  sanitizeFeishuCardMarkdown,
 } from '../src/app/personal-skills.ts'
 import {
   defaultLcmDagState,
@@ -346,4 +348,12 @@ it('tokenizes multi-keyword SiYuan queries and federates SiYuan hits into memory
   expect(out.siyuanNotesMatched?.count).toBe(1)
   expect(out.siyuanNotesMatched?.items[0]?.docId).toBe('doc-123')
   expect(out.siyuanNotesMatched?.hint).toContain('siyuan_read')
+
+  // Live tool status formatter & Feishu CardKit 2.0 Markdown sanitizer
+  const st = formatAgentToolStatusLabel('siyuan_search', { query: '项目笔记' })
+  expect(st.zh).toContain('正在检索思源笔记')
+  expect(st.zh).toContain('项目笔记')
+
+  const fenced = sanitizeFeishuCardMarkdown('Hello\n   ```ts\nconsole.log(1)\n   ```')
+  expect(fenced).toBe('Hello\n```ts\nconsole.log(1)\n```')
 })
