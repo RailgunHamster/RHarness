@@ -99,6 +99,10 @@ beforeEach(() => {
             executorModel: { provider: 'niumacode', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh' },
           },
           load: { running: 0, maxWorkers: 3 },
+          assistantMessages: [
+            { id: 'am-user-1', sender: 'operator', text: '今天有什么安排？', at: '2026-11-08T08:00:00Z' },
+            { id: 'am-bot-1', sender: 'Claw', bot: true, text: '上午 10:00 有评审会议。', at: '2026-11-08T08:00:03Z' },
+          ],
           pipeline: [
             {
               triggerId: 'panel:m1',
@@ -235,4 +239,33 @@ it('formats non-today timestamps with Chinese year-month-day and opens/closes fu
   expect(mdModal.textContent).toContain('1. 业务盘点')
   expect(mdModal.querySelector('table.dt-table')).not.toBeNull()
   expect(mdModal.textContent).toContain('首批只读接入')
+})
+
+it('expands Personal Assistant into full-screen chat-app mode with self/bot bubbles and exits on button or ESC', async () => {
+  await act(async () => root.render(<StandaloneRoot />))
+  const assistantTab = container.querySelector<HTMLButtonElement>('[data-testid="view-tab-assistant"]')!
+  await act(async () => { assistantTab.click() })
+
+  const shell = container.querySelector<HTMLElement>('.dt-assistant-shell')!
+  expect(shell).not.toBeNull()
+  expect(shell.getAttribute('data-fullscreen')).toBeNull()
+
+  const userBubble = container.querySelector<HTMLElement>('[data-testid="assistant-msg-am-user-1"]')!
+  const botBubble = container.querySelector<HTMLElement>('[data-testid="assistant-msg-am-bot-1"]')!
+  expect(userBubble.getAttribute('data-sender')).toBe('self')
+  expect(botBubble.getAttribute('data-sender')).toBe('bot')
+
+  const fsBtn = container.querySelector<HTMLButtonElement>('[data-testid="assistant-chat-fullscreen-btn"]')!
+  expect(fsBtn.textContent).toContain('全屏对话')
+  await act(async () => { fsBtn.click() })
+  expect(shell.getAttribute('data-fullscreen')).toBe('true')
+  expect(document.body.style.overflow).toBe('hidden')
+  expect(fsBtn.textContent).toContain('退出全屏')
+
+  // Pressing Escape exits full-screen chat mode and restores page scrolling
+  await act(async () => {
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  })
+  expect(shell.getAttribute('data-fullscreen')).toBeNull()
+  expect(document.body.style.overflow).toBe('')
 })

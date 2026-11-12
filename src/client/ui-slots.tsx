@@ -339,6 +339,7 @@ export function PersonalAssistantSlotView(props: {
   const [clearChatConfirm, setClearChatConfirm] = useState(false)
   const [forwardingId, setForwardingId] = useState<string | null>(null)
   const [fullscreenMsgId, setFullscreenMsgId] = useState<string | null>(null)
+  const [chatFullscreen, setChatFullscreen] = useState(false)
   const [follow, setFollow] = useState(true)
   const [expandedDetailIds, setExpandedDetailIds] = useState<Record<string, boolean>>({})
   const [refusalInputFor, setRefusalInputFor] = useState<string | null>(null)
@@ -347,6 +348,24 @@ export function PersonalAssistantSlotView(props: {
   const [error, setError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const historyRef = useRef<HTMLDivElement>(null)
+  const composerInputRef = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    if (!chatFullscreen) return
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !document.querySelector('[role="dialog"]')) {
+        e.preventDefault()
+        setChatFullscreen(false)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = prevOverflow
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [chatFullscreen])
 
   const latestMsgKey = `${messages.length}:${messages.at(-1)?.id ?? ''}:${messages.at(-1)?.text.length ?? 0}`
   useEffect(() => {
@@ -357,7 +376,7 @@ export function PersonalAssistantSlotView(props: {
       if (historyRef.current) historyRef.current.scrollTop = historyRef.current.scrollHeight
     })
     return () => cancelAnimationFrame(raf)
-  }, [follow, latestMsgKey])
+  }, [follow, latestMsgKey, chatFullscreen])
 
   const toggleDetail = (msgId: string) => {
     setExpandedDetailIds(curr => ({ ...curr, [msgId]: !curr[msgId] }))
@@ -578,8 +597,12 @@ export function PersonalAssistantSlotView(props: {
 
   return (
     <div className="dt-form" data-testid="personal-assistant-view">
-      <section className="dt-pipeline-card" aria-label={lang === 'zh' ? '个人助理' : 'Personal Assistant'}>
-        <div className="dt-live-head">
+      <section
+        className="dt-pipeline-card dt-assistant-shell"
+        data-fullscreen={chatFullscreen ? 'true' : undefined}
+        aria-label={lang === 'zh' ? '个人助理' : 'Personal Assistant'}
+      >
+        <div className="dt-live-head dt-assistant-header">
           <div className="dt-msg-receipt-main">
             <h2>{lang === 'zh' ? '个人助理' : 'Personal Assistant'}</h2>
             <span className="dt-chip-topic dt-mono">Claw</span>
@@ -596,6 +619,21 @@ export function PersonalAssistantSlotView(props: {
             )}
           </div>
           <div className="dt-row-buttons">
+            <Button
+              size="sm"
+              variant={chatFullscreen ? 'primary' : 'outline'}
+              onClick={() => setChatFullscreen(v => !v)}
+              data-testid="assistant-chat-fullscreen-btn"
+              title={
+                lang === 'zh'
+                  ? (chatFullscreen ? '退出沉浸式全屏聊天 (按 ESC 亦可退出)' : '将个人助理放大为全屏聊天窗口')
+                  : (chatFullscreen ? 'Exit full-screen chat (or press ESC)' : 'Expand Personal Assistant to full-screen chat')
+              }
+            >
+              {lang === 'zh'
+                ? (chatFullscreen ? '↙ 退出全屏 (ESC)' : '⛶ 全屏对话')
+                : (chatFullscreen ? '↙ Exit Fullscreen' : '⛶ Fullscreen Chat')}
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -639,7 +677,7 @@ export function PersonalAssistantSlotView(props: {
                 {lang === 'zh' ? '调试控制台' : 'Console'}
               </Button>
             )}
-            <Button size="sm" variant="outline" onClick={onSwitchToMemoryTab}>
+            <Button size="sm" variant="outline" onClick={() => { setChatFullscreen(false); onSwitchToMemoryTab() }}>
               {lang === 'zh' ? `记忆与插件 (${memories.length} 条 · ${pinnedMemories.length} 常驻)` : `Memory & Plugins (${memories.length})`}
             </Button>
           </div>
@@ -703,8 +741,8 @@ export function PersonalAssistantSlotView(props: {
           </div>
         )}
 
-        {/* Top Message & Image Composer */}
-        <form className="dt-form" onSubmit={event => { void submitMessage(event) }}>
+        {/* Message & Image Composer (docked at the bottom in Chat App style via `.dt-assistant-composer`) */}
+        <form className="dt-form dt-assistant-composer" onSubmit={event => { void submitMessage(event) }}>
           <div
             className="dt-image-drop"
             onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault() }}
@@ -713,8 +751,9 @@ export function PersonalAssistantSlotView(props: {
             <label className="dt-field">
               <span className="dt-field-head">{lang === 'zh' ? '消息内容' : 'Message'}</span>
               <textarea
+                ref={composerInputRef}
                 className="dt-textarea"
-                rows={3}
+                rows={chatFullscreen ? 2 : 3}
                 value={draft}
                 disabled={busy}
                 onChange={e => setDraft(e.target.value)}
@@ -784,23 +823,30 @@ export function PersonalAssistantSlotView(props: {
           </div>
         </form>
 
-        {/* Assistant Conversation Stream below Composer */}
-        <div className="dt-activity-toolbar">
+        {/* Assistant Conversation Stream */}
+        <div className="dt-activity-toolbar dt-assistant-toolbar">
           <span className="dt-hint">
             {lang === 'zh' ? `共 ${messages.length} 条对话记录（默认定位到最新消息）` : `${messages.length} messages (auto-following latest)`}
           </span>
-          <Button
-            size="sm"
-            variant="ghost"
-            aria-pressed={follow}
-            onClick={() => setFollow(v => !v)}
-          >
-            {lang === 'zh' ? (follow ? '自动跟随：开' : '自动跟随：关') : (follow ? 'Follow: on' : 'Follow: off')}
-          </Button>
+          <div className="dt-row-buttons">
+            {!follow && (
+              <Button size="sm" variant="outline" onClick={() => setFollow(true)}>
+                {lang === 'zh' ? '⬇ 回到最新消息' : '⬇ Jump to latest'}
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              aria-pressed={follow}
+              onClick={() => setFollow(v => !v)}
+            >
+              {lang === 'zh' ? (follow ? '自动跟随：开' : '自动跟随：关') : (follow ? 'Follow: on' : 'Follow: off')}
+            </Button>
+          </div>
         </div>
         <div
           ref={historyRef}
-          className="dt-panel-history"
+          className="dt-panel-history dt-assistant-stream"
           data-testid="assistant-message-stream"
           onScroll={() => {
             const node = historyRef.current
@@ -846,8 +892,9 @@ export function PersonalAssistantSlotView(props: {
                     </div>
                   )}
                   <article
-                    className="dt-panel-message"
+                    className="dt-panel-message dt-chat-bubble"
                     data-bot={isBot}
+                    data-sender={isBot ? 'bot' : 'self'}
                     data-testid={`assistant-msg-${msg.id}`}
                   >
                   <div className="dt-session-reply-head">
@@ -1116,14 +1163,8 @@ export function PersonalAssistantSlotView(props: {
             })
           )}
         </div>
-        {!follow && (
-          <Button size="sm" variant="ghost" onClick={() => setFollow(true)}>
-            {lang === 'zh' ? '回到最新消息' : 'Jump to latest'}
-          </Button>
-        )}
-
         {/* 30-Day Protected Chat Backup & Recovery Vault (`assistant-chat-backups/`) */}
-        <details className="dt-conversation-settings" open={chatBackups.length > 0} data-testid="assistant-chat-backup-vault">
+        <details className="dt-conversation-settings dt-assistant-vault" open={chatBackups.length > 0} data-testid="assistant-chat-backup-vault">
           <summary>
             {lang === 'zh'
               ? `🛡 对话记录 30 天反悔恢复箱 (assistant-chat-backups/ · 共 ${chatBackups.length} 份备份 · 30天内不可手动删除、随时可恢复)`
