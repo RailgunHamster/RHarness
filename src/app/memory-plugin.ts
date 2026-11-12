@@ -789,6 +789,7 @@ export function buildMemoryPluginTools(
   role: 'assistant' | 'orchestrator' | 'worker',
   readChatArchive?: () => ArchivedChatMessage[],
   archiveDeleted?: (removed: MemoryEntry[]) => void,
+  federatedNotesSearch?: (query: string) => Promise<{ count: number; items: unknown[] } | undefined>,
 ): RegisteredToolSpec[] {
   const saveSchema = z.object({
     id: z.string().optional().describe('Optional existing memory ID to update.'),
@@ -839,12 +840,29 @@ export function buildMemoryPluginTools(
     },
     {
       name: 'memory_search',
-      description: 'Search long-term memories by keyword, category, or pinned status.',
+      description: 'Search long-term memories by keyword, category, or pinned status (also automatically federates into SiYuan Knowledge Base notes when connected).',
       parameters: z.toJSONSchema(searchSchema),
       execute: async (rawArgs: unknown) => {
         const args = searchSchema.parse(rawArgs ?? {})
         const items = searchMemories(readEntries(), args.query, args.category, args.pinned_only)
-        return { count: items.length, items: items.slice(0, 25) }
+        let siyuanNotesMatched: { count: number; hint: string; items: unknown[] } | undefined
+        if (args.query?.trim() && federatedNotesSearch) {
+          try {
+            const notes = await federatedNotesSearch(args.query.trim())
+            if (notes && notes.count > 0) {
+              siyuanNotesMatched = {
+                count: notes.count,
+                hint: 'Matching notes were found in SiYuan Knowledge Base! Call `siyuan_read({ id: docId, instance })` on the relevant document to read its FULL Markdown content before replying.',
+                items: notes.items,
+              }
+            }
+          } catch {}
+        }
+        return {
+          count: items.length,
+          items: items.slice(0, 25),
+          ...(siyuanNotesMatched ? { siyuanNotesMatched } : {}),
+        }
       },
     },
     {

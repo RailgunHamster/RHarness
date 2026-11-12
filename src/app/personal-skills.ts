@@ -295,6 +295,63 @@ export function isSiyuanNotebookBlocked(notebookId: string, notebookName?: strin
   return false
 }
 
+const SIYUAN_STOP_CHARS = new Set(['的', '了', '吗', '呢', '啊', '吧', '呀', '哦', '说', '过', '有', '在', '是', '我', '你', '他', '她', '它', '什', '么', '那', '这', '个'])
+
+export function buildSiyuanSearchQueries(rawQuery: string, limit = 20): {
+  tokens: string[]
+  strictSql: string
+  fallbackOrSql?: string
+} {
+  const safeLimit = Math.max(1, Math.min(60, Math.trunc(limit)))
+  const rawParts = rawQuery
+    .trim()
+    .split(/[\s,，、;；:：?？!！"'“”‘’()（）[\]【】]+/)
+    .map(s => s.trim())
+    .filter(Boolean)
+
+  let tokens = rawParts.filter(t => !(t.length === 1 && SIYUAN_STOP_CHARS.has(t)))
+  if (tokens.length === 0) tokens = rawParts.length > 0 ? rawParts : [rawQuery.trim()]
+
+  const esc = (s: string) => s.replace(/'/g, "''")
+  const matchExpr = (tok: string) => {
+    const q = esc(tok)
+    return `(content LIKE '%${q}%' OR hpath LIKE '%${q}%' OR markdown LIKE '%${q}%')`
+  }
+  const rankExpr = (tok: string) => {
+    const q = esc(tok)
+    return `(CASE WHEN hpath LIKE '%${q}%' THEN 3 WHEN content LIKE '%${q}%' OR markdown LIKE '%${q}%' THEN 1 ELSE 0 END)`
+  }
+
+  const strictWhere = tokens.map(matchExpr).join(' AND ')
+  const strictScore = tokens.map(rankExpr).join(' + ')
+  const strictSql = `SELECT id, root_id, box, hpath, type, content, markdown, updated FROM blocks WHERE (${strictWhere}) ORDER BY (${strictScore}) DESC, CASE WHEN type='d' THEN 0 ELSE 1 END, updated DESC LIMIT ${safeLimit}`
+
+  // Build an OR fallback for multi-token queries (e.g. "姓名 说 梦") or long CJK phrases (>= 4 chars)
+  let fallbackTokens: string[] = []
+  if (tokens.length >= 2) {
+    fallbackTokens = tokens
+  } else if (tokens.length === 1 && /^[\u4e00-\u9fa5]{4,}$/.test(tokens[0]!)) {
+    const phrase = tokens[0]!
+    const bigrams: string[] = []
+    for (let i = 0; i < phrase.length - 1; i++) {
+      const bg = phrase.slice(i, i + 2)
+      if (!SIYUAN_STOP_CHARS.has(bg[0]!) && !SIYUAN_STOP_CHARS.has(bg[1]!)) {
+        bigrams.push(bg)
+      }
+    }
+    fallbackTokens = [...new Set(bigrams)].slice(0, 6)
+  }
+
+  if (fallbackTokens.length >= 2) {
+    const orWhere = fallbackTokens.map(matchExpr).join(' OR ')
+    const orScore = fallbackTokens.map(rankExpr).join(' + ')
+    const fallbackOrSql = `SELECT id, root_id, box, hpath, type, content, markdown, updated FROM blocks WHERE (${orWhere}) ORDER BY (${orScore}) DESC, CASE WHEN type='d' THEN 0 ELSE 1 END, updated DESC LIMIT ${safeLimit}`
+    return { tokens, strictSql, fallbackOrSql }
+  }
+
+  return { tokens, strictSql }
+}
+
 export function isSiyuanPathBlocked(hpathOrTitle: string, extraKeywords: readonly string[] = []): boolean {
   const lower = (hpathOrTitle ?? '').toLowerCase()
   if (!lower) return false
@@ -1154,58 +1211,62 @@ export async function executePersonalSkillLocal(
           : targetInst === 'siyuan-rh'
             ? ['siyuan-rh']
             : ['siyuan', 'siyuan-rh']
-      const safeQ = query.replace(/'/g, "''")
-      const stmt = `SELECT id, root_id, box, hpath, type, content, markdown, updated FROM blocks WHERE (content LIKE '%${safeQ}%' OR hpath LIKE '%${safeQ}%' OR markdown LIKE '%${safeQ}%') ORDER BY CASE WHEN type='d' THEN 0 ELSE 1 END, updated DESC LIMIT ${limit}`
+      const { strictSql, fallbackOrSql } = buildSiyuanSearchQueries(query, limit)
 
-      const perInst = await Promise.all(
-        instList.map(async inst => {
-          try {
-            const [nbData, rows] = await Promise.all([
-              callSiyuanApi<{ notebooks?: { id: string; name: string }[] }>(inst, '/api/notebook/lsNotebooks', {}),
-              callSiyuanApi<
-                {
-                  id: string
-                  root_id: string
-                  box: string
-                  hpath: string
-                  type: string
-                  content: string
-                  markdown: string
-                  updated?: string
-                }[]
-              >(inst, '/api/query/sql', { stmt }),
-            ])
-            const allowedNotebooks = (nbData?.notebooks ?? []).filter(n => !isSiyuanNotebookBlocked(n.id, n.name))
-            const nbMap = new Map(allowedNotebooks.map(n => [n.id, n.name]))
-            return (rows ?? [])
-              .filter(
-                r =>
-                  nbMap.has(r.box) &&
-                  !isSiyuanNotebookBlocked(r.box, nbMap.get(r.box)) &&
-                  !isSiyuanPathBlocked(r.hpath),
-              )
-              .map(r => ({
-                instance: inst,
-                instanceLabel: inst === 'siyuan' ? '🏠 家庭共用 (siyuan)' : '🔒 个人私有 (siyuan_rh)',
-                docId: r.root_id || r.id,
-                blockId: r.id,
-                notebookId: r.box,
-                notebookName: nbMap.get(r.box) ?? r.box,
-                hpath: r.hpath,
-                type: r.type,
-                snippet: redactSensitiveNoteContent((r.markdown || r.content || '').slice(0, 360)),
-                updated: r.updated,
-              }))
-          } catch {
-            return []
-          }
-        }),
-      )
-      const combined = perInst.flat()
+      type SiyuanBlockRow = {
+        id: string
+        root_id: string
+        box: string
+        hpath: string
+        type: string
+        content: string
+        markdown: string
+        updated?: string
+      }
+
+      const runInstQuery = async (inst: SiyuanInstanceId, stmt: string) => {
+        try {
+          const [nbData, rows] = await Promise.all([
+            callSiyuanApi<{ notebooks?: { id: string; name: string }[] }>(inst, '/api/notebook/lsNotebooks', {}),
+            callSiyuanApi<SiyuanBlockRow[]>(inst, '/api/query/sql', { stmt }),
+          ])
+          const allowedNotebooks = (nbData?.notebooks ?? []).filter(n => !isSiyuanNotebookBlocked(n.id, n.name))
+          const nbMap = new Map(allowedNotebooks.map(n => [n.id, n.name]))
+          return (rows ?? [])
+            .filter(
+              r =>
+                nbMap.has(r.box) &&
+                !isSiyuanNotebookBlocked(r.box, nbMap.get(r.box)) &&
+                !isSiyuanPathBlocked(r.hpath),
+            )
+            .map(r => ({
+              instance: inst,
+              instanceLabel: inst === 'siyuan' ? '🏠 家庭共用 (siyuan)' : '🔒 个人私有 (siyuan_rh)',
+              docId: r.root_id || r.id,
+              blockId: r.id,
+              notebookId: r.box,
+              notebookName: nbMap.get(r.box) ?? r.box,
+              hpath: r.hpath,
+              type: r.type,
+              snippet: redactSensitiveNoteContent((r.markdown || r.content || '').slice(0, 360)),
+              updated: r.updated,
+            }))
+        } catch {
+          return []
+        }
+      }
+
+      let combined = (await Promise.all(instList.map(inst => runInstQuery(inst, strictSql)))).flat()
+      let matchMode: 'strict' | 'fuzzy_or' = 'strict'
+      if (combined.length === 0 && fallbackOrSql) {
+        combined = (await Promise.all(instList.map(inst => runInstQuery(inst, fallbackOrSql)))).flat()
+        if (combined.length > 0) matchMode = 'fuzzy_or'
+      }
       return {
         ok: true,
         privacyGuard: 'active',
         query,
+        matchMode,
         count: combined.length,
         items: combined,
       }

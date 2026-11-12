@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest'
 import {
+  buildMemoryPluginTools,
   consolidateMemories,
   defaultMemories,
   evaluateMilestoneCountdown,
@@ -10,6 +11,7 @@ import {
   type MemoryEntry,
 } from '../src/app/memory-plugin.ts'
 import {
+  buildSiyuanSearchQueries,
   isSiyuanNotebookBlocked,
   isSiyuanPathBlocked,
   redactSensitiveNoteContent,
@@ -309,4 +311,39 @@ it('exercises absorbed official & community plugins: Tokenjuice, Loop Breaker, A
   // 7. Data SQL security guard (rejects non-SELECT statements)
   const blockedSql = executeReadonlyDataSql({ dataset: 'orders', sql: 'DROP TABLE orders' })
   expect(blockedSql.ok).toBe(false)
+})
+
+it('tokenizes multi-keyword SiYuan queries and federates SiYuan hits into memory_search', async () => {
+  // Space-separated keywords like "家人 语录" become tokenized AND + ranked OR fallback instead of literal "%家人 语录%"
+  const q1 = buildSiyuanSearchQueries('家人 语录', 15)
+  expect(q1.tokens).toEqual(['家人', '语录'])
+  expect(q1.strictSql).toContain("LIKE '%家人%'")
+  expect(q1.strictSql).toContain("AND (content LIKE '%语录%'")
+  expect(q1.fallbackOrSql).toContain("OR (content LIKE '%语录%'")
+
+  // Single-character stop words like "说" are stripped so "小明 说 趣事" keeps ["小明", "趣事"]
+  const q2 = buildSiyuanSearchQueries('小明 说 趣事', 10)
+  expect(q2.tokens).toEqual(['小明', '趣事'])
+
+  // Federated memory_search returns SiYuan note hits alongside SQLite memories even when SQLite has 0 matches
+  const tools = buildMemoryPluginTools(
+    () => [],
+    () => {},
+    'assistant',
+    undefined,
+    undefined,
+    async query => ({
+      count: 1,
+      items: [{ instance: 'siyuan-rh', docId: 'doc-123', hpath: '/记录/日常语录', snippet: `命中关键词: ${query}` }],
+    }),
+  )
+  const searchTool = tools.find(t => t.name === 'memory_search')!
+  const out = (await searchTool.execute({ query: '家人 语录' }, { signal: new AbortController().signal })) as {
+    count: number
+    siyuanNotesMatched?: { count: number; hint: string; items: { docId: string }[] }
+  }
+  expect(out.count).toBe(0)
+  expect(out.siyuanNotesMatched?.count).toBe(1)
+  expect(out.siyuanNotesMatched?.items[0]?.docId).toBe('doc-123')
+  expect(out.siyuanNotesMatched?.hint).toContain('siyuan_read')
 })

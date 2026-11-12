@@ -1170,6 +1170,18 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       role,
       readChatArchive,
       removed => { archiveMemoriesToBackupDir(stateDir, removed, 'single-delete') },
+      async query => {
+        if (!isPluginEnabled('dsh-personal-skills')) return undefined
+        const out = (await executePersonalSkillWithRemoteFallback(
+          'siyuan_search',
+          { query, limit: 10 },
+          getRegisteredNodes,
+        )) as { ok?: boolean; count?: number; items?: unknown[] } | undefined
+        if (out?.ok && Array.isArray(out.items) && out.items.length > 0) {
+          return { count: out.items.length, items: out.items }
+        }
+        return undefined
+      },
     )
     for (const t of memTools) {
       agent.ctx.tools?.register({
