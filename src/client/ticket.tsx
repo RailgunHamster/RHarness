@@ -1,0 +1,274 @@
+/** Ticket detail page: stage and actions, Mandate details, undelivered/delivered Inputs, subscribed Threads, and Assignments. */
+import { useEffect, useRef, useState, type ReactNode, type Ref } from 'react'
+import type { ReportState } from '../core/index.ts'
+import { ApiError, usePoll, type TicketPageView } from './api.ts'
+import { Button, DisclosureRow, Dot, Icon, Tag, type IconName, type TagTone } from './controls.tsx'
+import { decisionMark, reportDot, ticketMark } from './marks.ts'
+import { usePanel } from './provider.tsx'
+import { settingsRoute } from './route.ts'
+import { Earlier, ThreadLine, automatedRuns } from './rows.tsx'
+import { actorName, localized, readableMarkers, reasonLabel, reportPreview, valueLabel, when } from './text.ts'
+import { ActionLink, ConfirmButton, ExternalLink, Hint, KeyValues, LabelValue, LoadState, MarkdownLite, PageHead, Section, SessionButton,
+  StageMark, When } from './widgets.tsx'
+
+type Input = TicketPageView['inputs'][number]
+function InputLine({ input, earlier = [] }: { input: Input; earlier?: { id: string; at: string; preview: string }[] }) {
+  const { t, navigate } = usePanel()
+  const trigger = input.kind === 'trigger' ? input.trigger : undefined
+  return <li className="dt-row">
+    <Dot state={input.delivered ? 'idle' : 'warning'} label={input.delivered ? t('inputDelivered') : t('inputUndelivered')} />
+    <div className="dt-row-main">
+      {trigger ? <div className="dt-row-title"><button type="button" className="dt-open" onClick={() => navigate({ page: 'trigger',
+        id: trigger.thread, query: { trigger: trigger.id } })}>
+        {actorName(t, trigger.actor)}{t('labelSeparator')}{readableMarkers(t, trigger.preview) || t('empty')}
+      </button></div> : <div className="dt-row-title">{valueLabel(t, 'input', input.kind)}</div>}
+      <div className="dt-row-meta">{input.kind === 'trigger' && <span>{valueLabel(t, 'input', input.kind)}</span>}<When
+        at={input.at} /></div>
+      {(input.kind === 'text' || input.kind === 'note') && input.text && <div className="dt-row-quote"><MarkdownLite text={input.text} /></div>}
+      {trigger?.handback && <Hint>{t('inputHandedBack', { reason: trigger.handback.reason })}</Hint>}
+      <Earlier items={earlier} />
+    </div>
+  </li>
+}
+function InputList({ inputs }: { inputs: Input[] }) {
+  const sender = (input: Input) => input.kind === 'trigger' && input.trigger && !input.trigger.human
+    ? `${input.trigger.actor.source}:${input.trigger.actor.id}` : undefined
+  const shown = (input: Input) => ({ id: input.id, at: input.at, preview: input.kind === 'trigger' ? input.trigger?.preview ?? '' : '' })
+  return <ul className="dt-list">{automatedRuns(inputs, sender).map(run => <InputLine key={run.item.id} input={run.item}
+    earlier={run.earlier.map(shown)} />)}</ul>
+}
+
+function Details({ icon, title, open = false, children }: { icon: IconName; title: ReactNode; open?: boolean; children: ReactNode }) {
+  const [shown, setShown] = useState(open)
+  return <DisclosureRow icon={<Icon name={icon} />} title={title} open={shown} onToggle={() => setShown(!shown)}>
+    <div className="dt-disclosure-body">{children}</div>
+  </DisclosureRow>
+}
+type Assignment = TicketPageView['assignments'][number]
+type ReplyEntry = { id: string; number: number; report: NonNullable<Assignment['report']> }
+const replies = (assignments: Assignment[]): ReplyEntry[] => assignments.flatMap((assignment, index) => assignment.report
+  ? [{ id: assignment.id, number: index + 1, report: assignment.report }] : [])
+const replyTone = (state: ReportState): TagTone => state === 'ready' ? 'success' : state === 'failed' ? 'danger'
+  : state === 'blocked' || state === 'waiting' ? 'warning' : state === 'dropped' ? 'neutral' : 'info'
+function ReplyCard({ entry, latest = false, replyRef }: { entry: ReplyEntry; latest?: boolean; replyRef?: Ref<HTMLElement> }) {
+  const { t, notify } = usePanel()
+  const { report } = entry
+  const copy = () => {
+    if (!navigator.clipboard) { notify(t('copyUnavailable')); return }
+    void navigator.clipboard.writeText(report.summary).then(() => notify(t('replyCopied')), () => notify(t('copyUnavailable')))
+  }
+  return <article ref={replyRef} tabIndex={latest ? -1 : undefined} className={latest ? 'dt-reply dt-reply-latest' : 'dt-reply'} data-state={report.state}>
+    <div className="dt-reply-head">
+      <span className="dt-reply-author"><Icon name="message" size={14} />{t('executorReply')}</span>
+      <Tag tone={replyTone(report.state)}>{valueLabel(t, 'report', report.state)}</Tag>
+      <span className="dt-reply-meta">{t('assignmentNumber', { number: entry.number })} · <When at={report.at} /></span>
+      <Button variant="ghost" size="sm" className="dt-reply-copy" title={t('copyReply')} aria-label={t('copyReply')}
+        icon={<Icon name="copy" size={14} />} onClick={copy} />
+    </div>
+    <div className="dt-reply-body"><MarkdownLite text={report.summary || t('empty')} /></div>
+  </article>
+}
+function ReplyHistory({ entries }: { entries: ReplyEntry[] }) {
+  const { t } = usePanel()
+  const [open, setOpen] = useState<string>()
+  return <div className="dt-reply-history">{entries.map(entry => {
+    const title = <span className="dt-reply-history-title">
+      <span>{t('assignmentNumber', { number: entry.number })}</span>
+      <Tag tone={replyTone(entry.report.state)}>{valueLabel(t, 'report', entry.report.state)}</Tag>
+      <span className="dt-reply-history-preview" title={reportPreview(t, entry.report.summary)}>{reportPreview(t, entry.report.summary)}</span>
+      <span className="dt-reply-history-meta"><When at={entry.report.at} /></span>
+    </span>
+    return <DisclosureRow key={entry.id} icon={<Icon name="message" size={14} />} title={title} open={open === entry.id}
+      onToggle={() => setOpen(current => current === entry.id ? undefined : entry.id)}>
+      <div className="dt-reply-history-body"><ReplyCard entry={entry} /></div>
+    </DisclosureRow>
+  })}</div>
+}
+/** The latest report is the Executor's current answer; older Assignment reports stay individually expandable for context. */
+function Replies({ assignments }: { assignments: Assignment[] }) {
+  const { t } = usePanel()
+  const all = replies(assignments)
+  const latest = all.at(-1)
+  const current = assignments.at(-1)
+  const earlier = all.slice(0, -1).reverse()
+  const latestKey = latest ? `${latest.id}:${latest.report.at}` : ''
+  const previousKey = useRef<string>()
+  const latestRef = useRef<HTMLElement>(null)
+  const [newReply, setNewReply] = useState(false)
+  useEffect(() => {
+    if (previousKey.current !== undefined && previousKey.current !== latestKey) setNewReply(true)
+    previousKey.current = latestKey
+  }, [latestKey])
+  const jumpToLatest = () => {
+    setNewReply(false)
+    latestRef.current?.scrollIntoView?.({ block: 'center' })
+    latestRef.current?.focus({ preventScroll: true })
+  }
+  const followup = !!latest && !!current && current.id !== latest.id && current.state === 'running'
+  return <Section title={t('latestReply')} count={all.length || undefined} icon="message"
+    badge={newReply && <span className="dt-reply-new" role="status"><button type="button" onClick={jumpToLatest}><Icon name="chevron-down"
+      size={13} />{t('newReply')}</button></span>}>
+    {latest ? <>
+      {followup && <p className="dt-reply-followup">{t('replyBeingProcessed')}</p>}
+      <ReplyCard entry={latest} latest replyRef={latestRef} />
+    </> : <div className="dt-reply dt-reply-empty"><Hint>{t('noReplyYet')}</Hint></div>}
+    {earlier.length > 0 && <ReplyHistory entries={earlier} />}
+  </Section>
+}
+function Assignments({ ticket }: { ticket: TicketPageView }) {
+  const { t } = usePanel()
+  const report = (state: string) => t('assignmentReportShort', { state: valueLabel(t, 'report', state) })
+  return <ul className="dt-list">{ticket.assignments.slice().reverse().map((item, index) => <li key={item.id} className="dt-row">
+    <Dot state={item.state === 'running' ? reportDot(item.report?.state) : 'idle'} label={valueLabel(t, 'assignment', item.state)} />
+    <div className="dt-row-main">
+      <div className="dt-row-title">{t('assignmentNumber', { number: ticket.assignments.length - index })}</div>
+      <div className="dt-row-meta">
+        {/* A running Assignment whose worker reported a non-progress state has ended its turn; show that report as its tag and end its span there. */}
+        {item.turnEndedAt && item.report ? <Tag tone="neutral">{report(item.report.state)}</Tag> : <Tag tone={item.state === 'running'
+          ? 'info'
+          : 'neutral'}>{valueLabel(t, 'assignment', item.state)}</Tag>}
+        {item.state !== 'running' && item.report && <span>{report(item.report.state)}</span>}
+        <span>{t('assignmentSpan', { from: when(item.startedAt ?? item.createdAt, t('lang')), to: when(item.endedAt ?? item.turnEndedAt,
+          t('lang')) || t('now') })}</span>
+        {item.endedReason && <span>{reasonLabel(t, item.endedReason)}</span>}
+      </div>
+    </div>
+    {item.ref && item.ref !== ticket.sessionId && <div className="dt-row-actions"><SessionButton variant="outline"
+      sessionId={item.ref} /></div>}
+  </li>)}</ul>
+}
+function MandateDetails({ ticket, actor }: { ticket: TicketPageView; actor: string }) {
+  const { t, navigate } = usePanel()
+  const { mandate, decision } = ticket
+  const fact = (item: TicketPageView['basis']['facts'][number]): string => {
+    if (item.name === 'legacyAuthority') return valueLabel(t, 'legacy', item.value)
+    if (item.name === 'mode' || item.name === 'addressed') return valueLabel(t, item.name, item.value)
+    if (item.name === 'admission') return valueLabel(t, 'admissionCell', item.value)
+    if (item.name === 'rules') return item.value.map(rule => rule.name).join(t('listSeparator'))
+    return item.name === 'sender' ? item.value : t('yes')
+  }
+  const { legacy } = ticket.basis
+  // Omit `sender` when it matches `actor`, which is already shown on the status line.
+  const facts = ticket.basis.facts.filter(item => !(item.name === 'sender' && item.value === actor))
+  const direction = decision?.direction
+  const rows: [string, ReactNode][] = decision ? [
+    [t('term.trigger'), <button type="button" className="dt-trigger-link" onClick={() => navigate({ page: 'trigger', id: decision.thread,
+      query: { trigger: decision.triggerIds[0] ?? '' } })}>
+      <span className="dt-trigger-text">{readableMarkers(t, decision.preview) || t('empty')}</span>
+      <span className="dt-row-meta"><span>{valueLabel(t, 'source', mandate.actor.source)} · {actor}</span><When at={decision.at} /></span>
+    </button>],
+    [t('term.decision'), <div className="dt-kv-stack">
+      <span>{decisionMark(t, decision.outcome).label}</span>
+      <Hint>{reasonLabel(t, decision.reason)}</Hint>
+      {decision.rules.map(rule => <Hint key={rule.id}>{t(rule.matched ? 'ruleMatched' : 'ruleUnmatched', { rule: rule.name,
+        reason: rule.reason })}</Hint>)}
+      {direction && <Hint>{t('directionLine', { intent: t(direction.implementation_requested ? 'intentYes' : 'intentNo'),
+        basis: valueLabel(t, 'targetBasis', direction.target_basis),
+        design: t(direction.requires_design_decision ? 'designNeeded' : 'designNotNeeded') })} {t('directionEvidence',
+          { evidence: direction.evidence })}</Hint>}
+    </div>],
+  ] : []
+  const version = <button type="button" className="dt-textlink dt-mono" onClick={() => navigate(settingsRoute('eval',
+    { version: mandate.policyVersion }))}>{mandate.policyVersion.slice(0, 8)}</button>
+  return <Section title={t('mandateDetails')} icon="shield">
+    <KeyValues rows={[...rows, [t('term.scope'), legacy ? t('legacyScopeShort') : mandate.scope || t('empty')],
+      ...facts.map((item): [string, string] => [valueLabel(t, 'basis', item.name), fact(item)]),
+      ...legacy ? [] : [[t('policyVersion'), version] as [string, ReactNode]]]} />
+  </Section>
+}
+
+export function TicketPage({ id }: { id: string }) {
+  const { t, call, renderSessionActivity } = usePanel()
+  const { data, error, reload } = usePoll(() => call('GET tickets/:id', { id }), [id])
+  const after = async (request: Promise<unknown>) => { await request; await reload() }
+  if (!data) return <><PageHead
+    title={t('term.ticket')} />{error instanceof ApiError && error.missing ? <Hint>{t('ticketNotFound')}</Hint> : <LoadState
+      error={error} loading />}</>
+  const status = ticketMark(t, data)
+  const actor = actorName(t, data.mandate.actor)
+  const { legacy } = data.basis
+  const undelivered = data.inputs.filter(input => !input.delivered)
+  const opening = data.threads.find(thread => thread.url)
+  const ended = data.ended && (() => {
+    const outcome = valueLabel(t, 'outcome', data.ended.outcome), reason = reasonLabel(t, data.ended.reason), time = when(data.ended.at,
+      t('lang'))
+    return reason ? t('endedAt', { time, outcome, reason }) : t('endedAtShort', { time, outcome })
+  })()
+  const channel = data.channels[0]
+  return <>
+    <PageHead title={data.title}>
+      {opening?.url && <ActionLink href={opening.url}>{t('openThread', { source: valueLabel(t, 'source', opening.source) })}</ActionLink>}
+      {data.actions.retry && <ConfirmButton variant="outline" icon="refresh" label={t('retry')} title={t('retryTitle')}
+        message={t('retryConfirm', { title: data.title })}
+        onConfirm={() => after(call('POST tickets/:id/retry', { id }))} />}
+      {data.sessionId && <SessionButton variant="outline" sessionId={data.sessionId} />}
+    </PageHead>
+    {error && <LoadState error={error} loading={false} />}
+    <div className="dt-row-meta dt-status-line">
+      <StageMark state={status.dot} icon={status.icon} label={status.label} />
+      <LabelValue label={t('ticketMandateLabel')} value={valueLabel(t, 'strength', data.mandate.strength)} />
+      <LabelValue label={t('ticketActorLabel')} value={`${valueLabel(t, 'source', data.mandate.actor.source)} · ${actor}`} />
+      <LabelValue label={t('ticketUpdatedLabel')} value={when(data.updatedAt, t('lang'))} />
+    </div>
+    {ended && <Hint>{ended}</Hint>}
+    {data.attention && <div className="dt-banner"><span className="dt-banner-label">{t('attentionPrefix')}</span><MarkdownLite
+      text={data.attention.question} />
+      {channel && <div className="dt-banner-actions">
+        <ActionLink href={channel.url} icon="message">{t('answerIn', { source: valueLabel(t, 'source', channel.source) })}</ActionLink>
+      </div>}</div>}
+    {data.deliveryError && <p className="dt-banner dt-danger dt-mono">
+      <span className="dt-banner-label">{t('deliveryFailedPrefix')}</span>{data.deliveryError}
+    </p>}
+    {data.sessionId && renderSessionActivity?.(data.sessionId)}
+    <div className="dt-ticket-layout">
+      <div className="dt-ticket-main">
+        <Replies assignments={data.assignments} />
+        {undelivered.length > 0 && <Section title={t('undeliveredInputs')} count={undelivered.length}>
+          <Hint>{data.deliveryError ? t('inputRetryHint') : data.paused ? t('inputPausedHint') : t('inputWaitingHint')}</Hint>
+          <InputList inputs={undelivered} />
+        </Section>}
+        {data.threads.length > 0 && <Section title={t('subscribedThreads')} count={data.threads.length}>
+          <ul className="dt-list">{data.threads.map(thread => <ThreadLine key={thread.key} thread={thread} ticketId={data.id}
+            context={thread.context} />)}</ul>
+        </Section>}
+        <div className="dt-details">
+          {/* A single Assignment adds nothing beyond the status line; list Assignments only once work has been resumed or handed over. */}
+          {data.assignments.length > 1 && <Details icon="queue" title={`${t('term.assignment')} · ${data.assignments.length}`} open><Assignments
+            ticket={data} /></Details>}
+          {data.inputs.length > undelivered.length && <Details icon="inbox" title={t('deliveredInputs',
+            { count: data.inputs.length - undelivered.length })}>
+            <InputList inputs={data.inputs.filter(input => input.delivered)} />
+          </Details>}
+        </div>
+      </div>
+      <aside className="dt-ticket-aside">
+        <MandateDetails ticket={data} actor={actor} />
+        <div className="dt-details">
+          {data.environment.length > 0 && <Details icon="settings" title={t('term.environment')}>
+            <table className="dt-table"><tbody>{data.environment.map(variable => <tr key={variable.key} title={localized(t,
+              variable.description)}>
+              <td className="dt-mono">{variable.key}</td><td className="dt-mono">{variable.value || <span
+                className="dt-hint">{t('empty')}</span>}</td>
+            </tr>)}</tbody></table>
+          </Details>}
+          <Details icon="message" title={t('term.channel')}>
+            <ul className="dt-plain-list">{data.channels.map((item, index) => <li key={index}>
+              <ExternalLink href={item.url} icon={item.source === 'github' ? 'pull' : 'message'}>{localized(t, item.label)}</ExternalLink>
+            </li>)}</ul>
+          </Details>
+          <Details icon="hash" title={t('identifiers')}>
+            <KeyValues rows={[[t('ticketId'), <span className="dt-mono">{data.id}</span>], [t('executionDirectory'), <span
+              className="dt-mono">{data.directory ?? t('empty')}</span>],
+              ...legacy && data.mandate.scope ? [[t('legacyAssignment'), <span
+                className="dt-mono dt-clamp">{data.mandate.scope}</span>] as [string, ReactNode]] : []]} />
+          </Details>
+        </div>
+      </aside>
+    </div>
+    {data.actions.stop && <div className="dt-danger-zone">
+      <span className="dt-hint">{t('stopHint')}</span>
+      <ConfirmButton variant="outline" label={t('stop')} title={t('stopConfirmTitle')} message={t('stopConfirm', { title: data.title })}
+        onConfirm={() => after(call('POST tickets/:id/stop', { id }))} />
+    </div>}
+  </>
+}
