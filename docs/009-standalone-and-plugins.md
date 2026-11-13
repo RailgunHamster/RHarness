@@ -148,7 +148,7 @@ Stop-ScheduledTask -TaskName "RHarnessGateway"; Start-ScheduledTask -TaskName "R
 | 插件 ID | 分类 | 默认状态 | 核心能力说明 |
 | --- | --- | --- | --- |
 | `dsh-claw-assistant` | 个人助理 / UI | 启用 | 顶栏「个人助理」独立对话窗；支持图文问答、交互式提问卡，并在需要改代码/查机器时携**一字不改的用户原话**单向递交至工程引擎 |
-| `ui-workbench` | UI 插槽 | 启用 | 顶栏「工程对话」三栏研发工作台（话题侧栏 + 内联工单回执 + 右侧实时执行检视器） |
+| `ui-workbench` | UI 插槽 | 启用 | 顶栏「工程对话」研发工作台（话题侧栏 + 全宽内联工单回执对话区 + 下方实时执行检视器） |
 | `dsh-memory` | 记忆引擎 | 启用 | 高信噪比长期记忆库（初始为空白库），支持常驻置顶（Pinned）、混合语义自动召回、30 天防误删备份箱与多阶段纪念日倒计时（`milestone`） |
 | `dsh-lossless-context` | 记忆引擎 | 启用 | 无损分层摘要树（`lossless-claw` 模式）：滑出活跃窗口的历史对话自动构建 L1/L2 DAG 摘要树，可通过 `lcm_grep` 与 `lcm_expand` 100% 无损展开原文 |
 | `dsh-self-improving` | 记忆引擎 | 启用 | 复利纠错经验账本（安全受控的 Propose 审阅晋升模式，绝不暗改系统 Prompt）+ `/btw` 零上下文污染旁路快问 |

@@ -131,8 +131,8 @@ function MessageReceiptCard({
           onClick={() => onInspectSession(receipt.sessionId!, receipt.ticketId)}
         >
           {isSelected
-            ? (lang === 'zh' ? '正在右侧检视' : 'Inspecting')
-            : (lang === 'zh' ? '在右侧检视执行流' : 'Inspect execution')}
+            ? (lang === 'zh' ? '正在下方检视' : 'Inspecting')
+            : (lang === 'zh' ? '在下方检视执行流 ↓' : 'Inspect execution ↓')}
         </button>}
       </div>
 
@@ -534,7 +534,7 @@ function ConversationForm({
       if (!mounted.current) return
       setFollow(true)
       setRefresh(value => value + 1)
-      setStatus(lang === 'zh' ? '已发送。下方回执卡与右侧面板会实时同步执行进展。' : 'Sent. Receipt card and right-hand inspector will update live.')
+      setStatus(lang === 'zh' ? '已发送。对话流与下方实时执行检视器会同步显示进展。' : 'Sent. Conversation stream and bottom live inspector will update live.')
     } catch (err) { if (mounted.current) setStatus(err instanceof Error ? err.message : String(err)) }
     finally { sending.current = false; if (mounted.current) setBusy(false) }
   }

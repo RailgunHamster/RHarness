@@ -348,7 +348,7 @@ export function LiveWorkspace({
 
   return <section id="live-execution" className="dt-live-workspace" aria-label={lang === 'zh' ? '实时执行' : 'Live execution'}>
     <div className="dt-live-head"><div><h2>{lang === 'zh' ? '实时执行检视器' : 'Live execution inspector'}</h2>
-      <span className="dt-hint">{lang === 'zh' ? '点击左侧消息回执可切换检视目标 · 每秒自动更新' : 'Click any message receipt to inspect · Updates every second'}
+      <span className="dt-hint">{lang === 'zh' ? '点击上方消息回执可切换检视目标 · 每秒自动更新' : 'Click any message receipt above to inspect · Updates every second'}
         {live.updated && ` · ${live.updated}`}</span></div>
       <div className="dt-row-buttons">
         {manual && <Button size="sm" onClick={() => setManual(false)}>{lang === 'zh' ? '自动关注运行中的工单' : 'Follow running tickets'}</Button>}
