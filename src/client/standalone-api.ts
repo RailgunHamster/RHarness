@@ -262,6 +262,73 @@ export interface AssistantMessageInfo {
   at: string
   replyMeta?: AssistantReplyMetaInfo
   handoff?: EngineeringHandoffInfo
+  sticker?: { id: string; name: string; tags: string[]; emotion?: string }
+}
+export interface AssistantPersonaConfigInfo {
+  presetId: 'warm-witty' | 'lively-playful' | 'calm-gentle' | 'concise-neutral'
+  assistantName: string
+  userAddress: string
+  verbosity: 'brief' | 'balanced' | 'detailed'
+  kaomojiDensity: 'off' | 'light' | 'rich'
+  humorLevel: 'off' | 'light' | 'lively'
+  stickerFrequency: 'off' | 'occasional' | 'lively'
+  stickerCooldownTurns: number
+  learningEnabled: boolean
+  customInstructions: string
+}
+export interface PersonaPresetInfo {
+  id: AssistantPersonaConfigInfo['presetId']
+  label: { zh: string; en: string }
+  description: { zh: string; en: string }
+}
+export interface PersonaLearningInfo {
+  id: string
+  kind: 'style' | 'address' | 'preference' | 'rapport' | 'boundary'
+  content: string
+  enabled: boolean
+  source: 'user' | 'auto' | 'agent'
+  createdAt: string
+  updatedAt: string
+}
+export interface StickerInfo {
+  id: string
+  name: string
+  tags: string[]
+  emotion?: string
+  fileName: string
+  mediaType: string
+  sizeBytes: number
+  createdAt: string
+  updatedAt: string
+  useCount: number
+  lastUsedAt?: string
+  source: 'upload' | 'chat' | 'feishu'
+}
+export interface AmbientHomeCityInfo { name: string; latitude: number; longitude: number; timezone: string }
+export interface AssistantAmbientConfigInfo { homeCity: AmbientHomeCityInfo; weatherEnabled: boolean; newsEnabled: boolean }
+export interface AmbientSnapshotInfo {
+  at: string
+  beijingTime: string
+  lunarDate: string
+  solarTerm: { current: string; next: string; daysToNext: number }
+  period: string
+  dayType: 'workday' | 'holiday'
+  dayReason: string
+  weekdayLabel: string
+  homeCity: AmbientHomeCityInfo
+  weather?: { cityName: string; fetchedAt: string; current: { temperatureC: number; label: string }; oneLiner: string }
+  weatherStale?: boolean
+  oneLiner: string
+}
+export interface NewsItemInfo { title: string; url: string; source: string; topic: string; publishedAt?: string }
+export interface PersonaAmbientStateInfo {
+  config: AssistantPersonaConfigInfo
+  presets: PersonaPresetInfo[]
+  learnings: PersonaLearningInfo[]
+  stickers: StickerInfo[]
+  ambientConfig: AssistantAmbientConfigInfo
+  ambient: AmbientSnapshotInfo
+  news: { fetchedAt?: string; stale?: boolean; items: NewsItemInfo[] }
 }
 export interface AssistantChatBackupInfo {
   id: string
@@ -315,6 +382,7 @@ export interface SessionsPayload {
   plugins?: PluginDescriptorInfo[]
   assistantMessages?: AssistantMessageInfo[]
   assistantLiveRun?: LiveSessionRunInfo | null
+  assistantAmbient?: AmbientSnapshotInfo
   assistantChatBackups?: AssistantChatBackupInfo[]
   assistantContextConfig?: AssistantContextConfigInfo
   clawfeedItems?: ClawFeedItemInfo[]

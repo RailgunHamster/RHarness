@@ -148,6 +148,7 @@ Stop-ScheduledTask -TaskName "RHarnessGateway"; Start-ScheduledTask -TaskName "R
 | 插件 ID | 分类 | 默认状态 | 核心能力说明 |
 | --- | --- | --- | --- |
 | `dsh-claw-assistant` | 个人助理 / UI | 启用 | 顶栏「个人助理」独立对话窗；支持图文问答、交互式提问卡，并在需要改代码/查机器时携**一字不改的用户原话**单向递交至工程引擎 |
+| `dsh-assistant-persona` | 个人助理 / UI | 启用 | **仅挂载个人助理**的人设·表情·自学习与环境感知：人设预设与风格旋钮、颜文字库、用户上传表情包图库（`~/.rharness/stickers/`，Web 预览/增删 + 助理工具增删 + 飞书真实图片）、自动生效可审计的相处默契学习、农历/节气/工作日节律、常驻城市天气（Open-Meteo 零 Key）与新闻热点。入口在个人助理标题栏的 **「🎭 人设·表情·感知」**：标题栏实时显示常驻城市/天气/农历胶囊，城市、人设、表情与学习条目既可在 UI 修改，也可直接对助理说「把常驻城市改成上海」「把我刚发的图存为表情包」「记住闲聊简短一点」，助理会调用 `ambient_set_home_city` / `sticker_*` / `persona_learning_*` 工具自己改好 |
 | `ui-workbench` | UI 插槽 | 启用 | 顶栏「工程对话」研发工作台（话题侧栏 + 全宽内联工单回执对话区 + 下方实时执行检视器） |
 | `dsh-memory` | 记忆引擎 | 启用 | 高信噪比长期记忆库（初始为空白库），支持常驻置顶（Pinned）、混合语义自动召回、30 天防误删备份箱与多阶段纪念日倒计时（`milestone`） |
 | `dsh-lossless-context` | 记忆引擎 | 启用 | 无损分层摘要树（`lossless-claw` 模式）：滑出活跃窗口的历史对话自动构建 L1/L2 DAG 摘要树，可通过 `lcm_grep` 与 `lcm_expand` 100% 无损展开原文 |

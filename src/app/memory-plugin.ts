@@ -927,6 +927,8 @@ export function buildPluginCatalog(input: {
   totalCostCny?: number
   lcmNodeCount?: number
   learningCount?: number
+  personaStickerCount?: number
+  personaLearningCount?: number
   progressCardCount?: number
   extraPrivatePlugins?: PluginDescriptor[]
   sourcesEnabled: { panel: boolean; feishu: boolean; github: boolean }
@@ -955,6 +957,26 @@ export function buildPluginCatalog(input: {
       stats: {
         zh: `${input.assistantMessageCount ?? 0} 条助理消息`,
         en: `${input.assistantMessageCount ?? 0} assistant messages`,
+      },
+    },
+    {
+      id: 'dsh-assistant-persona',
+      packageName: '@rharness/plugin-assistant-persona-ambient',
+      title: { zh: '个人助理人设·表情包·自学习与环境感知 (Persona, Stickers, Learning & Ambient)', en: 'Assistant Persona, Stickers, Self-Learning & Ambient Awareness' },
+      description: {
+        zh: '仅挂载个人助理：三层人设（身份契约+风格旋钮+语气示例）、颜文字库、用户上传表情包图库（Web 预览/增删 + 助理工具增删 + 飞书真实图片）、自动生效可审计的相处默契学习、农历/节气/工作日节律、常驻城市天气与新闻热点感知（城市可在 UI 或让助理改）。',
+        en: 'Assistant-only persona presets, kaomoji, user-uploaded sticker gallery (UI + tools + Feishu images), auto-applied auditable learnings, lunar/solar-term rhythm, home-city weather and news briefs.',
+      },
+      category: 'assistant',
+      enabled: isEnabled('dsh-assistant-persona'),
+      canToggle: true,
+      roles: ['assistant', 'ui-slot'],
+      tools: ['persona_get', 'persona_update', 'sticker_list', 'sticker_add_from_message', 'sticker_delete', 'sticker_update', 'persona_learning_list', 'persona_learning_add', 'persona_learning_delete', 'ambient_get', 'ambient_set_home_city', 'weather_query', 'news_brief'],
+      promptSection: 'rharness-assistant-persona-ambient',
+      uiSlot: '个人助理标题栏 🎭 人设·表情·感知 工作台',
+      stats: {
+        zh: `${input.personaStickerCount ?? 0} 张表情包 · ${input.personaLearningCount ?? 0} 条已学默契`,
+        en: `${input.personaStickerCount ?? 0} stickers · ${input.personaLearningCount ?? 0} learnings`,
       },
     },
     ...(showPersonalSkills

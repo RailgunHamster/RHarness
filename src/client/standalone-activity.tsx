@@ -262,6 +262,7 @@ export function LiveWorkspace({
     plugins?: PluginDescriptorInfo[]
     assistantMessages?: AssistantMessageInfo[]
     assistantLiveRun?: LiveSessionRunInfo | null
+    assistantAmbient?: import('./standalone-api.ts').AmbientSnapshotInfo
     assistantChatBackups?: AssistantChatBackupInfo[]
     assistantContextConfig?: AssistantContextConfigInfo
     clawfeedItems?: ClawFeedItemInfo[]
@@ -324,6 +325,7 @@ export function LiveWorkspace({
           ...(result.plugins ? { plugins: result.plugins } : {}),
           ...(result.assistantMessages ? { assistantMessages: result.assistantMessages } : {}),
           ...(result.assistantLiveRun !== undefined ? { assistantLiveRun: result.assistantLiveRun } : {}),
+          ...(result.assistantAmbient ? { assistantAmbient: result.assistantAmbient } : {}),
           ...(result.assistantChatBackups ? { assistantChatBackups: result.assistantChatBackups } : {}),
           ...(result.assistantContextConfig ? { assistantContextConfig: result.assistantContextConfig } : {}),
           ...(result.clawfeedItems ? { clawfeedItems: result.clawfeedItems } : {}),

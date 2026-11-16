@@ -17,7 +17,7 @@ import { Store } from '../app/store.ts'
 import { feishuKind } from '../sources/feishu.ts'
 import { githubKind } from '../sources/github.ts'
 import { PANEL_SOURCE, panelKind, panelTrigger } from '../sources/panel.ts'
-import { PANEL_MESSAGE_BODY_BYTES, panelContent, panelWireContent, storePanelContent } from '../sources/panel-images.ts'
+import { PANEL_MESSAGE_BODY_BYTES, panelContent, panelWireContent, readPanelImage, storePanelContent } from '../sources/panel-images.ts'
 import { health } from '../sources/host.ts'
 import { packagePath } from '../infra/paths.ts'
 import { sameOrigin } from '../app/http.ts'
@@ -112,6 +112,36 @@ import {
   recordModelTurnUsage,
 } from '../app/runtime-guard-plugin.ts'
 import {
+  PERSONA_PRESETS,
+  buildAmbientPromptSection,
+  buildAmbientSnapshot,
+  buildAssistantPersonaAmbientTools,
+  buildPersonaPromptSection,
+  defaultAssistantAmbientConfig,
+  defaultAssistantPersonaConfig,
+  deleteStickerFile,
+  extractPersonaLearningFromUserMessage,
+  fetchAllNews,
+  fetchWeatherForCity,
+  geocodeCity,
+  isNewsCacheFresh,
+  isWeatherCacheFresh,
+  normalizeAssistantAmbientConfig,
+  normalizeAssistantPersonaConfig,
+  parseStickerMarker,
+  readStickerFile,
+  savePersonaLearning,
+  saveStickerFromBase64,
+  saveStickerFromBuffer,
+  stickerAllowedByPolicy,
+  type AssistantAmbientConfig,
+  type AssistantPersonaConfig,
+  type NewsCache,
+  type PersonaLearningEntry,
+  type StickerRecord,
+  type WeatherCache,
+} from '../app/assistant-persona-and-ambient.ts'
+import {
   addFeishuMessageReaction,
   buildClawFeedPluginTools,
   buildPersonalSkillsPluginTools,
@@ -125,7 +155,9 @@ import {
   loadStandaloneFeishuCredentials,
   removeFeishuMessageReaction,
   sendFeishuDirectMessage,
+  sendFeishuImageMessage,
   startNativeFeishuDmBridge,
+  uploadFeishuImage,
   type FeishuStreamingCardSession,
 } from '../app/personal-skills.ts'
 import {
@@ -538,6 +570,90 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       return seeded
     }
     return existing
+  }
+
+  // ---- Personal Assistant Persona / Stickers / Learning / Ambient (`dsh-assistant-persona`, Assistant-only) ----
+  const getPersonaConfig = (): AssistantPersonaConfig => {
+    if (!runtime) return defaultAssistantPersonaConfig()
+    return normalizeAssistantPersonaConfig(runtime.store.get(KV.persona.config) ?? defaultAssistantPersonaConfig())
+  }
+  const setPersonaConfig = (next: AssistantPersonaConfig): void => {
+    if (!runtime) return
+    runtime.store.set(KV.persona.config, normalizeAssistantPersonaConfig(next))
+  }
+  const getPersonaLearnings = (): PersonaLearningEntry[] => (runtime ? (runtime.store.get(KV.persona.learnings) ?? []) : [])
+  const setPersonaLearnings = (next: PersonaLearningEntry[]): void => { if (runtime) runtime.store.set(KV.persona.learnings, next) }
+  const getStickerRecords = (): StickerRecord[] => (runtime ? (runtime.store.get(KV.persona.stickers) ?? []) : [])
+  const setStickerRecords = (next: StickerRecord[]): void => { if (runtime) runtime.store.set(KV.persona.stickers, next) }
+  const getAmbientConfig = (): AssistantAmbientConfig => {
+    if (!runtime) return defaultAssistantAmbientConfig()
+    return normalizeAssistantAmbientConfig(runtime.store.get(KV.ambient.config) ?? defaultAssistantAmbientConfig())
+  }
+  const setAmbientConfig = (next: AssistantAmbientConfig): void => {
+    if (!runtime) return
+    runtime.store.set(KV.ambient.config, normalizeAssistantAmbientConfig(next))
+  }
+  const getWeatherCache = (): WeatherCache | undefined => runtime?.store.get(KV.ambient.weather)
+  const setWeatherCache = (next: WeatherCache): void => { if (runtime) runtime.store.set(KV.ambient.weather, next) }
+  const getNewsCache = (): NewsCache | undefined => runtime?.store.get(KV.ambient.news)
+  const setNewsCache = (next: NewsCache): void => { if (runtime) runtime.store.set(KV.ambient.news, next) }
+  const getAmbientSnapshot = () => {
+    const cfg = getAmbientConfig()
+    const profiles = runtime?.store.get(KV.modelProfiles.config)
+    return buildAmbientSnapshot(cfg, getWeatherCache(), new Date(), {
+      ...(profiles?.dayModeOverride ? { dayModeOverride: profiles.dayModeOverride } : {}),
+      ...(profiles?.customHolidays ? { customHolidays: profiles.customHolidays } : {}),
+      ...(profiles?.customWorkdays ? { customWorkdays: profiles.customWorkdays } : {}),
+    })
+  }
+  /** Background ambient refresh: home-city weather every ~45 min + news every ~90 min; failures degrade silently to stale cache. */
+  const refreshAmbientCachesInBackground = async (): Promise<void> => {
+    try {
+      if (!runtime || !isPluginEnabled('dsh-assistant-persona')) return
+      const cfg = getAmbientConfig()
+      if (cfg.weatherEnabled && !isWeatherCacheFresh(getWeatherCache(), cfg.homeCity.name)) {
+        try { setWeatherCache(await fetchWeatherForCity(cfg.homeCity)) } catch {}
+      }
+      if (cfg.newsEnabled && !isNewsCacheFresh(getNewsCache())) {
+        try { setNewsCache(await fetchAllNews()) } catch {}
+      }
+    } catch { /* store may already be closed during shutdown/tests */ }
+  }
+  /** If the model appended `[sticker:...]`, validates it against the gallery + frequency/cooldown policy and attaches it. */
+  const attachStickerToBotText = (rawText: string): { text: string; sticker?: StickerRecord } => {
+    const records = getStickerRecords()
+    if (!records.length) return { text: rawText }
+    const parsed = parseStickerMarker(rawText, records)
+    if (!parsed.sticker) return { text: parsed.cleanText }
+    const cfg = getPersonaConfig()
+    const recentBotFlags = (runtime.store.get(KV.assistant.messages) ?? []).filter(m => m.bot).slice(-6).map(m => Boolean(m.sticker))
+    if (!stickerAllowedByPolicy(cfg, recentBotFlags)) return { text: parsed.cleanText }
+    const used: StickerRecord = { ...parsed.sticker, useCount: parsed.sticker.useCount + 1, lastUsedAt: new Date().toISOString() }
+    setStickerRecords(records.map(r => (r.id === used.id ? used : r)))
+    return { text: parsed.cleanText, sticker: used }
+  }
+  /** Sends the attached sticker as a real Feishu image (uploaded once per sticker, `image_key` cached on the record). */
+  const deliverFeishuSticker = async (sticker: StickerRecord): Promise<void> => {
+    try {
+      let key = sticker.feishuImageKey
+      if (!key) {
+        const bytes = readStickerFile(sticker)
+        if (!bytes) return
+        key = await uploadFeishuImage(bytes)
+        if (key) setStickerRecords(getStickerRecords().map(r => (r.id === sticker.id ? { ...r, feishuImageKey: key } : r)))
+      }
+      if (key) await sendFeishuImageMessage(key)
+    } catch {}
+  }
+  const autoLearnPersonaFromUserText = (text: string): void => {
+    if (!isPluginEnabled('dsh-assistant-persona')) return
+    const cfg = getPersonaConfig()
+    if (!cfg.learningEnabled || !text.trim()) return
+    const learned = extractPersonaLearningFromUserMessage(text)
+    if (learned) {
+      const saved = savePersonaLearning(getPersonaLearnings(), { ...learned, source: 'auto' })
+      setPersonaLearnings(saved.list)
+    }
   }
 
   const broadcastMemoriesStateToPeers = async (mode: 'merge' | 'replace' = 'merge'): Promise<void> => {
@@ -1374,11 +1490,12 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       }
 
       if (event.type === 'assistant/message') {
-        const text = (event.data?.message?.content ?? [])
+        const rawText = (event.data?.message?.content ?? [])
           .map(part => (part.type === 'text' && typeof part.text === 'string' ? part.text : ''))
           .join('')
           .trim()
-        if (text) {
+        if (rawText) {
+          const { text, sticker } = attachStickerToBotText(rawText)
           const list = runtime.store.get(KV.assistant.messages) ?? []
           const replyMeta = buildAssistantReplyMeta(event.data?.turn, event.data?.model, text)
           list.push({
@@ -1388,6 +1505,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             text,
             at: new Date().toISOString(),
             replyMeta,
+            ...(sticker ? { sticker: { id: sticker.id, name: sticker.name, tags: sticker.tags, ...(sticker.emotion ? { emotion: sticker.emotion } : {}) } } : {}),
           })
           runtime.store.set(KV.assistant.messages, list)
           void broadcastAssistantStateToPeers('merge')
@@ -1400,6 +1518,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             void (async () => {
               try {
                 await pendingFeishu.streamCard.finish(text)
+                if (sticker) await deliverFeishuSticker(sticker)
               } finally {
                 if (pendingFeishu.reactionId) {
                   await removeFeishuMessageReaction(pendingFeishu.messageId, pendingFeishu.reactionId)
@@ -1442,8 +1561,46 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         name: 'rharness-claw-assistant-persona',
         text: () => buildAssistantSystemPrompt(),
       })
+      // Persona / stickers / learning / ambient sections & tools are Personal-Assistant-only (never Eval/Worker)
+      agent.ctx.systemPrompt?.section({
+        name: 'rharness-assistant-persona-ambient',
+        text: () => {
+          if (!isPluginEnabled('dsh-assistant-persona')) return ''
+          return [
+            buildPersonaPromptSection(getPersonaConfig(), getPersonaLearnings(), getStickerRecords()),
+            '',
+            buildAmbientPromptSection(getAmbientSnapshot()),
+          ].join('\n')
+        },
+      })
       for (const bridgeTool of buildAssistantBridgeTools(() => runtime)) {
         agent.ctx.tools?.register(bridgeTool)
+      }
+      for (const pat of buildAssistantPersonaAmbientTools({
+        isEnabled: () => isPluginEnabled('dsh-assistant-persona'),
+        getPersonaConfig,
+        setPersonaConfig,
+        getLearnings: getPersonaLearnings,
+        setLearnings: setPersonaLearnings,
+        getStickers: getStickerRecords,
+        setStickers: setStickerRecords,
+        getAmbientConfig,
+        setAmbientConfig,
+        getWeatherCache,
+        setWeatherCache,
+        getNewsCache,
+        setNewsCache,
+        getAssistantMessages: () => (runtime ? (runtime.store.get(KV.assistant.messages) ?? []) : []),
+        readStoredImageBytes: async part => {
+          const p = part as { image?: { id: string; path: string; mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; bytes: number; name?: string }; data?: string }
+          if (p.image) {
+            try { return await readPanelImage(p.image) } catch { return undefined }
+          }
+          if (typeof p.data === 'string' && p.data) return Buffer.from(p.data.replace(/^data:[^;,]+;base64,/, ''), 'base64')
+          return undefined
+        },
+      })) {
+        agent.ctx.tools?.register(pat)
       }
     }
 
@@ -1621,6 +1778,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   }) as never)
 
   runtime = new Runtime(host.ctx, machine, () => { void restartRuntime() })
+  // Warm ambient caches shortly after boot, then keep weather/news fresh in the background
+  setTimeout(() => { void refreshAmbientCachesInBackground() }, 3000)
+  const ambientRefreshTimer = setInterval(() => { void refreshAmbientCachesInBackground() }, 15 * 60 * 1000)
+  ambientRefreshTimer.unref?.()
 
   const runEphemeralBtwSideQuestion = async (question: string): Promise<string> => {
     const activeModels = resolveActiveRoleModels()
@@ -1679,7 +1840,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       startNativeFeishuDmBridge({
         signal: rt.lifetime,
         isEnabled: () => isPluginEnabled('dsh-personal-skills') && isPluginEnabled('dsh-claw-assistant'),
-        onOwnerMessage: async ({ messageId, text, createTimeMs, reactionId }) => {
+        onOwnerMessage: async ({ messageId, text, createTimeMs, reactionId, images }) => {
           const parsedBtw = parseBtwSideQuestion(text)
           if (parsedBtw.isBtw && isPluginEnabled('dsh-self-improving')) {
             const btwCard = await createFeishuStreamingCardSession({
@@ -1701,14 +1862,25 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             if (reactionId) void removeFeishuMessageReaction(messageId, reactionId)
             return undefined
           }
+          const feishuImageParts = (images ?? []).map(img => ({
+            type: 'image' as const,
+            mediaType: img.mediaType,
+            data: img.data.toString('base64'),
+            ...(img.name ? { name: img.name } : {}),
+          }))
+          const storedFeishuContent = feishuImageParts.length
+            ? await storePanelContent(stateDir, [{ type: 'text', text }, ...feishuImageParts])
+            : undefined
           list.push({
             id: msgId,
             sender: 'operator',
             text: `📱 [飞书私聊] ${text}`,
             at,
+            ...(storedFeishuContent ? { content: storedFeishuContent } : {}),
           })
           rt.store.set(KV.assistant.messages, list)
           void broadcastAssistantStateToPeers('merge')
+          autoLearnPersonaFromUserText(text)
 
           if (isPluginEnabled('dsh-self-improving') && text.trim()) {
             const corr = detectUserCorrectionFromMessage(text, ASSISTANT_SESSION_ID)
@@ -1750,10 +1922,16 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
                 ...(reactionId ? { reactionId } : {}),
                 streamCard,
               })
+              const feishuAgentContent: unknown[] = [{ type: 'text', text: `[message_id: ${msgId}] (来自主人飞书私聊)\n${text}` }]
+              for (const part of storedFeishuContent ?? []) {
+                if (part.type === 'image') {
+                  feishuAgentContent.push({ type: 'image', path: part.image.path, mediaType: part.image.mediaType, ...(part.image.name ? { name: part.image.name } : {}) })
+                }
+              }
               resolved.agent.followup({
                 id: msgId,
                 role: 'user',
-                content: [{ type: 'text', text: `[message_id: ${msgId}] (来自主人飞书私聊)\n${text}` }],
+                content: feishuAgentContent,
                 source: { kind: 'user' },
               } as never)
             }
@@ -1973,6 +2151,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             totalCostCny,
             lcmNodeCount: lcmDag.nodes.length,
             learningCount: learningsList.length,
+            personaStickerCount: getStickerRecords().length,
+            personaLearningCount: getPersonaLearnings().length,
             progressCardCount: Object.keys(progressCardsMap).length,
             ...(privateToolkitMod
               ? { extraPrivatePlugins: [privateToolkitMod.buildRHToolkitPluginDescriptor(isPluginEnabled('dsh-rhtoolkit'))] }
@@ -2014,6 +2194,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             plugins: pluginsList,
             assistantMessages,
             assistantLiveRun: summarizeSessionLiveRun(ASSISTANT_SESSION_ID) ?? null,
+            assistantAmbient: getAmbientSnapshot(),
             assistantChatBackups: listAndPurgeAssistantChatBackups(stateDir),
             assistantContextConfig: getAssistantContextConfig(),
             clawfeedItems: runtime.store.get(KV.clawfeed.items) ?? [],
@@ -2346,6 +2527,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           list.push(userMsg)
           runtime.store.set(KV.assistant.messages, list)
           void broadcastAssistantStateToPeers('merge')
+          autoLearnPersonaFromUserText(text)
 
           if (isPluginEnabled('dsh-self-improving') && text.trim()) {
             const corr = detectUserCorrectionFromMessage(text, ASSISTANT_SESSION_ID)
@@ -2486,6 +2668,186 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             })),
           )
           sendJson(res, 200, { messages: refreshed })
+          return
+        }
+
+        // ---- Personal Assistant Persona / Stickers / Learning / Ambient endpoints (`dsh-assistant-persona`) ----
+        if (sub === 'assistant/persona-state' || sub.startsWith('assistant/stickers') || sub.startsWith('assistant/persona') || sub.startsWith('assistant/ambient')) {
+          if (!isPluginEnabled('dsh-assistant-persona')) { sendJson(res, 404, { error: 'Assistant Persona & Ambient plugin is disabled' }); return }
+          const personaStatePayload = () => ({
+            config: getPersonaConfig(),
+            presets: PERSONA_PRESETS,
+            learnings: getPersonaLearnings(),
+            stickers: getStickerRecords().map(s => ({ ...s, feishuImageKey: undefined })),
+            ambientConfig: getAmbientConfig(),
+            ambient: getAmbientSnapshot(),
+            news: getNewsBriefPayload(),
+          })
+          const getNewsBriefPayload = () => {
+            const cache = getNewsCache()
+            return cache ? { fetchedAt: cache.fetchedAt, stale: !isNewsCacheFresh(cache), items: cache.items.slice(0, 30) } : { items: [] as NewsCache['items'], stale: true }
+          }
+          if (req.method === 'GET' && sub === 'assistant/persona-state') {
+            void refreshAmbientCachesInBackground()
+            sendJson(res, 200, personaStatePayload())
+            return
+          }
+          if (req.method === 'PUT' && sub === 'assistant/persona/config') {
+            const body = await readJsonBody(req, 256 * 1024)
+            const next = normalizeAssistantPersonaConfig({ ...getPersonaConfig(), ...(body.config ?? body) })
+            setPersonaConfig(next)
+            sendJson(res, 200, { config: next })
+            return
+          }
+          if (req.method === 'POST' && sub === 'assistant/persona/learnings') {
+            const body = await readJsonBody(req, 64 * 1024)
+            const saved = savePersonaLearning(getPersonaLearnings(), {
+              content: String(body.content ?? ''),
+              ...(body.kind === 'style' || body.kind === 'address' || body.kind === 'preference' || body.kind === 'rapport' || body.kind === 'boundary' ? { kind: body.kind } : {}),
+              source: 'user',
+            })
+            setPersonaLearnings(saved.list)
+            sendJson(res, 200, { entry: saved.entry, learnings: saved.list })
+            return
+          }
+          const learningIdMatch = /^assistant\/persona\/learnings\/([^/]+)$/.exec(sub)
+          if (learningIdMatch && (req.method === 'PUT' || req.method === 'DELETE')) {
+            const id = decodeURIComponent(learningIdMatch[1]!)
+            const all = getPersonaLearnings()
+            if (req.method === 'DELETE') {
+              const next = all.filter(e => e.id !== id)
+              setPersonaLearnings(next)
+              sendJson(res, 200, { deleted: next.length !== all.length, learnings: next })
+              return
+            }
+            const body = await readJsonBody(req, 64 * 1024)
+            const next = all.map(e => e.id === id ? {
+              ...e,
+              ...(typeof body.content === 'string' && body.content.trim() ? { content: body.content.trim().slice(0, 240) } : {}),
+              ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+              ...(body.kind === 'style' || body.kind === 'address' || body.kind === 'preference' || body.kind === 'rapport' || body.kind === 'boundary' ? { kind: body.kind as PersonaLearningEntry['kind'] } : {}),
+              updatedAt: new Date().toISOString(),
+            } : e)
+            setPersonaLearnings(next)
+            sendJson(res, 200, { learnings: next })
+            return
+          }
+          if (req.method === 'GET' && sub === 'assistant/stickers') {
+            sendJson(res, 200, { stickers: getStickerRecords() })
+            return
+          }
+          if (req.method === 'POST' && sub === 'assistant/stickers') {
+            const body = await readJsonBody(req, 12 * 1024 * 1024)
+            const saved = saveStickerFromBase64(getStickerRecords(), {
+              dataBase64: String(body.dataBase64 ?? body.data ?? ''),
+              name: String(body.name ?? '未命名表情'),
+              ...(Array.isArray(body.tags) ? { tags: body.tags.map(String) } : {}),
+              ...(typeof body.emotion === 'string' ? { emotion: body.emotion } : {}),
+              source: 'upload',
+            })
+            setStickerRecords(saved.list)
+            sendJson(res, 200, { sticker: saved.entry, stickers: saved.list })
+            return
+          }
+          if (req.method === 'POST' && sub === 'assistant/stickers/from-message') {
+            const body = await readJsonBody(req, 64 * 1024)
+            const name = String(body.name ?? '').trim()
+            if (!name) throw new Error('Sticker name is required')
+            const msgs = runtime.store.get(KV.assistant.messages) ?? []
+            const messageId = typeof body.messageId === 'string' ? body.messageId : undefined
+            const imageIndex = typeof body.imageIndex === 'number' ? body.imageIndex : 0
+            const candidates = messageId ? msgs.filter(m => m.id === messageId) : [...msgs].reverse().filter(m => !m.bot)
+            let saved: ReturnType<typeof saveStickerFromBuffer> | undefined
+            for (const msg of candidates) {
+              const images = (msg.content ?? []).filter(p => p.type === 'image')
+              const part = images[imageIndex]
+              if (!part || part.type !== 'image') continue
+              const bytes = await readPanelImage(part.image).catch(() => undefined)
+              if (!bytes) continue
+              saved = saveStickerFromBuffer(getStickerRecords(), { data: bytes, name, ...(Array.isArray(body.tags) ? { tags: body.tags.map(String) } : {}), ...(typeof body.emotion === 'string' ? { emotion: body.emotion } : {}), source: 'chat' })
+              break
+            }
+            if (!saved) { sendJson(res, 404, { error: 'No usable image found in the referenced message' }); return }
+            setStickerRecords(saved.list)
+            sendJson(res, 200, { sticker: saved.entry, stickers: saved.list })
+            return
+          }
+          const stickerContentMatch = /^assistant\/stickers\/([^/]+)\/content$/.exec(sub)
+          if (req.method === 'GET' && stickerContentMatch) {
+            const rec = getStickerRecords().find(s => s.id === decodeURIComponent(stickerContentMatch[1]!))
+            const bytes = rec ? readStickerFile(rec) : undefined
+            if (!rec || !bytes) { sendJson(res, 404, { error: 'Sticker not found' }); return }
+            res.writeHead(200, { 'content-type': rec.mediaType, 'content-length': String(bytes.length), 'cache-control': 'private, max-age=3600', 'x-content-type-options': 'nosniff' })
+            res.end(bytes)
+            return
+          }
+          const stickerIdMatch = /^assistant\/stickers\/([^/]+)$/.exec(sub)
+          if (stickerIdMatch && (req.method === 'PUT' || req.method === 'DELETE')) {
+            const id = decodeURIComponent(stickerIdMatch[1]!)
+            const all = getStickerRecords()
+            const target = all.find(s => s.id === id)
+            if (!target) { sendJson(res, 404, { error: 'Sticker not found' }); return }
+            if (req.method === 'DELETE') {
+              deleteStickerFile(target)
+              const next = all.filter(s => s.id !== id)
+              setStickerRecords(next)
+              sendJson(res, 200, { deleted: true, stickers: next })
+              return
+            }
+            const body = await readJsonBody(req, 64 * 1024)
+            const updated: StickerRecord = {
+              ...target,
+              ...(typeof body.name === 'string' && body.name.trim() ? { name: body.name.trim().slice(0, 40) } : {}),
+              ...(Array.isArray(body.tags) ? { tags: [...new Set(body.tags.map((t: unknown) => String(t).trim()).filter(Boolean))].slice(0, 8) } : {}),
+              ...(typeof body.emotion === 'string' ? { emotion: body.emotion.trim().slice(0, 20) || undefined } : {}),
+              updatedAt: new Date().toISOString(),
+            }
+            const next = all.map(s => (s.id === id ? updated : s))
+            setStickerRecords(next)
+            sendJson(res, 200, { sticker: updated, stickers: next })
+            return
+          }
+          if (req.method === 'GET' && sub === 'assistant/ambient') {
+            void refreshAmbientCachesInBackground()
+            sendJson(res, 200, { config: getAmbientConfig(), ambient: getAmbientSnapshot(), news: getNewsBriefPayload() })
+            return
+          }
+          if (req.method === 'PUT' && sub === 'assistant/ambient/config') {
+            const body = await readJsonBody(req, 64 * 1024) as { config?: Record<string, unknown>; city?: unknown; homeCity?: Record<string, unknown> }
+            const cfgBody = (body.config ?? body) as Record<string, unknown>
+            const current = getAmbientConfig()
+            let next = normalizeAssistantAmbientConfig({ ...current, ...cfgBody, homeCity: { ...current.homeCity, ...((cfgBody.homeCity as Record<string, unknown> | undefined) ?? {}) } })
+            const requestedCity = typeof cfgBody.city === 'string' ? cfgBody.city : typeof body.city === 'string' ? body.city : undefined
+            if (requestedCity && requestedCity.trim() && requestedCity.trim() !== next.homeCity.name) {
+              const geo = await geocodeCity(requestedCity.trim())
+              if (!geo) { sendJson(res, 404, { error: `City not found: ${requestedCity}` }); return }
+              next = normalizeAssistantAmbientConfig({ ...next, homeCity: geo })
+            }
+            setAmbientConfig(next)
+            let weatherError: string | undefined
+            if (next.weatherEnabled) {
+              try { setWeatherCache(await fetchWeatherForCity(next.homeCity)) } catch (err) { weatherError = err instanceof Error ? err.message : String(err) }
+            }
+            sendJson(res, 200, { config: next, ambient: getAmbientSnapshot(), ...(weatherError ? { weatherError } : {}) })
+            return
+          }
+          if (req.method === 'POST' && sub === 'assistant/ambient/refresh') {
+            const cfg = getAmbientConfig()
+            const errors: string[] = []
+            if (cfg.weatherEnabled) { try { setWeatherCache(await fetchWeatherForCity(cfg.homeCity)) } catch (err) { errors.push(err instanceof Error ? err.message : String(err)) } }
+            if (cfg.newsEnabled) { try { setNewsCache(await fetchAllNews()) } catch (err) { errors.push(err instanceof Error ? err.message : String(err)) } }
+            sendJson(res, 200, { config: cfg, ambient: getAmbientSnapshot(), news: getNewsBriefPayload(), ...(errors.length ? { errors } : {}) })
+            return
+          }
+          if (req.method === 'GET' && sub === 'assistant/ambient/news') {
+            const topic = url.searchParams.get('topic') ?? undefined
+            if (!isNewsCacheFresh(getNewsCache())) void refreshAmbientCachesInBackground()
+            const cache = getNewsCache()
+            const items = cache ? (topic && topic !== '综合' ? cache.items.filter(i => i.topic === topic || i.topic === '综合') : cache.items).slice(0, 12) : []
+            sendJson(res, 200, { fetchedAt: cache?.fetchedAt, topic: topic ?? '综合', items })
+            return
+          }
+          sendJson(res, 404, { error: 'Unknown persona/ambient endpoint' })
           return
         }
 

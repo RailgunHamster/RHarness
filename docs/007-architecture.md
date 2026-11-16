@@ -339,6 +339,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/model-profiles.ts` | Named model configuration presets (Profile 1, 2, 3) with per-role N-segment time-of-day scheduling |
 | `src/app/memory-plugin.ts` | First-class Cordis/DSH plugin host and native SQLite Long-Term Memory plugin (`memory_save`, `memory_search`, `memory_list`, `memory_delete` and pinned prompt injection) |
 | `src/app/claw-assistant.ts` | Claw Personal Assistant plugin (`@rharness/plugin-claw-assistant`) and one-way verbatim handoff bridge to the Engineering Eval engine with independent refusal right |
+| `src/app/assistant-persona-and-ambient.ts` | Personal-Assistant-only Persona/Sticker/Learning/Ambient plugin (`@rharness/plugin-assistant-persona-ambient`): persona presets & prompt, kaomoji bank, `~/.rharness/stickers` gallery, auto-applied persona learnings, lunar/solar-term rhythm, Open-Meteo home-city weather and RSS news briefs, plus Assistant-only management tools |
 | `src/app/personal-skills.ts` | Personal assistant skills, native Protobuf `pbbp2` Feishu WebSocket bridge, dual-instance SiYuan knowledge base with privacy guardrails, ClawFeed mobile notification ledger and scheduled script tools |
 | `src/app/runtime-guard-plugin.ts` | `@rharness/plugin-runtime-guard` (Tokenjuice output compactor, `SessionLoopDetector` circuit breaker, external prompt-injection sanitizer) and `@rharness/plugin-model-usage` telemetry |
 | `src/app/lossless-and-learning.ts` | `@rharness/plugin-lossless-context` (hierarchical L1/L2 DAG summary tree, `lcm_grep`, `lcm_expand`) and `@rharness/plugin-self-improving` (correction ledger and `/btw` ephemeral side questions) |
@@ -474,6 +475,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/panel-images.spec.ts` | Local Panel image validation, content-addressed storage, Codex/DSH image projection and HTTP round-trips |
 | `tests/standalone-client.spec.tsx` | Durable per-topic drafts, storage failure feedback, send retention/clearing, image input, reply targets and live worker event polling |
 | `tests/standalone-workspace.spec.tsx` | Inline conversation-first workspace order, direct area navigation and language changes without losing the draft |
+| `tests/persona-ambient.spec.tsx` | Persona presets & prompt, sticker gallery file CRUD and marker/cooldown policy, persona learning extraction/dedupe, lunar/solar-term/weather/news ambient helpers, Assistant-only persona tools, and the 🎭 Persona/Sticker/Learning/Home-City workbench UI |
 | `tests/panel-draft.spec.ts` | Text and preference storage recovery, topic/path isolation, corrupt/unavailable storage and ordered image transactions |
 | `tests/standalone.spec.ts` | The standalone server, multi-provider catalog (`dsh`, `codex`, `claude`, `cursor` and `human`), Local Panel Source and Session Console |
 | `tests/standalone-events.spec.ts` | Incremental event cursors, live provider text/tool collectors, full-body trace snapshots, privacy, deduplication and session-isolated DSH log fallback |

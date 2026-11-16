@@ -2,6 +2,14 @@
  * Typed key-value store keys and key families grouped by the single component that owns and writes each family.
  * Readers and writers refer to a record by its entry here so each key is spelled once with its value type.
  */
+import type {
+  AssistantAmbientConfig,
+  AssistantPersonaConfig,
+  NewsCache,
+  PersonaLearningEntry,
+  StickerRecord,
+  WeatherCache,
+} from './app/assistant-persona-and-ambient.ts'
 import type { AssistantContextConfig, AssistantStoredMessage, PendingUserQuestion } from './app/claw-assistant.ts'
 import type { DeviceGroupPacket, DeviceIdentityRecord } from './app/device-group.ts'
 import type { LcmDagState, LearningEntry } from './app/lossless-and-learning.ts'
@@ -94,6 +102,17 @@ export const KV = {
     messages: record<AssistantStoredMessage[]>('claw-assistant-messages'),
     contextConfig: record<AssistantContextConfig>('claw-assistant-context-config'),
     questions: record<PendingUserQuestion[]>('claw-assistant-questions'),
+  },
+  /** Personal Assistant Persona, Stickers, Auto-Applied Learning & Ambient Awareness (`@rharness/plugin-assistant-persona-ambient`). */
+  persona: {
+    config: record<AssistantPersonaConfig>('assistant-persona-config'),
+    learnings: record<PersonaLearningEntry[]>('assistant-persona-learnings'),
+    stickers: record<StickerRecord[]>('assistant-sticker-records'),
+  },
+  ambient: {
+    config: record<AssistantAmbientConfig>('assistant-ambient-config'),
+    weather: record<WeatherCache>('assistant-ambient-weather-cache'),
+    news: record<NewsCache>('assistant-ambient-news-cache'),
   },
   /** ClawFeed External Git-Repo Plugin (`@rharness/plugin-clawfeed`) notification ring buffer. */
   clawfeed: {

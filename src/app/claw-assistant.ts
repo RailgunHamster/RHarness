@@ -90,6 +90,8 @@ export interface AssistantStoredMessage {
   at: string
   replyMeta?: AssistantReplyMeta
   handoff?: EngineeringHandoffStatus
+  /** Sticker attached below this bot reply (rendered as a real image in Web / Feishu). */
+  sticker?: { id: string; name: string; tags: string[]; emotion?: string }
 }
 
 export interface AssistantWireMessage {

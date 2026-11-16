@@ -2119,6 +2119,7 @@ export function StandaloneRoot() {
   const [plugins, setPlugins] = useState<PluginDescriptorInfo[]>([])
   const [assistantMessages, setAssistantMessages] = useState<AssistantMessageInfo[]>([])
   const [assistantLiveRun, setAssistantLiveRun] = useState<LiveSessionRunInfo | null>(null)
+  const [assistantAmbient, setAssistantAmbient] = useState<import('./standalone-api.ts').AmbientSnapshotInfo>()
   const [assistantChatBackups, setAssistantChatBackups] = useState<AssistantChatBackupInfo[]>([])
   const [assistantContextConfig, setAssistantContextConfig] = useState<AssistantContextConfigInfo>()
   const [clawfeedItems, setClawfeedItems] = useState<ClawFeedItemInfo[]>([])
@@ -2137,6 +2138,7 @@ export function StandaloneRoot() {
     plugins?: PluginDescriptorInfo[]
     assistantMessages?: AssistantMessageInfo[]
     assistantLiveRun?: LiveSessionRunInfo | null
+    assistantAmbient?: import('./standalone-api.ts').AmbientSnapshotInfo
     assistantChatBackups?: AssistantChatBackupInfo[]
     assistantContextConfig?: AssistantContextConfigInfo
     clawfeedItems?: ClawFeedItemInfo[]
@@ -2154,6 +2156,7 @@ export function StandaloneRoot() {
     if (meta.plugins) setPlugins(meta.plugins)
     if (meta.assistantMessages) setAssistantMessages(meta.assistantMessages)
     if (meta.assistantLiveRun !== undefined) setAssistantLiveRun(meta.assistantLiveRun)
+    if (meta.assistantAmbient) setAssistantAmbient(meta.assistantAmbient)
     if (meta.assistantChatBackups) setAssistantChatBackups(meta.assistantChatBackups)
     if (meta.assistantContextConfig) setAssistantContextConfig(meta.assistantContextConfig)
     if (meta.clawfeedItems) setClawfeedItems(meta.clawfeedItems)
@@ -2349,6 +2352,7 @@ export function StandaloneRoot() {
           lang={lang}
           messages={assistantMessages}
           liveRun={assistantLiveRun}
+          ambient={assistantAmbient}
           chatBackups={assistantChatBackups}
           memories={memories}
           pendingQuestions={pendingQuestions}

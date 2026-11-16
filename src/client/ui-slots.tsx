@@ -12,16 +12,21 @@ import { MarkdownText as MarkdownLite } from './markdown-view.tsx'
 import {
   formatSmartTimestamp,
   standaloneFetch,
+  type AmbientSnapshotInfo,
   type AssistantChatBackupInfo,
   type AssistantContextConfigInfo,
   type AssistantMessageInfo,
+  type AssistantPersonaConfigInfo,
   type ClawFeedItemInfo,
   type Lang,
   type LiveSessionRunInfo,
   type MemoryEntryInfo,
   type PendingUserQuestionInfo,
+  type PersonaAmbientStateInfo,
+  type PersonaLearningInfo,
   type PluginDescriptorInfo,
   type SessionProgressCardInfo,
+  type StickerInfo,
 } from './standalone-api.ts'
 
 export type MainViewSlotId = 'workbench' | 'assistant' | 'clawfeed' | 'rhtoolkit' | 'memory' | 'pipeline' | 'management'
@@ -384,10 +389,264 @@ export function InlineLiveAgentBubble({
   )
 }
 
+const stickerObjectUrlCache = new Map<string, string>()
+
+/** Renders a sticker image below a bot bubble, fetched through the authenticated standalone API and cached as an object URL. */
+export function StickerImage({ sticker, lang }: { sticker: { id: string; name: string }; lang: Lang }): ReactNode {
+  const [src, setSrc] = useState(() => stickerObjectUrlCache.get(sticker.id) ?? '')
+  useEffect(() => {
+    const cached = stickerObjectUrlCache.get(sticker.id)
+    if (cached) { setSrc(cached); return }
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await fetch(`/orchestrator/standalone/assistant/stickers/${encodeURIComponent(sticker.id)}/content`, { headers: { 'x-orchestrator-request': '1' } })
+        if (!res.ok) return
+        const url = URL.createObjectURL(await res.blob())
+        stickerObjectUrlCache.set(sticker.id, url)
+        if (!cancelled) setSrc(url)
+      } catch {}
+    })()
+    return () => { cancelled = true }
+  }, [sticker.id])
+  if (!src) return <span className="dt-hint">😀 {sticker.name}</span>
+  return <img className="dt-chat-sticker" src={src} alt={sticker.name} title={sticker.name} loading="lazy" />
+  void lang
+}
+
+/** 🎭 人设·表情·感知 workbench: Persona knobs, Sticker Gallery, Learned Knowledge, Home City / Weather / News. */
+export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged }: {
+  lang: Lang
+  open: boolean
+  onClose: () => void
+  onAmbientChanged?: ((ambient: AmbientSnapshotInfo) => void) | undefined
+}): ReactNode {
+  const [tab, setTab] = useState<'persona' | 'stickers' | 'learnings' | 'ambient'>('persona')
+  const [state, setState] = useState<PersonaAmbientStateInfo | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const [notice, setNotice] = useState('')
+  const [draftConfig, setDraftConfig] = useState<AssistantPersonaConfigInfo | null>(null)
+  const [cityDraft, setCityDraft] = useState('')
+  const [newLearning, setNewLearning] = useState('')
+  const [newLearningKind, setNewLearningKind] = useState<PersonaLearningInfo['kind']>('preference')
+  const [stickerName, setStickerName] = useState('')
+  const [stickerTags, setStickerTags] = useState('')
+  const stickerFileRef = useRef<HTMLInputElement>(null)
+
+  const load = async () => {
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<PersonaAmbientStateInfo>('assistant/persona-state', 'GET')
+      setState(res)
+      setDraftConfig(res.config)
+      setCityDraft(res.ambientConfig.homeCity.name)
+      onAmbientChanged?.(res.ambient)
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  useEffect(() => { if (open) void load() }, [open ])
+
+  if (!open) return null
+  const cfg = draftConfig ?? state?.config
+  const savePersona = async () => {
+    if (!cfg) return
+    setBusy(true); setErr(''); setNotice('')
+    try {
+      const res = await standaloneFetch<{ config: AssistantPersonaConfigInfo }>('assistant/persona/config', 'PUT', { config: cfg })
+      setDraftConfig(res.config)
+      setState(curr => (curr ? { ...curr, config: res.config } : curr))
+      setNotice(lang === 'zh' ? '✅ 人设已保存，下一回合生效' : '✅ Persona saved')
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const uploadStickers = async (files: File[]) => {
+    if (!files.length) return
+    setBusy(true); setErr(''); setNotice('')
+    try {
+      for (const file of files) {
+        const loaded = await readAssistantImageFile(file)
+        const res = await standaloneFetch<{ stickers: StickerInfo[] }>('assistant/stickers', 'POST', {
+          dataBase64: loaded.data,
+          name: stickerName.trim() || file.name.replace(/\.[^.]+$/, '') || '未命名表情',
+          tags: stickerTags.split(/[,，、\s]+/).map(s => s.trim()).filter(Boolean),
+        })
+        setState(curr => (curr ? { ...curr, stickers: res.stickers } : curr))
+      }
+      setStickerName(''); setStickerTags('')
+      setNotice(lang === 'zh' ? '✅ 表情包已加入图库，助理闲聊时就能发啦' : '✅ Sticker added')
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const deleteSticker = async (s: StickerInfo) => {
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<{ stickers: StickerInfo[] }>(`assistant/stickers/${encodeURIComponent(s.id)}`, 'DELETE')
+      stickerObjectUrlCache.delete(s.id)
+      setState(curr => (curr ? { ...curr, stickers: res.stickers } : curr))
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const saveStickerMeta = async (s: StickerInfo, patch: Partial<StickerInfo>) => {
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<{ stickers: StickerInfo[] }>(`assistant/stickers/${encodeURIComponent(s.id)}`, 'PUT', patch)
+      setState(curr => (curr ? { ...curr, stickers: res.stickers } : curr))
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const addLearning = async () => {
+    if (!newLearning.trim()) return
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<{ learnings: PersonaLearningInfo[] }>('assistant/persona/learnings', 'POST', { content: newLearning.trim(), kind: newLearningKind })
+      setState(curr => (curr ? { ...curr, learnings: res.learnings } : curr))
+      setNewLearning('')
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const updateLearning = async (entry: PersonaLearningInfo, patch: Partial<PersonaLearningInfo>) => {
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<{ learnings: PersonaLearningInfo[] }>(`assistant/persona/learnings/${encodeURIComponent(entry.id)}`, 'PUT', patch)
+      setState(curr => (curr ? { ...curr, learnings: res.learnings } : curr))
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const deleteLearning = async (entry: PersonaLearningInfo) => {
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<{ learnings: PersonaLearningInfo[] }>(`assistant/persona/learnings/${encodeURIComponent(entry.id)}`, 'DELETE')
+      setState(curr => (curr ? { ...curr, learnings: res.learnings } : curr))
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const saveCity = async () => {
+    if (!cityDraft.trim() || !state) return
+    setBusy(true); setErr(''); setNotice('')
+    try {
+      const res = await standaloneFetch<{ config: PersonaAmbientStateInfo['ambientConfig']; ambient: AmbientSnapshotInfo }>('assistant/ambient/config', 'PUT', { city: cityDraft.trim(), weatherEnabled: state.ambientConfig.weatherEnabled, newsEnabled: state.ambientConfig.newsEnabled })
+      setState(curr => (curr ? { ...curr, ambientConfig: res.config, ambient: res.ambient } : curr))
+      onAmbientChanged?.(res.ambient)
+      setNotice(lang === 'zh' ? `✅ 常驻城市已改为 ${res.config.homeCity.name}，天气已刷新` : '✅ Home city updated')
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const refreshAmbient = async () => {
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<PersonaAmbientStateInfo>('assistant/ambient/refresh', 'POST', {})
+      setState(curr => (curr ? { ...curr, ambient: res.ambient, news: res.news, ambientConfig: res.ambientConfig ?? curr.ambientConfig } : curr))
+      onAmbientChanged?.(res.ambient)
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+
+  return (
+    <Modal className="dt-fullscreen-modal" open={open} onClose={onClose} title={lang === 'zh' ? '🎭 人设 · 表情包 · 已学默契 · 环境感知' : '🎭 Persona · Stickers · Learnings · Ambient'} closeLabel={lang === 'zh' ? '关闭 (ESC)' : 'Close (ESC)'} description={lang === 'zh' ? '仅作用于个人助理（不影响工程 Eval / Worker）。这里能改的，助理自己也能通过工具改。' : 'Personal Assistant only. Everything here is also editable by the Assistant via tools.'} footer={<Button size="sm" variant="primary" onClick={onClose}>{lang === 'zh' ? '完成' : 'Done'}</Button>}>
+      <div className="dt-form">
+        <div className="dt-persona-tabs" role="tablist">
+          {([['persona', '🎭 人设风格'], ['stickers', `😀 表情包图库 (${state?.stickers.length ?? 0})`], ['learnings', `🧠 已学默契 (${state?.learnings.length ?? 0})`], ['ambient', '🌦 感知与城市']] as const).map(([id, label]) => (
+            <Button key={id} size="sm" variant={tab === id ? 'primary' : 'outline'} onClick={() => setTab(id)} data-testid={`persona-tab-${id}`}>{label}</Button>
+          ))}
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void load() }}>{lang === 'zh' ? '↻ 刷新' : 'Refresh'}</Button>
+        </div>
+        {err && <p className="dt-error" role="status">{err}</p>}
+        {notice && <p className="dt-hint" role="status">{notice}</p>}
+        {!state || !cfg ? <p className="dt-hint">{lang === 'zh' ? '加载中…' : 'Loading…'}</p> : tab === 'persona' ? (
+          <div className="dt-form" data-testid="persona-panel">
+            <div className="dt-persona-presets">
+              {state.presets.map(p => (
+                <button key={p.id} type="button" className="dt-persona-preset" data-active={cfg.presetId === p.id} onClick={() => setDraftConfig({ ...cfg, presetId: p.id })}>
+                  <strong>{p.label[lang]}</strong><span>{p.description[lang]}</span>
+                </button>
+              ))}
+            </div>
+            <div className="dt-persona-grid">
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '助理名字/自称' : 'Assistant name'}</span><Input value={cfg.assistantName} onChange={e => setDraftConfig({ ...cfg, assistantName: e.target.value })} /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '如何称呼你' : 'Calls you'}</span><Input value={cfg.userAddress} onChange={e => setDraftConfig({ ...cfg, userAddress: e.target.value })} /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '回复长度' : 'Verbosity'}</span><select className="dt-select" value={cfg.verbosity} onChange={e => setDraftConfig({ ...cfg, verbosity: e.target.value as AssistantPersonaConfigInfo['verbosity'] })}><option value="brief">简短</option><option value="balanced">适中</option><option value="detailed">详细</option></select></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '颜文字密度' : 'Kaomoji'}</span><select className="dt-select" value={cfg.kaomojiDensity} onChange={e => setDraftConfig({ ...cfg, kaomojiDensity: e.target.value as AssistantPersonaConfigInfo['kaomojiDensity'] })}><option value="off">关闭</option><option value="light">适度 (｡•̀ᴗ-)✧</option><option value="rich">丰富 Σ(っ °Д °;)っ</option></select></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '玩梗程度' : 'Humor'}</span><select className="dt-select" value={cfg.humorLevel} onChange={e => setDraftConfig({ ...cfg, humorLevel: e.target.value as AssistantPersonaConfigInfo['humorLevel'] })}><option value="off">不玩梗</option><option value="light">轻度接梗</option><option value="lively">活泼玩梗</option></select></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '表情包频率' : 'Stickers'}</span><select className="dt-select" value={cfg.stickerFrequency} onChange={e => setDraftConfig({ ...cfg, stickerFrequency: e.target.value as AssistantPersonaConfigInfo['stickerFrequency'] })}><option value="off">不发表情包</option><option value="occasional">偶尔发</option><option value="lively">经常发</option></select></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '表情冷却（回合）' : 'Sticker cooldown (turns)'}</span><Input type="number" min={0} max={10} value={String(cfg.stickerCooldownTurns)} onChange={e => setDraftConfig({ ...cfg, stickerCooldownTurns: Math.max(0, Math.min(10, Number(e.target.value) || 0)) })} /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '自动学习相处默契' : 'Auto-learning'}</span><select className="dt-select" value={cfg.learningEnabled ? 'on' : 'off'} onChange={e => setDraftConfig({ ...cfg, learningEnabled: e.target.value === 'on' })}><option value="on">开启（自动生效，可在「已学默契」增删）</option><option value="off">关闭</option></select></label>
+            </div>
+            <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '自定义风格要求（可选）' : 'Custom style instructions'}</span><textarea className="dt-textarea" rows={3} value={cfg.customInstructions} onChange={e => setDraftConfig({ ...cfg, customInstructions: e.target.value })} placeholder={lang === 'zh' ? '例如：闲聊别列 1/2/3 点；报数据时必须带来源' : ''} /></label>
+            <div className="dt-row-buttons"><Button variant="primary" disabled={busy} onClick={() => { void savePersona() }}>{lang === 'zh' ? '💾 保存人设' : 'Save persona'}</Button></div>
+          </div>
+        ) : tab === 'stickers' ? (
+          <div className="dt-form" data-testid="sticker-gallery-panel">
+            <p className="dt-hint">{lang === 'zh' ? '你上传的表情包保存在 ~/.rharness/stickers/。也可以在对话里给助理发一张图说「存为表情包」，或让它删除/改名；助理发表情包时 Web 会显示图片、飞书会发真实图片消息。' : 'Upload stickers, or ask the Assistant in chat to save/delete them.'}</p>
+            <div className="dt-persona-grid">
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '新表情名字（上传时使用）' : 'Name for uploads'}</span><Input value={stickerName} onChange={e => setStickerName(e.target.value)} placeholder="摸鱼" /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '标签（逗号分隔，助理按标签选图）' : 'Tags'}</span><Input value={stickerTags} onChange={e => setStickerTags(e.target.value)} placeholder="开心, 日常" /></label>
+            </div>
+            <input ref={stickerFileRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden onChange={e => { const f = Array.from(e.target.files ?? []); e.target.value = ''; void uploadStickers(f) }} />
+            <div className="dt-row-buttons"><Button variant="primary" disabled={busy} onClick={() => stickerFileRef.current?.click()} data-testid="sticker-upload-btn">{lang === 'zh' ? '⬆ 上传表情包图片' : 'Upload stickers'}</Button></div>
+            {state.stickers.length === 0 ? <p className="dt-hint">{lang === 'zh' ? '图库还是空的，上传第一张表情包吧~' : 'No stickers yet.'}</p> : (
+              <div className="dt-sticker-grid">
+                {state.stickers.map(s => (
+                  <div key={s.id} className="dt-sticker-card" data-testid={`sticker-card-${s.id}`}>
+                    <StickerImage sticker={s} lang={lang} />
+                    <Input value={s.name} disabled={busy} onChange={e => setState(curr => (curr ? { ...curr, stickers: curr.stickers.map(x => x.id === s.id ? { ...x, name: e.target.value } : x) } : curr))} onBlur={e => { void saveStickerMeta(s, { name: e.target.value }) }} />
+                    <Input value={s.tags.join(', ')} disabled={busy} placeholder={lang === 'zh' ? '标签' : 'Tags'} onChange={e => setState(curr => (curr ? { ...curr, stickers: curr.stickers.map(x => x.id === s.id ? { ...x, tags: e.target.value.split(/[,，]/).map(t => t.trim()).filter(Boolean) } : x) } : curr))} onBlur={e => { void saveStickerMeta(s, { tags: e.target.value.split(/[,，]/).map(t => t.trim()).filter(Boolean) }) }} />
+                    <span className="dt-hint">{s.emotion ? `${s.emotion} · ` : ''}{(s.sizeBytes / 1024).toFixed(0)} KB · {lang === 'zh' ? '已发' : 'used'} {s.useCount} {lang === 'zh' ? '次' : 'x'}</span>
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void deleteSticker(s) }} data-testid={`sticker-delete-${s.id}`}>{lang === 'zh' ? '🗑 删除' : 'Delete'}</Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : tab === 'learnings' ? (
+          <div className="dt-form" data-testid="persona-learnings-panel">
+            <p className="dt-hint">{lang === 'zh' ? '助理从对话里自动学到的说话风格/称呼/偏好会立刻生效并记录在这里，随时可改、可删、可停用。你也可以直接新增，或在聊天里说「记住：…」「忘掉你学的…那条」。' : 'Auto-applied learnings. Edit, disable, or delete anytime.'}</p>
+            <div className="dt-persona-grid">
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '新增一条默契' : 'New learning'}</span><Input value={newLearning} onChange={e => setNewLearning(e.target.value)} placeholder={lang === 'zh' ? '例如：闲聊时简短一点，多用颜文字' : ''} /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '类型' : 'Kind'}</span><select className="dt-select" value={newLearningKind} onChange={e => setNewLearningKind(e.target.value as PersonaLearningInfo['kind'])}><option value="style">说话风格</option><option value="address">称呼</option><option value="preference">偏好</option><option value="rapport">相处默契</option><option value="boundary">雷区/边界</option></select></label>
+            </div>
+            <div className="dt-row-buttons"><Button variant="primary" disabled={busy || !newLearning.trim()} onClick={() => { void addLearning() }}>{lang === 'zh' ? '➕ 添加并生效' : 'Add'}</Button></div>
+            {state.learnings.length === 0 ? <p className="dt-hint">{lang === 'zh' ? '还没有学到任何默契。' : 'No learnings yet.'}</p> : (
+              <div className="dt-learning-list">
+                {state.learnings.map(entry => (
+                  <div key={entry.id} className="dt-learning-row" data-testid={`learning-row-${entry.id}`}>
+                    <Tag tone={entry.enabled ? 'success' : 'neutral'}>{entry.kind}</Tag>
+                    <Input value={entry.content} disabled={busy} onChange={e => setState(curr => (curr ? { ...curr, learnings: curr.learnings.map(x => x.id === entry.id ? { ...x, content: e.target.value } : x) } : curr))} onBlur={e => { void updateLearning(entry, { content: e.target.value }) }} />
+                    <span className="dt-hint">{entry.source === 'auto' ? '自动学习' : entry.source === 'agent' ? '助理记录' : '手动添加'} · {formatSmartTimestamp(entry.createdAt, lang)}</span>
+                    <Button size="sm" variant="outline" disabled={busy} onClick={() => { void updateLearning(entry, { enabled: !entry.enabled }) }}>{entry.enabled ? '停用' : '启用'}</Button>
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void deleteLearning(entry) }} data-testid={`learning-delete-${entry.id}`}>🗑 删除</Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="dt-form" data-testid="ambient-panel">
+            <div className="dt-ambient-card">
+              <strong>{state.ambient.oneLiner}</strong>
+              <span className="dt-hint">{state.ambient.beijingTime} · {state.ambient.period} · 农历{state.ambient.lunarDate} · {state.ambient.solarTerm.current}（距{state.ambient.solarTerm.next} {state.ambient.solarTerm.daysToNext} 天）· {state.ambient.dayType === 'workday' ? '工作日' : '休息日'}（{state.ambient.dayReason}）</span>
+              {state.ambient.weather && <span>{state.ambient.weather.oneLiner}{state.ambient.weatherStale ? '（缓存稍旧，点刷新更新）' : ''}</span>}
+            </div>
+            <div className="dt-persona-grid">
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '常驻城市（天气与感知基准）' : 'Home city'}</span><Input value={cityDraft} onChange={e => setCityDraft(e.target.value)} data-testid="ambient-city-input" placeholder="北京 / 上海 / 深圳…" /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '天气感知' : 'Weather'}</span><select className="dt-select" value={state.ambientConfig.weatherEnabled ? 'on' : 'off'} onChange={e => setState(curr => (curr ? { ...curr, ambientConfig: { ...curr.ambientConfig, weatherEnabled: e.target.value === 'on' } } : curr))}><option value="on">开启（每45分钟刷新）</option><option value="off">关闭</option></select></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '新闻感知' : 'News'}</span><select className="dt-select" value={state.ambientConfig.newsEnabled ? 'on' : 'off'} onChange={e => setState(curr => (curr ? { ...curr, ambientConfig: { ...curr.ambientConfig, newsEnabled: e.target.value === 'on' } } : curr))}><option value="on">开启（问新闻时用 news_brief）</option><option value="off">关闭</option></select></label>
+            </div>
+            <p className="dt-hint">{lang === 'zh' ? '💡 也可以直接在聊天里对助理说「把常驻城市改成上海」，它会调用 ambient_set_home_city 自己改好，和这里完全同步。' : 'Tip: tell the Assistant "change my home city to Shanghai" — it uses the same API.'}</p>
+            <div className="dt-row-buttons">
+              <Button variant="primary" disabled={busy} onClick={() => { void saveCity() }} data-testid="ambient-save-city-btn">{lang === 'zh' ? '💾 保存城市与开关' : 'Save'}</Button>
+              <Button variant="outline" disabled={busy} onClick={() => { void refreshAmbient() }}>{lang === 'zh' ? '↻ 立即刷新天气与新闻' : 'Refresh now'}</Button>
+            </div>
+            <strong>{lang === 'zh' ? '📰 最近新闻缓存（问助理「最近有什么新闻」也会用这份）' : '📰 Cached headlines'}</strong>
+            {state.news.items.length === 0 ? <p className="dt-hint">{lang === 'zh' ? '暂无缓存，点击「立即刷新」拉取。' : 'No cached news yet.'}</p> : (
+              <div className="dt-news-list">
+                {state.news.items.slice(0, 10).map((n, i) => (
+                  <a key={i} className="dt-news-item" href={n.url} target="_blank" rel="noreferrer"><Tag tone="info">{n.topic}</Tag><span>{n.title}</span><span className="dt-hint">{n.source}</span></a>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </Modal>
+  )
+}
+
 export function PersonalAssistantSlotView(props: {
   lang: Lang
   messages: AssistantMessageInfo[]
   liveRun?: LiveSessionRunInfo | null | undefined
+  ambient?: AmbientSnapshotInfo | undefined
   chatBackups?: AssistantChatBackupInfo[] | undefined
   memories: MemoryEntryInfo[]
   pendingQuestions?: PendingUserQuestionInfo[] | undefined
@@ -408,6 +667,7 @@ export function PersonalAssistantSlotView(props: {
     lang,
     messages,
     liveRun,
+    ambient,
     chatBackups = [],
     memories,
     pendingQuestions = [],
@@ -439,7 +699,29 @@ export function PersonalAssistantSlotView(props: {
   const [ephemeralBtwCard, setEphemeralBtwCard] = useState<{ question: string; answer: string; at: string } | null>(null)
   const [optimisticUserMsg, setOptimisticUserMsg] = useState<AssistantMessageInfo | null>(null)
   const [pendingTurnSinceMs, setPendingTurnSinceMs] = useState<number | null>(null)
+  const [personaWorkbenchOpen, setPersonaWorkbenchOpen] = useState(false)
+  const [ambientOverride, setAmbientOverride] = useState<AmbientSnapshotInfo | undefined>()
+  const [stickerSaveFor, setStickerSaveFor] = useState<{ messageId: string; imageIndex: number } | null>(null)
+  const [stickerSaveName, setStickerSaveName] = useState('')
+  const [stickerSaveTags, setStickerSaveTags] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const displayAmbient = ambientOverride ?? ambient
+
+  const saveImageAsSticker = async () => {
+    if (!stickerSaveFor || !stickerSaveName.trim()) return
+    setBusy(true); setError(null)
+    try {
+      await standaloneFetch('assistant/stickers/from-message', 'POST', {
+        messageId: stickerSaveFor.messageId,
+        imageIndex: stickerSaveFor.imageIndex,
+        name: stickerSaveName.trim(),
+        tags: stickerSaveTags.split(/[,，、\s]+/).map(s => s.trim()).filter(Boolean),
+      })
+      setStickerSaveFor(null); setStickerSaveName(''); setStickerSaveTags('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally { setBusy(false) }
+  }
   const fileInputRef = useRef<HTMLInputElement>(null)
   const historyRef = useRef<HTMLDivElement>(null)
   const composerInputRef = useRef<HTMLTextAreaElement>(null)
@@ -774,8 +1056,16 @@ export function PersonalAssistantSlotView(props: {
                 {matchedAssistantSlot.label} ({matchedAssistantSlot.startTime}→{matchedAssistantSlot.endTime})
               </Tag>
             )}
+            {displayAmbient && (
+              <button type="button" className="dt-ambient-pill" data-testid="assistant-ambient-pill" onClick={() => setPersonaWorkbenchOpen(true)} title={lang === 'zh' ? '常驻城市 / 天气 / 农历节气（点击打开「感知与城市」设置，助理也能自己改）' : 'Home city / weather / lunar (click to open Ambient settings)'}>
+                {displayAmbient.oneLiner}
+              </button>
+            )}
           </div>
           <div className="dt-row-buttons">
+            <Button size="sm" variant="outline" onClick={() => setPersonaWorkbenchOpen(true)} data-testid="assistant-persona-btn" title={lang === 'zh' ? '人设风格、表情包图库、已学默契、常驻城市与新闻感知（助理也能通过工具自己改）' : 'Persona, stickers, learnings, home city & news'}>
+              {lang === 'zh' ? '🎭 人设·表情·感知' : '🎭 Persona'}
+            </Button>
             <Button
               size="sm"
               variant={chatFullscreen ? 'primary' : 'outline'}
@@ -1121,6 +1411,12 @@ export function PersonalAssistantSlotView(props: {
 
                   <MarkdownLite text={msg.text} />
 
+                  {isBot && msg.sticker && (
+                    <div data-testid={`assistant-sticker-${msg.id}`}>
+                      <StickerImage sticker={msg.sticker} lang={lang} />
+                    </div>
+                  )}
+
                   {isBot && isDetailOpen && (
                     <div className="dt-msg-receipt" data-testid={`assistant-detail-panel-${msg.id}`}>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%' }}>
@@ -1177,12 +1473,27 @@ export function PersonalAssistantSlotView(props: {
                     {msgImages.map((image, index) => {
                       const src = `data:${image.mediaType};base64,${image.data}`
                       return (
-                        <a key={index} href={src} download={image.name || 'image'} title={lang === 'zh' ? '下载原图' : 'Download original'}>
-                          <img src={src} alt={image.name || (lang === 'zh' ? '图片' : 'Image')} loading="lazy" />
-                        </a>
+                        <figure key={index}>
+                          <a href={src} download={image.name || 'image'} title={lang === 'zh' ? '下载原图' : 'Download original'}>
+                            <img src={src} alt={image.name || (lang === 'zh' ? '图片' : 'Image')} loading="lazy" />
+                          </a>
+                          {!isBot && (
+                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => { setStickerSaveFor({ messageId: msg.id, imageIndex: index }); setStickerSaveName(''); setStickerSaveTags('') }} data-testid={`save-sticker-${msg.id}-${index}`}>
+                              {lang === 'zh' ? '😀 存为表情包' : 'Save as sticker'}
+                            </Button>
+                          )}
+                        </figure>
                       )
                     })}
                   </div>
+                  {!isBot && stickerSaveFor?.messageId === msg.id && (
+                    <div className="dt-sticker-save-form" data-testid="sticker-save-form">
+                      <Input value={stickerSaveName} onChange={e => setStickerSaveName(e.target.value)} placeholder={lang === 'zh' ? '表情名字，如：摸鱼' : 'Sticker name'} />
+                      <Input value={stickerSaveTags} onChange={e => setStickerSaveTags(e.target.value)} placeholder={lang === 'zh' ? '标签，如：开心, 日常' : 'Tags'} />
+                      <Button size="sm" variant="primary" disabled={busy || !stickerSaveName.trim()} onClick={() => { void saveImageAsSticker() }}>{lang === 'zh' ? '保存到图库' : 'Save'}</Button>
+                      <Button size="sm" variant="ghost" disabled={busy} onClick={() => setStickerSaveFor(null)}>{lang === 'zh' ? '取消' : 'Cancel'}</Button>
+                    </div>
+                  )}
 
                   {handoff && (
                     <div
@@ -1410,6 +1721,8 @@ export function PersonalAssistantSlotView(props: {
           )}
         </details>
       </section>
+
+      <PersonaAmbientWorkbench lang={lang} open={personaWorkbenchOpen} onClose={() => setPersonaWorkbenchOpen(false)} onAmbientChanged={setAmbientOverride} />
 
       {(() => {
         const fullMsg = fullscreenMsgId ? messages.find(m => m.id === fullscreenMsgId) : undefined

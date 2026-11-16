@@ -633,6 +633,58 @@ export async function sendFeishuDirectMessage(
   }
 }
 
+/** Uploads a local sticker/image file to Feishu and returns its `image_key` for `msg_type: "image"` delivery. */
+export async function uploadFeishuImage(imageBytes: Buffer): Promise<string | undefined> {
+  const cred = loadStandaloneFeishuCredentials()
+  if (!cred || !imageBytes.length) return undefined
+  try {
+    const token = await getFeishuTenantToken(cred)
+    const form = new FormData()
+    form.append('image_type', 'message')
+    form.append('image', new Blob([new Uint8Array(imageBytes)]), 'sticker.png')
+    const res = await fetch('https://open.feishu.cn/open-apis/im/v1/images', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+      body: form,
+      signal: AbortSignal.timeout(20_000),
+    })
+    const data = (await res.json()) as { code?: number; data?: { image_key?: string } }
+    return data.code === 0 && typeof data.data?.image_key === 'string' ? data.data.image_key : undefined
+  } catch { return undefined }
+}
+
+/** Sends a real image message to the Feishu owner DM (used for sticker delivery after the text/card reply). */
+export async function sendFeishuImageMessage(imageKey: string): Promise<boolean> {
+  const cred = loadStandaloneFeishuCredentials()
+  if (!cred || !imageKey) return false
+  try {
+    const token = await getFeishuTenantToken(cred)
+    const res = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ receive_id: cred.ownerOpenId, msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const data = (await res.json()) as { code?: number }
+    return data.code === 0
+  } catch { return false }
+}
+
+/** Downloads an image resource attached to an inbound Feishu message (`GET .../resources/:image_key?type=image`). */
+export async function downloadFeishuMessageImage(messageId: string, imageKey: string): Promise<Buffer | undefined> {
+  const cred = loadStandaloneFeishuCredentials()
+  if (!cred || !messageId || !imageKey) return undefined
+  try {
+    const token = await getFeishuTenantToken(cred)
+    const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(imageKey)}?type=image`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(20_000),
+    })
+    if (!res.ok) return undefined
+    return Buffer.from(await res.arrayBuffer())
+  } catch { return undefined }
+}
+
 export function extractCompactToolArgPreview(args: unknown): string | undefined {
   if (!args || typeof args !== 'object') return undefined
   const rec = args as Record<string, unknown>
@@ -677,6 +729,19 @@ export function formatAgentToolStatusLabel(
     toolkit_status: { zh: '🧰 正在查询云端工具箱状态', en: '🧰 Checking Cloud Toolkit' },
     toolkit_download: { zh: `⬇️ 正在启动云端视频下载${suffix}`, en: `⬇️ Starting cloud download${suffix}` },
     toolkit_list_files: { zh: '🎬 正在读取云端媒体库列表', en: '🎬 Listing cloud media files' },
+    persona_get: { zh: '🎭 正在读取人设配置', en: '🎭 Reading persona config' },
+    persona_update: { zh: '🎭 正在调整说话风格', en: '🎭 Updating persona style' },
+    sticker_list: { zh: '😀 正在翻表情包图库', en: '😀 Listing sticker gallery' },
+    sticker_add_from_message: { zh: '😀 正在把图片收藏为表情包', en: '😀 Saving image as sticker' },
+    sticker_delete: { zh: '🗑️ 正在删除表情包', en: '🗑️ Deleting sticker' },
+    sticker_update: { zh: '😀 正在整理表情包标签', en: '😀 Updating sticker' },
+    persona_learning_list: { zh: '🧠 正在回顾已学默契', en: '🧠 Listing persona learnings' },
+    persona_learning_add: { zh: '🧠 正在记住相处偏好', en: '🧠 Learning preference' },
+    persona_learning_delete: { zh: '🧠 正在忘掉一条默契', en: '🧠 Forgetting learning' },
+    ambient_get: { zh: '🌦 正在感知时间与常驻城市天气', en: '🌦 Sensing time & home weather' },
+    ambient_set_home_city: { zh: `📍 正在切换常驻城市${suffix}`, en: `📍 Changing home city${suffix}` },
+    weather_query: { zh: `🌦 正在查询天气${suffix}`, en: `🌦 Querying weather${suffix}` },
+    news_brief: { zh: `📰 正在汇总最近新闻${suffix}`, en: `📰 Summarizing recent news${suffix}` },
     assistant_forward_to_engineering: { zh: `🚀 正在打包原话递交工程引擎${suffix}`, en: `🚀 Forwarding verbatim request to Engineering${suffix}` },
     assistant_ask_user: { zh: '💬 正在整理待确认选项', en: '💬 Preparing question options' },
     orchestrator_route: { zh: '⚖️ Eval 正在研判准入并派发工单', en: '⚖️ Eval routing request' },
@@ -2240,6 +2305,8 @@ export function startNativeFeishuDmBridge(options: {
     text: string
     createTimeMs: number
     reactionId?: string
+    /** Downloaded bytes + media type when the owner sent an image (or a post containing images). */
+    images?: { mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; data: Buffer; name?: string }[]
   }) => Promise<string | undefined>
 }): void {
   const cred = loadStandaloneFeishuCredentials()
@@ -2313,23 +2380,53 @@ export function startNativeFeishuDmBridge(options: {
     feishuBridgeState.receivedCount++
 
     let text = ''
+    const imageKeys: string[] = []
     try {
-      const parsedContent = JSON.parse(msg?.content ?? '{}') as { text?: string }
+      const parsedContent = JSON.parse(msg?.content ?? '{}') as {
+        text?: string
+        image_key?: string
+        content?: { tag?: string; text?: string; image_key?: string }[][]
+      }
       text = (parsedContent.text ?? '').replace(/@_user_\d+\s*/g, '').trim()
+      if (typeof parsedContent.image_key === 'string' && parsedContent.image_key) imageKeys.push(parsedContent.image_key)
+      for (const row of parsedContent.content ?? []) {
+        for (const el of row) {
+          if (el.tag === 'text' && el.text && !text) text = el.text.replace(/@_user_\d+\s*/g, '').trim()
+          if (el.tag === 'img' && typeof el.image_key === 'string' && el.image_key) imageKeys.push(el.image_key)
+        }
+      }
     } catch {
       text = (msg?.content ?? '').trim()
     }
-    if (!text) return
+    if (msg?.message_type === 'image' && imageKeys.length === 0) {
+      try {
+        const parsed = JSON.parse(msg?.content ?? '{}') as { image_key?: string }
+        if (parsed.image_key) imageKeys.push(parsed.image_key)
+      } catch {}
+    }
+    if (!text && imageKeys.length === 0) return
+    if (!text && imageKeys.length > 0) text = '[图片]'
 
     const ts = Number(msg?.create_time ?? Date.now())
     // Immediately add the "Typing" (敲键盘) emoji reaction on the user's Feishu message so the owner knows it was received
     const reactionId = await addFeishuMessageReaction(msgId, 'Typing')
     try {
+      const images: { mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; data: Buffer; name?: string }[] = []
+      for (const key of imageKeys.slice(0, 4)) {
+        const bytes = await downloadFeishuMessageImage(msgId, key)
+        if (!bytes) continue
+        const mediaType = bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) ? 'image/png' as const
+          : bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 ? 'image/jpeg' as const
+          : bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6)) ? 'image/gif' as const
+          : 'image/webp' as const
+        images.push({ mediaType, data: bytes, name: 'feishu-image' })
+      }
       const replyText = await options.onOwnerMessage({
         messageId: msgId,
         text,
         createTimeMs: Number.isFinite(ts) ? ts : Date.now(),
         ...(reactionId ? { reactionId } : {}),
+        ...(images.length ? { images } : {}),
       })
       if (replyText && replyText.trim()) {
         await sendFeishuDirectMessage(replyText.trim(), currentCred.ownerOpenId, 'open_id')
