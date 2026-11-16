@@ -113,6 +113,7 @@
 .dt-news-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 8px; color: var(--dsw-alias-label-primary); text-decoration: none; }
 .dt-news-item:hover { background: var(--dsw-alias-bg-module-platform); }
 .dt-memory-edit-form { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; width: 100%; }
+.dt-view-subtabs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 8px 10px; margin-bottom: 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); }
 .dt-assistant-shell[data-fullscreen='true'] { position: fixed; inset: 0; z-index: 900; width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0; padding: 12px 20px calc(12px + env(safe-area-inset-bottom, 0px)); border: 0; border-radius: 0; box-shadow: none; overflow: hidden; background: var(--dsw-alias-bg-base); }
 .dt-assistant-shell[data-fullscreen='true'] .dt-assistant-header { flex: none; padding: 10px 14px; border-radius: 12px; background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); }
 .dt-assistant-shell[data-fullscreen='true'] .dt-assistant-toolbar { flex: none; width: min(1160px, 100%); margin: 0 auto; }

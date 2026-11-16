@@ -29,23 +29,62 @@ import {
   type StickerInfo,
 } from './standalone-api.ts'
 
-export type MainViewSlotId = 'workbench' | 'assistant' | 'clawfeed' | 'rhtoolkit' | 'memory' | 'pipeline' | 'management'
+export type MainViewSlotId = 'workbench' | 'assistant' | 'clawfeed' | 'rhtoolkit' | 'memory-library' | 'siyuan-kb' | 'plugin-center' | 'pipeline' | 'management'
+
+export interface UIViewSlotCounts {
+  assistantCount: number
+  clawfeedCount: number
+  memoryCount: number
+  enabledPlugins: number
+  totalPlugins: number
+  pipelineCount: number
+}
 
 export interface UIViewSlotPlugin {
   id: MainViewSlotId
   pluginId?: string
+  /** Position of this view inside its tab bar (ascending). */
   order: number
-  label: (
-    lang: Lang,
-    counts: {
-      assistantCount: number
-      clawfeedCount: number
-      memoryCount: number
-      enabledPlugins: number
-      totalPlugins: number
-      pipelineCount: number
-    },
-  ) => string
+  /**
+   * Tab bar (top-level tab) this view belongs to. Views that register the SAME `tabBarId`
+   * share ONE top-level tab; inside that tab they arrange themselves as sub-tabs by `order`.
+   * Omit to give the view its own dedicated top-level tab (tab bar id defaults to the view id).
+   */
+  tabBarId?: string
+  /** Top-level tab label when this view's tab bar is shown (first member with a `tabBarLabel` wins). */
+  tabBarLabel?: ((lang: Lang, counts: UIViewSlotCounts) => string) | undefined
+  /** Position of the shared tab bar among top-level tabs. Defaults to the smallest member `order`. */
+  tabBarOrder?: number | undefined
+  label: (lang: Lang, counts: UIViewSlotCounts) => string
+}
+
+/** A resolved top-level tab: one or more views sharing the same registered tab-bar name. */
+export interface UIViewTabBarGroup {
+  id: string
+  order: number
+  members: UIViewSlotPlugin[]
+  label: (lang: Lang, counts: UIViewSlotCounts) => string
+}
+
+/** Groups visible views by their registered tab-bar name (`tabBarId`, defaulting to the view id). */
+export function groupUIViewSlotsIntoTabBars(slots: readonly UIViewSlotPlugin[]): UIViewTabBarGroup[] {
+  const byId = new Map<string, UIViewSlotPlugin[]>()
+  for (const slot of slots) {
+    const barId = slot.tabBarId ?? slot.id
+    byId.set(barId, [...(byId.get(barId) ?? []), slot])
+  }
+  return [...byId.entries()]
+    .map(([id, members]) => {
+      const sorted = [...members].sort((a, b) => a.order - b.order)
+      const labelMember = sorted.find(m => m.tabBarLabel) ?? sorted[0]!
+      return {
+        id,
+        order: sorted.find(m => m.tabBarOrder !== undefined)?.tabBarOrder ?? Math.min(...sorted.map(m => m.order)),
+        members: sorted,
+        label: labelMember.tabBarLabel ?? labelMember.label,
+      }
+    })
+    .sort((a, b) => a.order - b.order)
 }
 
 /**
@@ -84,12 +123,40 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
     label: lang => (lang === 'zh' ? '🧰 云端工具箱' : '🧰 Cloud Toolkit'),
   },
   {
-    id: 'memory',
+    // Long-Term Memory Library and SiYuan Knowledge Base register the SAME tab bar (`knowledge`):
+    // the top bar shows one 「记忆与知识库」 tab and the two views arrange themselves inside it.
+    id: 'memory-library',
+    pluginId: 'dsh-memory',
     order: 30,
+    tabBarId: 'knowledge',
+    tabBarOrder: 30,
+    tabBarLabel: (lang, c) =>
+      lang === 'zh'
+        ? `记忆与知识库 (${c.memoryCount})`
+        : `Memory & Knowledge (${c.memoryCount})`,
     label: (lang, c) =>
       lang === 'zh'
-        ? `记忆与插件 (${c.memoryCount} · ${c.enabledPlugins}/${c.totalPlugins})`
-        : `Memory & Plugins (${c.memoryCount} · ${c.enabledPlugins}/${c.totalPlugins})`,
+        ? `🧠 长期记忆库 (${c.memoryCount})`
+        : `🧠 Memory Library (${c.memoryCount})`,
+  },
+  {
+    id: 'siyuan-kb',
+    pluginId: 'dsh-personal-skills',
+    order: 32,
+    tabBarId: 'knowledge',
+    tabBarLabel: (lang, c) =>
+      lang === 'zh'
+        ? `记忆与知识库 (${c.memoryCount})`
+        : `Memory & Knowledge (${c.memoryCount})`,
+    label: lang => (lang === 'zh' ? '📚 思源知识库' : '📚 SiYuan KB'),
+  },
+  {
+    id: 'plugin-center',
+    order: 35,
+    label: (lang, c) =>
+      lang === 'zh'
+        ? `🧩 插件中心 (${c.enabledPlugins}/${c.totalPlugins})`
+        : `🧩 Plugin Center (${c.enabledPlugins}/${c.totalPlugins})`,
   },
   {
     id: 'pipeline',
@@ -111,7 +178,7 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
 export function getEnabledUIViewSlots(plugins: PluginDescriptorInfo[]): UIViewSlotPlugin[] {
   const disabledSet = new Set(plugins.filter(p => !p.enabled).map(p => p.id))
   const registeredIds = new Set(plugins.map(p => p.id))
-  const privatePackSlotIds = new Set(['dsh-rhtoolkit', 'dsh-clawfeed'])
+  const privatePackSlotIds = new Set(['dsh-rhtoolkit', 'dsh-clawfeed', 'dsh-personal-skills'])
   return BUILTIN_UI_VIEW_SLOTS
     .filter(slot => {
       if (!slot.pluginId) return true
@@ -1125,7 +1192,7 @@ export function PersonalAssistantSlotView(props: {
               </Button>
             )}
             <Button size="sm" variant="outline" onClick={() => { setChatFullscreen(false); onSwitchToMemoryTab() }}>
-              {lang === 'zh' ? `记忆与插件 (${memories.length} 条 · ${pinnedMemories.length} 常驻)` : `Memory & Plugins (${memories.length})`}
+              {lang === 'zh' ? `🧠 长期记忆库 (${memories.length} 条 · ${pinnedMemories.length} 常驻)` : `🧠 Memory Library (${memories.length})`}
             </Button>
           </div>
         </div>

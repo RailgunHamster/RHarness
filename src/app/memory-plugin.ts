@@ -1127,7 +1127,7 @@ export function buildPluginCatalog(input: {
       packageName: '@rharness/plugin-memory',
       title: { zh: '高信噪比长期记忆与混合自动召回引擎 (Memory & Hybrid Auto-Recall Engine)', en: 'High-SNR Long-Term Memory & Hybrid Auto-Recall Engine' },
       description: {
-        zh: '排在顶栏第 3 位「记忆与插件」，仅挂载至「个人助理」与「工程 Worker」，绝不污染工程 Eval 主控会话（complete: true）。专注记录高纯度用户偏好、设备拓扑与周期提醒，结合每轮混合语义自动召回 (Auto-Recall) 与思源双实例目录索引注入。',
+        zh: '位于顶栏「记忆与知识库」标签栏内的「🧠 长期记忆库」子视图（与「📚 思源知识库」注册同一标签栏），仅挂载至「个人助理」与「工程 Worker」，绝不污染工程 Eval 主控会话（complete: true）。专注记录高纯度用户偏好、设备拓扑与周期提醒，结合每轮混合语义自动召回 (Auto-Recall) 与思源双实例目录索引注入。',
         en: 'Mounted exclusively onto Personal Assistant and Worker sessions with Pinned Context, Per-Turn Hybrid Auto-Recall, Practical Consolidation, and SiYuan Dual-Instance Directory Summary.',
       },
       category: 'memory',
@@ -1136,7 +1136,7 @@ export function buildPluginCatalog(input: {
       roles: ['assistant', 'worker', 'ui-slot'],
       tools: ['memory_save', 'memory_search', 'memory_list', 'memory_update', 'memory_delete', 'memory_consolidate'],
       promptSection: 'rharness-long-term-memory',
-      uiSlot: 'topbar.tab#4: 记忆与插件',
+      uiSlot: 'topbar.tab: 记忆与知识库 / 🧠 长期记忆库',
       stats: {
         zh: `${input.memoryCount} 条记忆 (${input.pinnedMemoryCount} 条常驻注入)`,
         en: `${input.memoryCount} entries (${input.pinnedMemoryCount} pinned)`,

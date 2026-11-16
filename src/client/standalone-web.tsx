@@ -18,6 +18,7 @@ import { markdownBlocks } from './markdown.ts'
 import {
   ClawFeedNotificationsSlotView,
   getEnabledUIViewSlots,
+  groupUIViewSlotsIntoTabBars,
   PersonalAssistantSlotView,
   RHToolkitSlotView,
   type MainViewSlotId,
@@ -716,6 +717,7 @@ function WorkerNodesModal({
 
 function MemoryAndPluginsSection({
   lang,
+  section,
   memories,
   memoryBackups,
   plugins,
@@ -724,6 +726,8 @@ function MemoryAndPluginsSection({
   onPluginsUpdated,
 }: {
   lang: Lang
+  /** Which registered view of this workbench to render: plugin center, memory library, or SiYuan KB. */
+  section: 'plugins' | 'memory' | 'siyuan'
   memories: MemoryEntryInfo[]
   memoryBackups: MemoryBackupInfo[]
   plugins: PluginDescriptorInfo[]
@@ -1081,6 +1085,7 @@ function MemoryAndPluginsSection({
 
   return <div className="dt-form">
     {error && <p className="dt-error" role="status">{error}</p>}
+    {section === 'plugins' && <>
     <section className="dt-pipeline-card" aria-label={lang === 'zh' ? '一等公民插件中心' : 'First-class Plugin Center'}>
       <div className="dt-live-head">
         <div>
@@ -1310,7 +1315,9 @@ function MemoryAndPluginsSection({
         </div>
       )}
     </Modal>
+    </>}
 
+    {section === 'memory' && <>
     <section className="dt-pipeline-card" aria-label={lang === 'zh' ? '长期记忆库' : 'Long-term memory store'}>
       <div className="dt-live-head">
         <div>
@@ -1628,8 +1635,9 @@ function MemoryAndPluginsSection({
         )}
       </div>
     </section>
+    </>}
 
-    {plugins.some(p => p.id === 'dsh-personal-skills' && p.enabled) && <section className="dt-pipeline-card" aria-label={lang === 'zh' ? '思源双实例知识库' : 'SiYuan Dual-Instance Knowledge Base'}>
+    {section === 'siyuan' && plugins.some(p => p.id === 'dsh-personal-skills' && p.enabled) && <section className="dt-pipeline-card" aria-label={lang === 'zh' ? '思源双实例知识库' : 'SiYuan Dual-Instance Knowledge Base'}>
       <div className="dt-live-head">
         <div>
           <h2>
@@ -2293,9 +2301,27 @@ export function StandaloneRoot() {
   }, [viewMode, hasActiveAssistantOrHandoffRun, refreshAssistantMessages])
 
   const enabledSlots = useMemo(() => getEnabledUIViewSlots(plugins), [plugins])
+  const tabBarGroups = useMemo(() => groupUIViewSlotsIntoTabBars(enabledSlots), [enabledSlots])
+  const [tabBarSelection, setTabBarSelection] = useState<Partial<Record<string, MainViewSlotId>>>({})
+  const activeTabBar = tabBarGroups.find(g => g.members.some(m => m.id === viewMode))
+  const slotCounts = {
+    assistantCount: assistantMessages.length,
+    clawfeedCount: clawfeedItems.length,
+    memoryCount: memories.length,
+    enabledPlugins: plugins.filter(p => p.enabled).length,
+    totalPlugins: plugins.length,
+    pipelineCount: pipelineRows.length,
+  }
+  const selectTabBar = (groupId: string) => {
+    const group = tabBarGroups.find(g => g.id === groupId)
+    if (!group) return
+    const remembered = tabBarSelection[groupId]
+    const target = (remembered && group.members.some(m => m.id === remembered) ? remembered : group.members[0]?.id) ?? viewMode
+    setViewMode(target)
+  }
   useEffect(() => {
     if (!enabledSlots.some(s => s.id === viewMode)) {
-      setViewMode(enabledSlots[0]?.id ?? 'memory')
+      setViewMode(enabledSlots[0]?.id ?? 'memory-library')
     }
   }, [enabledSlots, viewMode])
 
@@ -2348,23 +2374,16 @@ export function StandaloneRoot() {
         <strong>RHarness</strong>
         <span>{lang === 'zh' ? '智能体工作台' : 'Agent Workbench'}</span>
         <div className="dt-mode-switcher" role="tablist" aria-label={lang === 'zh' ? '工作台视图模式' : 'Workspace view mode'}>
-          {enabledSlots.map(slot => <button
-            key={slot.id}
+          {tabBarGroups.map(group => <button
+            key={group.id}
             type="button"
             role="tab"
             className="dt-mode-tab"
-            aria-selected={viewMode === slot.id}
-            onClick={() => setViewMode(slot.id)}
-            data-testid={`view-tab-${slot.id}`}
+            aria-selected={activeTabBar?.id === group.id}
+            onClick={() => selectTabBar(group.id)}
+            data-testid={`view-tab-${group.id}`}
           >
-            {slot.label(lang, {
-              assistantCount: assistantMessages.length,
-              clawfeedCount: clawfeedItems.length,
-              memoryCount: memories.length,
-              enabledPlugins: plugins.filter(p => p.enabled).length,
-              totalPlugins: plugins.length,
-              pipelineCount: pipelineRows.length,
-            })}
+            {group.label(lang, slotCounts)}
           </button>)}
         </div>
       </div>
@@ -2445,6 +2464,21 @@ export function StandaloneRoot() {
         onInspectSession={handleInspectSession}
       />
       <div id="management" className="dt-standalone-management">
+        {activeTabBar && activeTabBar.members.length > 1 && (
+          <div className="dt-view-subtabs" role="tablist" aria-label={lang === 'zh' ? '标签栏内视图' : 'Views in this tab bar'} data-testid={`view-subtabs-${activeTabBar.id}`}>
+            {activeTabBar.members.map(member => <button
+              key={member.id}
+              type="button"
+              role="tab"
+              className="dt-mode-tab"
+              aria-selected={viewMode === member.id}
+              onClick={() => { setTabBarSelection(prev => ({ ...prev, [activeTabBar.id]: member.id })); setViewMode(member.id) }}
+              data-testid={`view-subtab-${member.id}`}
+            >
+              {member.label(lang, slotCounts)}
+            </button>)}
+          </div>
+        )}
         {viewMode === 'assistant' && <PersonalAssistantSlotView
           lang={lang}
           messages={assistantMessages}
@@ -2466,7 +2500,7 @@ export function StandaloneRoot() {
             setViewMode('workbench')
             if (ticketId) handleInspectSession(`worker-${ticketId}`)
           }}
-          onSwitchToMemoryTab={() => setViewMode('memory')}
+          onSwitchToMemoryTab={() => setViewMode('memory-library')}
           onOpenAssistantSession={() => setActiveSession('claw-assistant-main')}
         />}
         {viewMode === 'clawfeed' && <ClawFeedNotificationsSlotView
@@ -2475,8 +2509,29 @@ export function StandaloneRoot() {
           onItemsUpdated={setClawfeedItems}
         />}
         {viewMode === 'rhtoolkit' && <RHToolkitSlotView lang={lang} />}
-        {viewMode === 'memory' && <MemoryAndPluginsSection
+        {viewMode === 'plugin-center' && <MemoryAndPluginsSection
           lang={lang}
+          section="plugins"
+          memories={memories}
+          memoryBackups={memoryBackups}
+          plugins={plugins}
+          onMemoriesUpdated={setMemories}
+          onMemoryBackupsUpdated={setMemoryBackups}
+          onPluginsUpdated={setPlugins}
+        />}
+        {viewMode === 'memory-library' && <MemoryAndPluginsSection
+          lang={lang}
+          section="memory"
+          memories={memories}
+          memoryBackups={memoryBackups}
+          plugins={plugins}
+          onMemoriesUpdated={setMemories}
+          onMemoryBackupsUpdated={setMemoryBackups}
+          onPluginsUpdated={setPlugins}
+        />}
+        {viewMode === 'siyuan-kb' && <MemoryAndPluginsSection
+          lang={lang}
+          section="siyuan"
           memories={memories}
           memoryBackups={memoryBackups}
           plugins={plugins}
@@ -2493,7 +2548,7 @@ export function StandaloneRoot() {
           </div>
           <PipelineAuditSection rows={pipelineRows} lang={lang} onInspectSession={id => { setViewMode('workbench'); handleInspectSession(id) }} />
         </section>}
-        <div className="dt-management-suite" hidden={viewMode === 'pipeline' || viewMode === 'memory' || viewMode === 'assistant' || viewMode === 'clawfeed' || viewMode === 'rhtoolkit'}>
+        <div className="dt-management-suite" hidden={viewMode === 'pipeline' || viewMode === 'memory-library' || viewMode === 'siyuan-kb' || viewMode === 'plugin-center' || viewMode === 'assistant' || viewMode === 'clawfeed' || viewMode === 'rhtoolkit'}>
           <App t={t} openSession={async id => setActiveSession(id)} deploymentForm={undefined}
             renderSessionActivity={id => <TicketActivity key={id} sessionId={id} lang={lang} />} />
         </div>

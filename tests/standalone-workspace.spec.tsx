@@ -386,9 +386,17 @@ it('edits a long-term memory inline as delete-old + add-new with the old version
   }))
 
   await act(async () => root.render(<StandaloneRoot />))
-  const memoryTab = container.querySelector<HTMLButtonElement>('[data-testid="view-tab-memory"]')!
+  // Memory Library + SiYuan KB share ONE top-level tab bar (「记忆与知识库」): one top tab, sub-tabs inside
+  const memoryTab = container.querySelector<HTMLButtonElement>('[data-testid="view-tab-knowledge"]')!
+  expect(memoryTab.textContent).toContain('记忆与知识库')
   await act(async () => { memoryTab.click() })
+  expect(container.querySelector('[data-testid="view-subtabs-knowledge"]')).not.toBeNull()
+  expect(container.querySelector('[data-testid="view-subtab-memory-library"]')).not.toBeNull()
+  expect(container.querySelector('[data-testid="view-subtab-siyuan-kb"]')).not.toBeNull()
   expect(container.textContent).toContain('旧版内容')
+  // Plugin Center is its own separate top-level tab now (no longer mixed into the memory view)
+  expect(container.querySelector('[data-testid="view-tab-plugin-center"]')).not.toBeNull()
+  expect(container.textContent).not.toContain('一等公民插件中心')
 
   const editBtn = container.querySelector<HTMLButtonElement>('[data-testid="memory-edit-btn-mem-edit-1"]')!
   await act(async () => { editBtn.click() })

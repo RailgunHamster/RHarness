@@ -8,7 +8,7 @@
    - **个人助理（Tab 1，`@rharness/plugin-claw-assistant`）**：负责日常问答、随手记、图文交流与长期记忆（`memory_save` / `memory_search` / `memory_list` / `memory_delete`）。当个人助理判断某段对话需要推进工程代码研发时，助理会生成简短总结，并将**助理总结 + 用户发给助理的一字不改原话 + 全部原始图片**打包单向递交至「工程对话」。
    - **工程对话（Tab 2，`dsh-superagent`）**：工程评估主会话（`orchestrator` / `Eval`）100% 保持原生的 `complete: true` 严苛契约，零个人助理工具污染。工程 `Eval` 模型对所有请求（含个人助理递交的请求）拥有**独立研判与拒收权**：确认属于明确研发需求则建立带不可变授权（`Mandate`）的独立 Git Worktree 工单（`Ticket`）；若属日常备忘或方向未定则直接拒收（`ignore`）并给出理由。
 2. **全系统一等公民插件化（Cordis / DSH Plugin Host + `ctx.slots`）**：
-   - 顶栏各功能窗口（`个人助理`、`工程对话`、`记忆与插件`、`管线追踪`、`系统管理`）及后台扩展能力共 **13 个一等公民插件**，均可在「记忆与插件」中心实时启停与审计。
+   - 顶栏各功能窗口（`个人助理`、`工程对话`、`记忆与知识库`、`🧩 插件中心`、`管线追踪`、`系统管理`）及后台扩展能力共 **13 个一等公民插件**，均可在「🧩 插件中心」实时启停与审计。顶栏支持标签栏分组：多个视图注册同一标签栏名字即合并为一个入口（如长期记忆库与思源知识库同属「记忆与知识库」），栏内自行分位。
 3. **分布式设备组与四重地址容灾（`@rharness/plugin-device-group`）**：
    - 融合 `ECDSA P-256` 签名一次性邀请码入组与四重网络地址自动容灾回退（`局域网 IP` → `不变机器名 Hostname` → `Tailscale MagicDNS 域名` → `Tailscale IP`），支持跨机器派发 Worker 工单并通过 Git Bundle 自动快进合入 `main` 分支。
 4. **可视化模型配置组与角色 N 段分时调度（`@rharness/plugin-model-profiles`）**：
@@ -26,7 +26,7 @@ pnpm start
 
 默认监听 `http://127.0.0.1:4318`（可通过 `--port` / `DSH_SUPERAGENT_PORT`、`--host 0.0.0.0` 与 `--state-dir` / `DSH_SUPERAGENT_STATE_DIR` 覆盖；停止后台服务可执行 `pnpm stop`）。完整的单机/多机部署、手机端 PWA 接入与全套插件说明请直接阅读 **[009 Standalone Deployment & Plugin Guide（独立部署与全套插件指南）](docs/009-standalone-and-plugins.md)**。
 
-- **内置消息源（Sources）**：默认启用本地面板源（`panel`），支持文字与多图粘贴/拖拽；飞书源（`feishu`）与 GitHub 仓库源（`github`）可在「系统管理 → 设置 → 来源」或「记忆与插件」中随时启用。
+- **内置消息源（Sources）**：默认启用本地面板源（`panel`），支持文字与多图粘贴/拖拽；飞书源（`feishu`）与 GitHub 仓库源（`github`）可在「系统管理 → 设置 → 来源」或「🧩 插件中心」中随时启用。
 - **角色模型与分时配置组**：通过顶栏「配置组」或「系统管理 → 设置 → 评估 / 执行」，采用统一的可视化列表为 `Eval`（主控评估）和 `Worker`（工单执行器）选择 `dsh`、`codex`、`claude`、`cursor` 或 `human` 模型及高低峰自动切换时段。
 
 ## 初始化配置（Setup）

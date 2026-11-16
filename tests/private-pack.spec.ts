@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { buildPluginCatalog, defaultMemories } from '../src/app/memory-plugin.ts'
 import { resetPrivatePackCache } from '../src/app/private-pack.ts'
-import { getEnabledUIViewSlots } from '../src/client/ui-slots.tsx'
+import { getEnabledUIViewSlots, groupUIViewSlotsIntoTabBars } from '../src/client/ui-slots.tsx'
 import { startStandaloneServer } from '../src/server/standalone.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -86,7 +86,19 @@ describe('clean-room public deployment & external private pack isolation', () =>
 
     const visibleSlots = getEnabledUIViewSlots(plugins).map(s => s.id)
     expect(visibleSlots).not.toContain('rhtoolkit')
-    expect(visibleSlots).toEqual(['assistant', 'workbench', 'memory', 'pipeline', 'management'])
+    expect(visibleSlots).toEqual(['assistant', 'workbench', 'memory-library', 'plugin-center', 'pipeline', 'management'])
+
+    // Views registering the same tab-bar name collapse into ONE top-level tab with members ordered inside.
+    // In clean-room mode the SiYuan slot is unregistered, so the knowledge bar degrades to a single member.
+    const cleanBars = groupUIViewSlotsIntoTabBars(getEnabledUIViewSlots(plugins))
+    expect(cleanBars.map(b => b.id)).toEqual(['assistant', 'workbench', 'knowledge', 'plugin-center', 'pipeline', 'management'])
+    expect(cleanBars.find(b => b.id === 'knowledge')?.members.map(m => m.id)).toEqual(['memory-library'])
+    const fullBars = groupUIViewSlotsIntoTabBars(getEnabledUIViewSlots([
+      ...plugins,
+      { id: 'dsh-personal-skills', enabled: true },
+      { id: 'dsh-memory', enabled: true },
+    ] as never))
+    expect(fullBars.find(b => b.id === 'knowledge')?.members.map(m => m.id)).toEqual(['memory-library', 'siyuan-kb'])
 
     const stateDir = mkdtempSync(join(tmpdir(), 'rharness-clean-room-'))
     const srv = await startStandaloneServer({
