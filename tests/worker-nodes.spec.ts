@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { startStandaloneServer } from '../src/server/standalone.ts'
+import { buildNodeCandidateEndpoints } from '../src/app/device-group.ts'
 import { defaultModelProfilesConfig, resolveEffectiveModelProfile } from '../src/app/model-profiles.ts'
 import { selectWorkerNode, syncRemoteNodeGitBranch, type WorkerNodeRecord } from '../src/app/worker-nodes.ts'
 
@@ -12,6 +13,24 @@ function git(cwd: string, args: string[]) {
 }
 
 describe('distributed LAN worker nodes and P2P Git fast-forward merge', () => {
+  it('derives peer candidate ports from the peer endpoint instead of leaking to the production default port', () => {
+    // Regression: ephemeral test servers share the host/IP/hostname with a production server on :4318.
+    // Derived LAN/hostname/Tailscale candidates must reuse the peer's real (ephemeral) port so peer
+    // sync broadcasts can never fall through to the production server on the same machine.
+    const candidates = buildNodeCandidateEndpoints({
+      endpoints: ['http://192.168.0.100:54321'],
+      hostname: 'dev-box',
+      lanIps: ['192.168.0.100'],
+      tailscaleIps: ['100.64.0.9'],
+    })
+    expect(candidates[0]).toBe('http://192.168.0.100:54321')
+    expect(candidates.every(u => u.endsWith(':54321'))).toBe(true)
+    expect(candidates.some(u => u.includes(':4318'))).toBe(false)
+    // Production nodes without an explicit port still derive the standard :4318 candidates
+    const prod = buildNodeCandidateEndpoints({ hostname: 'hub-box', lanIps: ['192.168.0.50'] })
+    expect(prod).toContain('http://192.168.0.50:4318')
+  })
+
   it('selects the best online worker node by explicit ID, message hint, or capability tags', () => {
     const nodes: WorkerNodeRecord[] = [
       { id: 'local', name: 'claw-hub', url: 'local', tags: ['linux', 'always-on'], status: 'online', lastSeenAt: '' },

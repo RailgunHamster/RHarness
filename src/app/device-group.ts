@@ -311,22 +311,30 @@ export function buildNodeCandidateEndpoints(node: {
 
   addUrl(node.url)
   for (const ep of node.endpoints ?? []) addUrl(ep)
-  for (const ip of node.lanIps ?? []) addUrl(`http://${ip}:${defaultPort}`)
-  if (node.hostname) addUrl(`http://${node.hostname}:${defaultPort}`)
+  // Derived address candidates (LAN IP / hostname / Tailscale) must reuse the peer's actual port when
+  // known (e.g. an ephemeral test server on this same machine), never silently fall back to the
+  // production default port — otherwise peer sync traffic can leak into a production server that
+  // happens to share the same physical host/IP/hostname.
+  const explicitPort = [node.url, ...(node.endpoints ?? [])]
+    .map(u => (typeof u === 'string' ? /:(\d+)\/?$/.exec(u.trim().replace(/\/+$/, ''))?.[1] : undefined))
+    .find(Boolean)
+  const derivedPort = explicitPort ? Number(explicitPort) : defaultPort
+  for (const ip of node.lanIps ?? []) addUrl(`http://${ip}:${derivedPort}`)
+  if (node.hostname) addUrl(`http://${node.hostname}:${derivedPort}`)
   if (node.tailscaleDnsName) {
-    addUrl(`http://${node.tailscaleDnsName}:${defaultPort}`)
+    addUrl(`http://${node.tailscaleDnsName}:${derivedPort}`)
     const shortName = node.tailscaleDnsName.split('.')[0]
-    if (shortName) addUrl(`http://${shortName}:${defaultPort}`)
+    if (shortName) addUrl(`http://${shortName}:${derivedPort}`)
   }
-  for (const ip of node.tailscaleIps ?? []) addUrl(`http://${ip}:${defaultPort}`)
+  for (const ip of node.tailscaleIps ?? []) addUrl(`http://${ip}:${derivedPort}`)
 
   // Also check live Tailscale peer table in case IPs or DNS names were updated
   const peer = findTailscalePeer(node.tailscaleDnsName || node.hostname || node.name)
   if (peer) {
-    if (peer.dnsName) addUrl(`http://${peer.dnsName}:${defaultPort}`)
-    if (peer.shortDnsName) addUrl(`http://${peer.shortDnsName}:${defaultPort}`)
-    if (peer.hostName) addUrl(`http://${peer.hostName}:${defaultPort}`)
-    for (const ip of peer.tailscaleIps) addUrl(`http://${ip}:${defaultPort}`)
+    if (peer.dnsName) addUrl(`http://${peer.dnsName}:${derivedPort}`)
+    if (peer.shortDnsName) addUrl(`http://${peer.shortDnsName}:${derivedPort}`)
+    if (peer.hostName) addUrl(`http://${peer.hostName}:${derivedPort}`)
+    for (const ip of peer.tailscaleIps) addUrl(`http://${ip}:${derivedPort}`)
   }
 
   return candidates
