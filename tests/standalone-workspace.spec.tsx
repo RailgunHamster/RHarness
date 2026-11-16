@@ -357,3 +357,52 @@ it('renders inline ephemeral live status & streaming text bubbles in both Person
   expect(container.querySelector('[data-testid="assistant-live-bubble"]')).toBeNull()
   expect(container.textContent).toContain('已为您查到笔记全文如下。')
 })
+
+it('edits a long-term memory inline as delete-old + add-new with the old version kept in the regret vault', async () => {
+  let putBody: Record<string, unknown> | undefined
+  const baseFetch = globalThis.fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.includes('siyuan/notebooks')) {
+      return new Response(JSON.stringify({ instances: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (url.includes('/memories/mem-edit-1') && init?.method === 'PUT') {
+      putBody = JSON.parse(String(init.body)) as Record<string, unknown>
+      return new Response(JSON.stringify({
+        memory: { id: 'mem-edit-2', title: '汇报偏好', content: String(putBody.content), category: 'preference', tags: ['style'], pinned: true, source: 'user', createdAt: '2026-11-17T00:00:00Z', updatedAt: '2026-11-17T00:00:00Z' },
+        replacedId: 'mem-edit-1',
+        memories: [{ id: 'mem-edit-2', title: '汇报偏好', content: String(putBody.content), category: 'preference', tags: ['style'], pinned: true, source: 'user', createdAt: '2026-11-17T00:00:00Z', updatedAt: '2026-11-17T00:00:00Z' }],
+        memoryBackups: [{ id: 'mem-bak-1', reason: 'edit-replace', deletedAt: '2026-11-17T00:00:00Z', expiresAt: '2026-12-17T00:00:00Z', filePath: '/tmp/mem-bak-1.json', count: 1, entries: [{ id: 'mem-edit-1', title: '汇报偏好', content: '旧版内容', category: 'preference', tags: ['style'], pinned: true, source: 'user', createdAt: '2026-11-16T00:00:00Z', updatedAt: '2026-11-16T00:00:00Z' }] }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (url.endsWith('/sessions') || url.includes('/sessions?')) {
+      const res = await baseFetch(url, init)
+      const payload = (await res.clone().json()) as Record<string, unknown>
+      payload.memories = [{ id: 'mem-edit-1', title: '汇报偏好', content: '旧版内容', category: 'preference', tags: ['style'], pinned: true, source: 'user', createdAt: '2026-11-16T00:00:00Z', updatedAt: '2026-11-16T00:00:00Z' }]
+      payload.memoryBackups = []
+      payload.plugins = []
+      return new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return baseFetch(url, init)
+  }))
+
+  await act(async () => root.render(<StandaloneRoot />))
+  const memoryTab = container.querySelector<HTMLButtonElement>('[data-testid="view-tab-memory"]')!
+  await act(async () => { memoryTab.click() })
+  expect(container.textContent).toContain('旧版内容')
+
+  const editBtn = container.querySelector<HTMLButtonElement>('[data-testid="memory-edit-btn-mem-edit-1"]')!
+  await act(async () => { editBtn.click() })
+  const contentBox = container.querySelector<HTMLTextAreaElement>('[data-testid="memory-edit-content-mem-edit-1"]')!
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(contentBox, '编辑后的新内容')
+    contentBox.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  const saveBtn = container.querySelector<HTMLButtonElement>('[data-testid="memory-edit-save-mem-edit-1"]')!
+  await act(async () => { saveBtn.click() })
+  await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+
+  expect(putBody?.content).toBe('编辑后的新内容')
+  expect(container.textContent).toContain('编辑后的新内容')
+  expect(container.textContent).toContain('旧版本')
+  expect(container.textContent).toContain('编辑替换的前版本')
+})

@@ -1,12 +1,20 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import {
+  archiveMemoriesToBackupDir,
   buildMemoryPluginTools,
   consolidateMemories,
   defaultMemories,
   evaluateMilestoneCountdown,
   formatPinnedMemoryPromptSection,
   getUpcomingMilestones,
+  listAndPurgeMemoryBackups,
   recallRelevantMemoriesForTurn,
+  replaceMemoryEntry,
+  restoreMemoryBackupFromDir,
+  saveMemoryEntry,
   searchMemories,
   type MemoryEntry,
 } from '../src/app/memory-plugin.ts'
@@ -356,4 +364,55 @@ it('tokenizes multi-keyword SiYuan queries and federates SiYuan hits into memory
 
   const fenced = sanitizeFeishuCardMarkdown('Hello\n   ```ts\nconsole.log(1)\n   ```')
   expect(fenced).toBe('Hello\n```ts\nconsole.log(1)\n```')
+})
+
+it('edits a memory as delete-old + add-new with the old version archived in the 30-day regret vault', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rharness-mem-edit-'))
+  try {
+    const seeded = saveMemoryEntry([], { title: '汇报偏好', content: '旧版：始终用中文总结。', category: 'preference', tags: ['style'], pinned: true, source: 'user' })
+    const oldId = seeded.entry.id
+
+    // Pure replace semantics: new ID, edited text, inherited fields, old entry returned for archiving
+    const { entry, list, replaced } = replaceMemoryEntry(seeded.list, oldId, { content: '新版：中文总结，结论先行。' })
+    expect(replaced.id).toBe(oldId)
+    expect(entry.id).not.toBe(oldId)
+    expect(entry.content).toBe('新版：中文总结，结论先行。')
+    expect(entry.title).toBe('汇报偏好')
+    expect(entry.pinned).toBe(true)
+    expect(list).toHaveLength(1)
+    expect(() => replaceMemoryEntry(list, 'missing-id', { content: 'x' })).toThrow(/not found/)
+
+    // Old version lands in the vault as an edit-replace backup and can be restored (regret path)
+    const backup = archiveMemoriesToBackupDir(dir, [replaced], 'edit-replace')
+    expect(backup?.reason).toBe('edit-replace')
+    const vault = listAndPurgeMemoryBackups(dir)
+    expect(vault).toHaveLength(1)
+    expect(vault[0]?.entries[0]?.content).toBe('旧版：始终用中文总结。')
+    const restored = restoreMemoryBackupFromDir(dir, backup!.id, list)
+    expect(restored.list.some(e => e.id === oldId && e.content.includes('旧版'))).toBe(true)
+    expect(restored.list.some(e => e.id === entry.id)).toBe(true)
+
+    // The memory_update tool performs the same replace and archives via the replaced-callback
+    let entries: MemoryEntry[] = seeded.list
+    const archived: MemoryEntry[] = []
+    const tools = buildMemoryPluginTools(
+      () => entries,
+      next => { entries = next },
+      'assistant',
+      undefined,
+      removed => { archived.push(...removed) },
+      undefined,
+      removed => { archived.push(...removed) },
+    )
+    const updateTool = tools.find(t => t.name === 'memory_update')!
+    const out = (await updateTool.execute({ id: oldId, content: '工具编辑版' }, { signal: new AbortController().signal })) as { updated: boolean; replacedId: string; previousVersionArchived: boolean }
+    expect(out.updated).toBe(true)
+    expect(out.replacedId).toBe(oldId)
+    expect(out.previousVersionArchived).toBe(true)
+    expect(archived.map(e => e.id)).toEqual([oldId])
+    expect(entries).toHaveLength(1)
+    expect(entries[0]?.content).toBe('工具编辑版')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

@@ -71,7 +71,7 @@ export interface MemoryConsolidationResult {
 
 export interface MemoryBackupRecord {
   id: string
-  reason: 'clear-all' | 'single-delete'
+  reason: 'clear-all' | 'single-delete' | 'edit-replace'
   deletedAt: string
   expiresAt: string
   filePath: string
@@ -455,6 +455,47 @@ export function saveMemoryEntry(
   return { entry, list: next }
 }
 
+/**
+ * Edit-as-replace: removes the old entry and inserts a brand-new entry (new ID, fresh timestamps)
+ * carrying the edited fields. Callers MUST archive the returned `replaced` entry into the 30-day
+ * regret vault (`archiveMemoriesToBackupDir(..., 'edit-replace')`) so no version is ever lost.
+ * Fields left `undefined` inherit from the replaced entry.
+ */
+export function replaceMemoryEntry(
+  entries: readonly MemoryEntry[],
+  id: string,
+  input: {
+    title?: string
+    content?: string
+    category?: MemoryCategory
+    tags?: string[]
+    pinned?: boolean
+    source?: 'user' | 'assistant' | 'orchestrator' | 'worker'
+    milestone?: MilestoneReminderRule | null
+  },
+): { entry: MemoryEntry; list: MemoryEntry[]; replaced: MemoryEntry } {
+  const old = entries.find(e => e.id === id)
+  if (!old) throw new Error(`Memory entry not found: ${id}`)
+  const title = (input.title ?? old.title).trim()
+  const content = (input.content ?? old.content).trim()
+  if (!title || !content) throw new Error('Memory title and content are required')
+  const milestone = input.milestone === null ? undefined : (input.milestone ?? old.milestone)
+  const entry: MemoryEntry = {
+    id: `mem-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    title,
+    content,
+    category: input.category ?? (milestone ? 'milestone' : old.category),
+    tags: input.tags ?? old.tags,
+    pinned: input.pinned ?? old.pinned,
+    source: input.source ?? old.source,
+    ...(milestone ? { milestone } : {}),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }
+  const list = [entry, ...entries.filter(e => e.id !== id)]
+  return { entry, list, replaced: old }
+}
+
 export function getMemoryBackupDir(stateDir: string): string {
   return join(stateDir, 'memory-backups')
 }
@@ -466,7 +507,7 @@ export function getMemoryBackupDir(stateDir: string): string {
 export function archiveMemoriesToBackupDir(
   stateDir: string,
   entriesToArchive: readonly MemoryEntry[],
-  reason: 'clear-all' | 'single-delete',
+  reason: 'clear-all' | 'single-delete' | 'edit-replace',
   now = new Date(),
 ): MemoryBackupRecord | undefined {
   if (!entriesToArchive.length) return undefined
@@ -742,7 +783,7 @@ export function formatPinnedMemoryPromptSection(
   if (lines.length > 0) {
     parts.push(
       '## RHarness Long-Term Memory (Pinned Context)',
-      'The following persistent facts and user preferences are active across sessions. Use `memory_search`, `memory_save`, `memory_list`, `memory_delete`, or `memory_consolidate` when you need to recall or record durable user preferences, server facts, or milestone reminders (birthdays/anniversaries/renewals with `target_date` and `lead_days: [30, 14, 7, 1, 0]`):',
+      'The following persistent facts and user preferences are active across sessions. Use `memory_search`, `memory_save`, `memory_list`, `memory_update`, `memory_delete`, or `memory_consolidate` when you need to recall or record durable user preferences, server facts, or milestone reminders (birthdays/anniversaries/renewals with `target_date` and `lead_days: [30, 14, 7, 1, 0]`). To edit an entry, call `memory_update` (old version is archived to the 30-day vault, never lost):',
       ...lines,
     )
   }
@@ -790,6 +831,7 @@ export function buildMemoryPluginTools(
   readChatArchive?: () => ArchivedChatMessage[],
   archiveDeleted?: (removed: MemoryEntry[]) => void,
   federatedNotesSearch?: (query: string) => Promise<{ count: number; items: unknown[] } | undefined>,
+  archiveReplaced?: (removed: MemoryEntry[]) => void,
 ): RegisteredToolSpec[] {
   const saveSchema = z.object({
     id: z.string().optional().describe('Optional existing memory ID to update.'),
@@ -872,6 +914,39 @@ export function buildMemoryPluginTools(
       execute: async () => {
         const items = searchMemories(readEntries())
         return { count: items.length, items: items.slice(0, 30) }
+      },
+    },
+    {
+      name: 'memory_update',
+      description: 'Edit an existing long-term memory entry by ID. Implemented as delete-old + add-new: the old version is archived into the 30-day regret vault (reason: edit-replace, restorable anytime) and a fresh entry with a new ID carries the edited text. Omit fields to keep their current values.',
+      parameters: z.toJSONSchema(z.object({
+        id: z.string().min(1).describe('ID of the memory entry to edit (from memory_list / memory_search).'),
+        title: z.string().min(1).max(160).optional().describe('New title. Omit to keep the current title.'),
+        content: z.string().min(1).max(4000).optional().describe('New content text. Omit to keep the current content.'),
+        category: z.enum(['preference', 'device', 'project', 'fact', 'episodic', 'milestone']).optional(),
+        tags: z.array(z.string()).optional(),
+        pinned: z.boolean().optional(),
+      })),
+      execute: async (rawArgs: unknown) => {
+        const args = z.object({
+          id: z.string().min(1),
+          title: z.string().min(1).max(160).optional(),
+          content: z.string().min(1).max(4000).optional(),
+          category: z.enum(['preference', 'device', 'project', 'fact', 'episodic', 'milestone']).optional(),
+          tags: z.array(z.string()).optional(),
+          pinned: z.boolean().optional(),
+        }).parse(rawArgs ?? {})
+        const { entry, list, replaced } = replaceMemoryEntry(readEntries(), args.id, {
+          ...(args.title !== undefined ? { title: args.title } : {}),
+          ...(args.content !== undefined ? { content: args.content } : {}),
+          ...(args.category !== undefined ? { category: args.category } : {}),
+          ...(args.tags !== undefined ? { tags: args.tags } : {}),
+          ...(args.pinned !== undefined ? { pinned: args.pinned } : {}),
+          source: role,
+        })
+        ;(archiveReplaced ?? archiveDeleted)?.([replaced])
+        writeEntries(list)
+        return { updated: true, replacedId: replaced.id, memory: entry, previousVersionArchived: true }
       },
     },
     {
@@ -1059,7 +1134,7 @@ export function buildPluginCatalog(input: {
       enabled: isEnabled('dsh-memory'),
       canToggle: true,
       roles: ['assistant', 'worker', 'ui-slot'],
-      tools: ['memory_save', 'memory_search', 'memory_list', 'memory_delete', 'memory_consolidate'],
+      tools: ['memory_save', 'memory_search', 'memory_list', 'memory_update', 'memory_delete', 'memory_consolidate'],
       promptSection: 'rharness-long-term-memory',
       uiSlot: 'topbar.tab#4: 记忆与插件',
       stats: {

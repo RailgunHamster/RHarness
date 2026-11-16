@@ -971,6 +971,49 @@ function MemoryAndPluginsSection({
     }
   }
 
+  const [editingMemId, setEditingMemId] = useState<string | null>(null)
+  const [editTitle, setEditTitle] = useState('')
+  const [editContent, setEditContent] = useState('')
+  const [editCategory, setEditCategory] = useState<MemoryCategoryInfo>('preference')
+  const [editTags, setEditTags] = useState('')
+  const [editPinned, setEditPinned] = useState(false)
+  const [editFeedback, setEditFeedback] = useState('')
+
+  const startEditMem = (mem: MemoryEntryInfo) => {
+    setEditingMemId(mem.id)
+    setEditTitle(mem.title)
+    setEditContent(mem.content)
+    setEditCategory(mem.category)
+    setEditTags(mem.tags.join(', '))
+    setEditPinned(mem.pinned)
+    setEditFeedback('')
+  }
+
+  // Edit = delete-old + add-new on the server: the previous version lands in the 30-day regret vault.
+  const saveEditMem = async (id: string) => {
+    if (busy || !editTitle.trim() || !editContent.trim()) return
+    setBusy(true); setError(''); setEditFeedback('')
+    try {
+      const res = await standaloneFetch<{ memory: MemoryEntryInfo; replacedId: string; memories: MemoryEntryInfo[]; memoryBackups: MemoryBackupInfo[] }>(`memories/${encodeURIComponent(id)}`, 'PUT', {
+        title: editTitle.trim(),
+        content: editContent.trim(),
+        category: editCategory,
+        tags: editTags,
+        pinned: editPinned,
+      })
+      onMemoriesUpdated(res.memories)
+      onMemoryBackupsUpdated(res.memoryBackups)
+      setEditingMemId(null)
+      setEditFeedback(lang === 'zh'
+        ? `✏️ 已保存修改：旧版本《${res.memory.title}》已移入 30 天反悔恢复箱（可在下方一键恢复），新版本即时生效。`
+        : '✏️ Edit saved: previous version moved to the 30-day regret vault, new version is live.')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const clearAllMemoriesConfirmed = async () => {
     if (busy) return
     setBusy(true); setError('')
@@ -1439,32 +1482,84 @@ function MemoryAndPluginsSection({
 
       <div className="dt-pipeline-list">
         {!filtered.length && <p className="dt-hint">{lang === 'zh' ? '暂无匹配的记忆条目。' : 'No matching memories.'}</p>}
+        {editFeedback && <p className="dt-hint" role="status">{editFeedback}</p>}
         {filtered.map(mem => <div key={mem.id} className="dt-msg-receipt" data-active={mem.pinned || Boolean(mem.milestone)}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 0 }}>
-            <div className="dt-msg-receipt-main">
-              {mem.pinned && <Tag tone="success">{lang === 'zh' ? '📌 常驻注入 Prompt' : '📌 Pinned'}</Tag>}
-              <Tag tone={mem.category === 'milestone' ? 'warning' : 'info'}>
-                {mem.category === 'milestone' ? '🎂 重大事件/纪念日' : mem.category}
-              </Tag>
-              {mem.milestone && (
-                <Tag tone="info">
-                  {`📅 ${mem.milestone.recurrence === 'yearly' ? '每年' : ''} ${mem.milestone.targetDate} · 提前 ${(mem.milestone.leadDays ?? [30, 14, 7, 1, 0]).join('/')} 天提醒`}
-                </Tag>
-              )}
-              <strong>{mem.title}</strong>
-              {mem.tags.map(t => <span key={t} className="dt-mono dt-msg-receipt-branch">#{t}</span>)}
-              <span className="dt-mono dt-hint">by {mem.source} · {formatSmartTimestamp(mem.updatedAt, lang)}</span>
+          {editingMemId === mem.id ? (
+            <div className="dt-memory-edit-form" data-testid={`memory-edit-form-${mem.id}`}>
+              <label className="dt-field">
+                <span className="dt-field-head">{lang === 'zh' ? '标题' : 'Title'}</span>
+                <Input value={editTitle} onChange={e => setEditTitle(e.target.value)} data-testid={`memory-edit-title-${mem.id}`} />
+              </label>
+              <label className="dt-field">
+                <span className="dt-field-head">{lang === 'zh' ? '内容（可直接改）' : 'Content'}</span>
+                <textarea className="dt-textarea" rows={4} value={editContent} onChange={e => setEditContent(e.target.value)} data-testid={`memory-edit-content-${mem.id}`} />
+              </label>
+              <div className="dt-persona-grid">
+                <label className="dt-field">
+                  <span className="dt-field-head">{lang === 'zh' ? '分类' : 'Category'}</span>
+                  <select className="dt-select" value={editCategory} onChange={e => setEditCategory(e.target.value as MemoryCategoryInfo)}>
+                    <option value="preference">preference</option>
+                    <option value="device">device</option>
+                    <option value="project">project</option>
+                    <option value="fact">fact</option>
+                    <option value="episodic">episodic</option>
+                    <option value="milestone">milestone</option>
+                  </select>
+                </label>
+                <label className="dt-field">
+                  <span className="dt-field-head">{lang === 'zh' ? '标签（逗号分隔）' : 'Tags'}</span>
+                  <Input value={editTags} onChange={e => setEditTags(e.target.value)} />
+                </label>
+                <label className="dt-field">
+                  <span className="dt-field-head">{lang === 'zh' ? '常驻注入 Prompt' : 'Pinned'}</span>
+                  <select className="dt-select" value={editPinned ? 'yes' : 'no'} onChange={e => setEditPinned(e.target.value === 'yes')}>
+                    <option value="yes">{lang === 'zh' ? '📌 常驻' : 'Pinned'}</option>
+                    <option value="no">{lang === 'zh' ? '非常驻' : 'Not pinned'}</option>
+                  </select>
+                </label>
+              </div>
+              <span className="dt-hint">{lang === 'zh' ? '保存 = 删除旧条目 + 新建修改后的条目：旧版本会自动进入下方 30 天反悔恢复箱，绝不丢失，随时可一键恢复。' : 'Saving replaces the entry: the old version is archived to the 30-day regret vault.'}</span>
+              <div className="dt-row-buttons">
+                <Button size="sm" variant="primary" disabled={busy || !editTitle.trim() || !editContent.trim()} onClick={() => { void saveEditMem(mem.id) }} data-testid={`memory-edit-save-${mem.id}`}>
+                  {lang === 'zh' ? '💾 保存修改（旧版进恢复箱）' : 'Save (archive old)'}
+                </Button>
+                <Button size="sm" variant="ghost" disabled={busy} onClick={() => setEditingMemId(null)}>
+                  {lang === 'zh' ? '取消' : 'Cancel'}
+                </Button>
+              </div>
             </div>
-            <div style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{mem.content}</div>
-          </div>
-          <div className="dt-row-buttons">
-            <Button size="sm" variant="outline" disabled={busy} onClick={() => { void togglePin(mem) }}>
-              {mem.pinned ? (lang === 'zh' ? '取消常驻' : 'Unpin') : (lang === 'zh' ? '设为常驻' : 'Pin')}
-            </Button>
-            <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void removeMem(mem.id) }}>
-              {lang === 'zh' ? '移入30天备份' : 'Delete (30d Backup)'}
-            </Button>
-          </div>
+          ) : (
+            <>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 0 }}>
+                <div className="dt-msg-receipt-main">
+                  {mem.pinned && <Tag tone="success">{lang === 'zh' ? '📌 常驻注入 Prompt' : '📌 Pinned'}</Tag>}
+                  <Tag tone={mem.category === 'milestone' ? 'warning' : 'info'}>
+                    {mem.category === 'milestone' ? '🎂 重大事件/纪念日' : mem.category}
+                  </Tag>
+                  {mem.milestone && (
+                    <Tag tone="info">
+                      {`📅 ${mem.milestone.recurrence === 'yearly' ? '每年' : ''} ${mem.milestone.targetDate} · 提前 ${(mem.milestone.leadDays ?? [30, 14, 7, 1, 0]).join('/')} 天提醒`}
+                    </Tag>
+                  )}
+                  <strong>{mem.title}</strong>
+                  {mem.tags.map(t => <span key={t} className="dt-mono dt-msg-receipt-branch">#{t}</span>)}
+                  <span className="dt-mono dt-hint">by {mem.source} · {formatSmartTimestamp(mem.updatedAt, lang)}</span>
+                </div>
+                <div style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{mem.content}</div>
+              </div>
+              <div className="dt-row-buttons">
+                <Button size="sm" variant="outline" disabled={busy} onClick={() => startEditMem(mem)} data-testid={`memory-edit-btn-${mem.id}`}>
+                  {lang === 'zh' ? '✏️ 编辑' : '✏️ Edit'}
+                </Button>
+                <Button size="sm" variant="outline" disabled={busy} onClick={() => { void togglePin(mem) }}>
+                  {mem.pinned ? (lang === 'zh' ? '取消常驻' : 'Unpin') : (lang === 'zh' ? '设为常驻' : 'Pin')}
+                </Button>
+                <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void removeMem(mem.id) }}>
+                  {lang === 'zh' ? '移入30天备份' : 'Delete (30d Backup)'}
+                </Button>
+              </div>
+            </>
+          )}
         </div>)}
       </div>
 
@@ -1503,7 +1598,9 @@ function MemoryAndPluginsSection({
                       <Tag tone="info">
                         {bak.reason === 'clear-all'
                           ? (lang === 'zh' ? `清空全部记忆备份 (${bak.count} 条)` : `Full Clear Backup (${bak.count})`)
-                          : (lang === 'zh' ? `单条删除备份 (${bak.count} 条)` : `Single Delete Backup (${bak.count})`)}
+                          : bak.reason === 'edit-replace'
+                            ? (lang === 'zh' ? `✏️ 编辑替换的前版本 (${bak.count} 条)` : `Pre-Edit Version (${bak.count})`)
+                            : (lang === 'zh' ? `单条删除备份 (${bak.count} 条)` : `Single Delete Backup (${bak.count})`)}
                       </Tag>
                       <span className="dt-mono dt-hint">
                         {formatSmartTimestamp(bak.deletedAt, lang)} · {bak.id}

@@ -182,7 +182,7 @@ export interface MemoryEntryInfo {
 }
 export interface MemoryBackupInfo {
   id: string
-  reason: 'clear-all' | 'single-delete'
+  reason: 'clear-all' | 'single-delete' | 'edit-replace'
   deletedAt: string
   expiresAt: string
   filePath: string

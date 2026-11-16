@@ -71,6 +71,7 @@ import {
   formatPinnedMemoryPromptSection,
   getUpcomingMilestones,
   listAndPurgeMemoryBackups,
+  replaceMemoryEntry,
   restoreMemoryBackupFromDir,
   saveMemoryEntry,
   searchMemories,
@@ -1635,6 +1636,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         }
         return undefined
       },
+      removed => { archiveMemoriesToBackupDir(stateDir, removed, 'edit-replace') },
     )
     for (const t of memTools) {
       agent.ctx.tools?.register({
@@ -3116,6 +3118,59 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             restoredCount: restored.restoredCount,
             memories: restored.list,
             memoryBackups: restored.backups,
+          })
+          return
+        }
+
+        // Edit a memory as delete-old + add-new: the previous version is archived into the 30-day
+        // regret vault (reason: edit-replace) so an edit can never lose the original text.
+        if (req.method === 'PUT' && sub.startsWith('memories/')) {
+          const memId = decodeURIComponent(sub.slice('memories/'.length))
+          const body = await readJsonBody(req, 1024 * 1024)
+          const current = getMemoryEntries()
+          const old = current.find(m => m.id === memId)
+          if (!old) { sendJson(res, 404, { error: `Memory entry not found: ${memId}` }); return }
+          const category = body.category !== undefined && ['preference', 'device', 'project', 'fact', 'episodic', 'milestone'].includes(String(body.category))
+            ? (String(body.category) as MemoryCategory)
+            : undefined
+          const tags = Array.isArray(body.tags)
+            ? body.tags.map(t => String(t).trim()).filter(Boolean)
+            : typeof body.tags === 'string'
+              ? body.tags.split(/[\s,]+/).map(t => t.trim()).filter(Boolean)
+              : undefined
+          let milestone: MilestoneReminderRule | null | undefined = undefined
+          if (body.milestone === null) {
+            milestone = null
+          } else if (typeof body.milestone === 'object' && body.milestone !== null) {
+            const mObj = body.milestone as { targetDate?: string; recurrence?: string; leadDays?: unknown }
+            if (typeof mObj.targetDate === 'string' && mObj.targetDate.trim()) {
+              const td = mObj.targetDate.trim()
+              milestone = {
+                targetDate: td,
+                recurrence: mObj.recurrence === 'once' ? 'once' : mObj.recurrence === 'yearly' ? 'yearly' : (/^\d{4}-/.test(td) ? 'once' : 'yearly'),
+                leadDays: Array.isArray(mObj.leadDays)
+                  ? mObj.leadDays.map(n => Number(n)).filter(n => Number.isFinite(n) && n >= 0 && n <= 365)
+                  : [...DEFAULT_MILESTONE_LEAD_DAYS],
+              }
+              if (!milestone.leadDays.length) milestone.leadDays = [...DEFAULT_MILESTONE_LEAD_DAYS]
+            }
+          }
+          const { entry, list, replaced } = replaceMemoryEntry(current, memId, {
+            ...(typeof body.title === 'string' ? { title: body.title } : {}),
+            ...(typeof body.content === 'string' ? { content: body.content } : {}),
+            ...(category ? { category } : {}),
+            ...(tags !== undefined ? { tags } : {}),
+            ...(typeof body.pinned === 'boolean' ? { pinned: body.pinned } : {}),
+            ...(milestone !== undefined ? { milestone } : {}),
+          })
+          const backup = archiveMemoriesToBackupDir(stateDir, [replaced], 'edit-replace')
+          setMemoryEntries(list, 'replace')
+          sendJson(res, 200, {
+            memory: entry,
+            replacedId: replaced.id,
+            ...(backup ? { backup } : {}),
+            memories: list,
+            memoryBackups: listAndPurgeMemoryBackups(stateDir),
           })
           return
         }
