@@ -585,10 +585,15 @@ export function upsertResidentAddress(
   now = new Date(),
 ): { config: AssistantAmbientConfig; entry: ResidentAddress } {
   const address = input.address.trim().slice(0, 160)
+  // Same address text updates in place; re-saving under the same label (e.g.「老婆公司」
+  // with a corrected address) also replaces the old entry instead of stacking a duplicate
+  // that label-based navigation would keep resolving to the stale one.
   const existing = config.residentAddresses.find(a => a.address === address)
+    ?? (input.label?.trim() ? config.residentAddresses.find(a => a.label === input.label!.trim()) : undefined)
   const entry: ResidentAddress = existing
     ? {
         ...existing,
+        address,
         ...(input.label?.trim() ? { label: input.label.trim().slice(0, 20) } : {}),
         city: input.city,
         isPrimary: input.makePrimary ? true : existing.isPrimary,
@@ -1001,6 +1006,12 @@ export interface NavigationResult {
   steps: string[]
   links: { amap?: string; baidu: string }
   note?: string
+  /** How the endpoints were located: coordinate paste > POI > door-level geocode > city > imprecise guess. */
+  precision?: 'coordinate' | 'poi' | 'door' | 'city' | 'imprecise'
+  /** Set when several places plausibly match: the user must pick one before any route is planned. */
+  needsConfirmation?: boolean
+  candidates?: PlaceCandidate[]
+  confirmationFor?: 'origin' | 'destination'
 }
 
 export function formatDurationZh(totalMinutes: number): string {
@@ -1034,17 +1045,136 @@ export function buildBaiduNavigationUrl(originText: string | undefined, destinat
   return `https://api.map.baidu.com/direction?${params.toString()}`
 }
 
-interface AmapGeocodeHit { longitude: number; latitude: number; formattedAddress: string; city?: string }
+interface AmapGeocodeHit { longitude: number; latitude: number; formattedAddress: string; city?: string; level?: string }
 
 export async function geocodeWithAmap(address: string, apiKey: string, fetcher: FetchFn = fetch): Promise<AmapGeocodeHit | undefined> {
   const res = await fetcher(`https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(apiKey)}&address=${encodeURIComponent(address)}`, { signal: AbortSignal.timeout(10_000) })
   if (!res.ok) return undefined
-  const data = (await res.json()) as { status?: string; geocodes?: { location?: string; formatted_address?: string; city?: string | string[] }[] }
+  const data = (await res.json()) as { status?: string; geocodes?: { location?: string; formatted_address?: string; city?: string | string[]; level?: string }[] }
   if (data.status !== '1') return undefined
   const hit = data.geocodes?.[0]
   const [lon, lat] = (hit?.location ?? '').split(',').map(Number)
   if (!hit || !Number.isFinite(lon) || !Number.isFinite(lat)) return undefined
-  return { longitude: lon!, latitude: lat!, formattedAddress: hit.formatted_address ?? address, ...(typeof hit.city === 'string' && hit.city ? { city: hit.city } : {}) }
+  return { longitude: lon!, latitude: lat!, formattedAddress: hit.formatted_address ?? address, ...(typeof hit.city === 'string' && hit.city ? { city: hit.city } : {}), ...(hit.level ? { level: hit.level } : {}) }
+}
+
+/** Geocode levels precise enough to navigate to; anything coarser （市/区县/乡镇/道路…) is an approximation. */
+export const PRECISE_GEOCODE_LEVELS = new Set(['兴趣点', '门牌号', '道路交叉路口', '公交地铁站点', '小巷', '热点商圈'])
+
+export interface PlaceCandidate {
+  name: string
+  address?: string
+  district?: string
+  cityName?: string
+  longitude: number
+  latitude: number
+}
+
+/**
+ * Amap POI keyword search — the right API for place *names* (companies, campuses,
+ * malls, stations). Plain geocoding cannot resolve those and silently fabricates a
+ * road-side point, which is how navigation destinations used to drift kilometres away.
+ */
+export async function searchPlacesWithAmap(keyword: string, input: { apiKey: string; city?: string; fetcher?: FetchFn }): Promise<PlaceCandidate[]> {
+  const fetcher = input.fetcher ?? fetch
+  const params = new URLSearchParams({
+    key: input.apiKey,
+    keywords: keyword,
+    offset: '10',
+    page: '1',
+    extensions: 'base',
+    ...(input.city ? { city: input.city, citylimit: 'false' } : {}),
+  })
+  const res = await fetcher(`https://restapi.amap.com/v3/place/text?${params.toString()}`, { signal: AbortSignal.timeout(10_000) })
+  if (!res.ok) return []
+  const data = (await res.json()) as { status?: string; pois?: { name?: string; address?: string | string[]; location?: string; cityname?: string; adname?: string }[] }
+  if (data.status !== '1') return []
+  const out: PlaceCandidate[] = []
+  for (const poi of data.pois ?? []) {
+    const [lon, lat] = (poi.location ?? '').split(',').map(Number)
+    if (!poi.name || !Number.isFinite(lon) || !Number.isFinite(lat)) continue
+    out.push({
+      name: poi.name,
+      ...(typeof poi.address === 'string' && poi.address ? { address: poi.address } : {}),
+      ...(poi.adname ? { district: poi.adname } : {}),
+      ...(poi.cityname ? { cityName: poi.cityname } : {}),
+      longitude: lon!,
+      latitude: lat!,
+    })
+  }
+  return out
+}
+
+function normalizePlaceText(text: string): string {
+  return text.toLowerCase().replace(/[\s·・_\-—–()（）【】[\]「」'’"“”,，.。:：;；]/g, '')
+}
+
+/** How well a POI candidate matches the user's words: 100 exact name, 80 prefix, 60 containment, 40 via address, else 10. */
+export function scorePlaceMatch(keyword: string, candidate: PlaceCandidate): number {
+  const core = normalizePlaceText(keyword)
+  const name = normalizePlaceText(candidate.name)
+  if (!core || !name) return 0
+  if (name === core) return 100
+  if (name.startsWith(core) || core.startsWith(name)) return 80
+  if (name.includes(core) || core.includes(name)) return 60
+  if (candidate.address && normalizePlaceText(candidate.address).includes(core)) return 40
+  return 10
+}
+
+/** Parses a pasted "longitude,latitude" coordinate pair (e.g. copied from a maps app). */
+export function parseCoordinateText(text: string): { longitude: number; latitude: number } | undefined {
+  const m = /^\s*(-?\d{1,3}(?:\.\d+)?)\s*[,，、\s]\s*(-?\d{1,2}(?:\.\d+)?)\s*$/.exec(text.trim())
+  if (!m) return undefined
+  const longitude = Number(m[1])
+  const latitude = Number(m[2])
+  if (!Number.isFinite(longitude) || !Number.isFinite(latitude) || Math.abs(longitude) > 180 || Math.abs(latitude) > 90) return undefined
+  return { longitude, latitude }
+}
+
+export async function reverseGeocodeWithAmap(longitude: number, latitude: number, apiKey: string, fetcher: FetchFn = fetch): Promise<{ city?: string; formattedAddress?: string } | undefined> {
+  const res = await fetcher(`https://restapi.amap.com/v3/geocode/regeo?key=${encodeURIComponent(apiKey)}&location=${longitude},${latitude}`, { signal: AbortSignal.timeout(10_000) })
+  if (!res.ok) return undefined
+  const data = (await res.json()) as { status?: string; regeocode?: { formatted_address?: string; addressComponent?: { city?: string | string[] } } }
+  if (data.status !== '1') return undefined
+  const city = data.regeocode?.addressComponent?.city
+  return {
+    ...(typeof city === 'string' && city ? { city } : {}),
+    ...(data.regeocode?.formatted_address ? { formattedAddress: data.regeocode.formatted_address } : {}),
+  }
+}
+
+/**
+ * Resolves the city + coordinates for a resident address being saved: pasted coordinates
+ * win (zero error), then precise Amap geocoding / decisive POI match, then the plain
+ * city-level geocoder. Returns an `AmbientHomeCity` whose coordinates may be POI-precise.
+ */
+export async function resolveAddressCity(addressText: string, input: { amapKey?: string; cityHint?: string; fetcher?: FetchFn }): Promise<AmbientHomeCity | undefined> {
+  const fetcher = input.fetcher ?? fetch
+  const coord = parseCoordinateText(addressText)
+  if (coord) {
+    let cityName = input.cityHint?.trim()
+    if (!cityName && input.amapKey) {
+      const rev = await reverseGeocodeWithAmap(coord.longitude, coord.latitude, input.amapKey, fetcher).catch(() => undefined)
+      cityName = rev?.city
+    }
+    return { name: cityName || '坐标点', longitude: coord.longitude, latitude: coord.latitude, timezone: 'Asia/Shanghai' }
+  }
+  if (input.amapKey) {
+    const geo = await geocodeWithAmap(input.cityHint?.trim() || addressText, input.amapKey, fetcher).catch(() => undefined)
+    if (geo && geo.level && PRECISE_GEOCODE_LEVELS.has(geo.level)) {
+      return { name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' }
+    }
+    const places = await searchPlacesWithAmap(addressText, { apiKey: input.amapKey, ...(input.cityHint ? { city: input.cityHint } : {}), fetcher }).catch(() => [])
+    const scored = places.map(p => ({ p, score: scorePlaceMatch(addressText, p) })).sort((a, b) => b.score - a.score)
+    const top = scored[0]
+    if (top && top.score >= 60) {
+      return { name: top.p.cityName || input.cityHint?.trim() || top.p.name, longitude: top.p.longitude, latitude: top.p.latitude, timezone: 'Asia/Shanghai' }
+    }
+    if (geo) {
+      return { name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' }
+    }
+  }
+  return geocodeCity(input.cityHint?.trim() || addressText, fetcher)
 }
 
 /** Amap direction planning (driving is traffic-aware). Throws Error(info) on API-level failures. */
@@ -1089,15 +1219,28 @@ export async function planRouteWithAmap(input: {
   }
 }
 
+interface ResolvedEndpoint {
+  point: NavigationPoint
+  addressText: string
+  precision: NonNullable<NavigationResult['precision']>
+  needsConfirmation?: boolean
+  candidates?: PlaceCandidate[]
+}
+
+const POSTAL_ADDRESS_RE = /\d+\s*(号|弄|栋|幢|室|层|楼)/
+
 /**
- * End-to-end navigation orchestration shared by the Assistant tool and the Web UI:
- * resolves endpoints from resident addresses (label match → detailed address geocode →
- * city-level coordinates), plans with Amap when a key is configured, and always returns
- * map deep links so the user can jump into a maps app either way.
+ * End-to-end navigation orchestration shared by the Assistant tool and the Web UI.
+ * Endpoint resolution order (this ordering is the fix for drifting destinations):
+ * pasted coordinates → saved-address label → for postal-style addresses, door-level
+ * geocoding → for place *names*, Amap POI search with match scoring → city-level
+ * coordinates. When several POIs plausibly match, planning STOPS and candidates are
+ * returned for confirmation instead of silently routing to the first (wrong) point.
  */
 export async function planNavigation(input: {
   fromText?: string
   toText: string
+  toLabel?: string
   mode?: NavigationMode
   addresses: readonly ResidentAddress[]
   amapKey?: string
@@ -1105,51 +1248,93 @@ export async function planNavigation(input: {
 }): Promise<NavigationResult> {
   const fetcher = input.fetcher ?? fetch
   const mode: NavigationMode = input.mode ?? 'driving'
-  const resolveEndpoint = async (text: string | undefined, role: 'origin' | 'destination'): Promise<{ point: NavigationPoint; addressText: string }> => {
+  const primary = input.addresses.find(a => a.isPrimary) ?? input.addresses[0]
+  const cityHint = primary?.city.name
+
+  const fromSavedAddress = async (addr: ResidentAddress): Promise<ResolvedEndpoint> => {
+    const base: NavigationPoint = { label: addr.label, longitude: addr.city.longitude, latitude: addr.city.latitude, cityName: addr.city.name }
+    if (input.amapKey) {
+      const precise = await resolveAddressCity(addr.address, { amapKey: input.amapKey, cityHint: addr.city.name, fetcher }).catch(() => undefined)
+      if (precise) return { point: { ...base, longitude: precise.longitude, latitude: precise.latitude }, addressText: addr.address, precision: 'poi' }
+    }
+    return { point: base, addressText: addr.address, precision: 'city' }
+  }
+
+  const resolveEndpoint = async (text: string | undefined, role: 'origin' | 'destination'): Promise<ResolvedEndpoint> => {
     const t = (text ?? '').trim()
-    const primary = input.addresses.find(a => a.isPrimary) ?? input.addresses[0]
-    if (!t && role === 'origin' && primary) {
-      const base: NavigationPoint = { label: primary.label, longitude: primary.city.longitude, latitude: primary.city.latitude, cityName: primary.city.name }
-      if (input.amapKey) {
-        const geo = await geocodeWithAmap(primary.address, input.amapKey, fetcher).catch(() => undefined)
-        if (geo) return { point: { ...base, longitude: geo.longitude, latitude: geo.latitude }, addressText: primary.address }
-      }
-      return { point: base, addressText: primary.address }
+    if (!t && role === 'origin' && primary) return fromSavedAddress(primary)
+    const coord = t ? parseCoordinateText(t) : undefined
+    if (coord) {
+      return { point: { label: role === 'destination' && input.toLabel ? input.toLabel : t, longitude: coord.longitude, latitude: coord.latitude, ...(cityHint ? { cityName: cityHint } : {}) }, addressText: t, precision: 'coordinate' }
     }
     const matched = t
       ? input.addresses.find(a => a.label === t || a.label.includes(t) || a.address.includes(t))
       : undefined
-    if (matched) {
-      const base: NavigationPoint = { label: matched.label, longitude: matched.city.longitude, latitude: matched.city.latitude, cityName: matched.city.name }
-      if (input.amapKey) {
-        const geo = await geocodeWithAmap(matched.address, input.amapKey, fetcher).catch(() => undefined)
-        if (geo) return { point: { ...base, longitude: geo.longitude, latitude: geo.latitude }, addressText: matched.address }
-      }
-      return { point: base, addressText: matched.address }
-    }
-    const label = t || (role === 'origin' ? '起点' : '目的地')
+    if (matched) return fromSavedAddress(matched)
+    const label = (role === 'destination' && input.toLabel) || t || (role === 'origin' ? '起点' : '目的地')
     if (input.amapKey && t) {
+      const looksPostal = POSTAL_ADDRESS_RE.test(t) || /(路|街|大道|巷|村)\s*\d/.test(t)
+      if (looksPostal) {
+        const geo = await geocodeWithAmap(t, input.amapKey, fetcher).catch(() => undefined)
+        if (geo && geo.level && PRECISE_GEOCODE_LEVELS.has(geo.level)) {
+          return { point: { label, longitude: geo.longitude, latitude: geo.latitude, ...(geo.city ? { cityName: geo.city } : {}) }, addressText: t, precision: 'door' }
+        }
+      }
+      const places = await searchPlacesWithAmap(t, { apiKey: input.amapKey, ...(cityHint ? { city: cityHint } : {}), fetcher }).catch(() => [])
+      const scored = places.map(p => ({ p, score: scorePlaceMatch(t, p) })).sort((a, b) => b.score - a.score)
+      const top = scored[0]
+      const second = scored[1]
+      if (top && top.score >= 60 && (!second || top.score - second.score >= 20 || second.score < 40)) {
+        return { point: { label, longitude: top.p.longitude, latitude: top.p.latitude, ...(top.p.cityName ? { cityName: top.p.cityName } : {}) }, addressText: top.p.address ?? t, precision: 'poi' }
+      }
+      if (top && top.score >= 40) {
+        return {
+          point: { label },
+          addressText: t,
+          precision: 'imprecise',
+          needsConfirmation: true,
+          candidates: scored.filter(s => s.score >= 40).slice(0, 5).map(s => s.p),
+        }
+      }
       const geo = await geocodeWithAmap(t, input.amapKey, fetcher).catch(() => undefined)
-      if (geo) return { point: { label, longitude: geo.longitude, latitude: geo.latitude, ...(geo.city ? { cityName: geo.city } : {}) }, addressText: t }
+      if (geo) {
+        const precise = geo.level ? PRECISE_GEOCODE_LEVELS.has(geo.level) : false
+        return { point: { label, longitude: geo.longitude, latitude: geo.latitude, ...(geo.city ? { cityName: geo.city } : {}) }, addressText: t, precision: precise ? 'door' : 'imprecise' }
+      }
     }
     if (t) {
       const candidate = (await searchCityCandidates(t, fetcher).catch(() => []))[0]
-      if (candidate) return { point: { label, longitude: candidate.longitude, latitude: candidate.latitude, cityName: candidate.name }, addressText: t }
+      if (candidate) return { point: { label, longitude: candidate.longitude, latitude: candidate.latitude, cityName: candidate.name }, addressText: t, precision: 'city' }
     }
-    return { point: { label }, addressText: t }
+    return { point: { label }, addressText: t, precision: 'imprecise' }
   }
+
   const origin = await resolveEndpoint(input.fromText, 'origin')
   const destination = await resolveEndpoint(input.toText, 'destination')
   const links = {
     ...(buildAmapNavigationUrl(origin.point, destination.point, mode) ? { amap: buildAmapNavigationUrl(origin.point, destination.point, mode)! } : {}),
     baidu: buildBaiduNavigationUrl(origin.addressText || undefined, destination.addressText, mode, destination.point.cityName ?? origin.point.cityName),
   }
-  const base: NavigationResult = { provider: 'links', mode, origin: origin.point, destination: destination.point, steps: [], links }
+  const precisionRank = { coordinate: 0, poi: 1, door: 1, city: 2, imprecise: 3 } as const
+  const precision = precisionRank[origin.precision] >= precisionRank[destination.precision] ? origin.precision : destination.precision
+  const base: NavigationResult = { provider: 'links', mode, origin: origin.point, destination: destination.point, steps: [], links, precision }
+
+  const ambiguous = origin.needsConfirmation
+    ? { side: 'origin' as const, ep: origin }
+    : destination.needsConfirmation
+      ? { side: 'destination' as const, ep: destination }
+      : undefined
+  if (ambiguous) {
+    return {
+      ...base,
+      needsConfirmation: true,
+      confirmationFor: ambiguous.side,
+      candidates: ambiguous.ep.candidates ?? [],
+      note: `「${ambiguous.ep.addressText}」找到几个可能的位置，先确认是哪一个再规划路线（点错一个就会整体跑偏）：${(ambiguous.ep.candidates ?? []).map((c, i) => `${i + 1}. ${c.name}${c.address ? `（${c.address}）` : ''}`).join('；')}`,
+    }
+  }
   if (!input.amapKey) {
     return { ...base, note: '尚未配置高德地图 Key，暂时只能提供导航链接（点开直接跳地图 App）。配置后助理可直接报距离、时长与实时路况。' }
-  }
-  if (origin.point.longitude === undefined || destination.point.longitude === undefined) {
-    return { ...base, note: '有一端地址没能定位到坐标，先给导航链接；把地址写得更完整（带城市名）会更准。' }
   }
   const originLon = origin.point.longitude
   const originLat = origin.point.latitude
@@ -1174,7 +1359,7 @@ export async function planNavigation(input: {
       durationMin: Math.round(route.durationMin),
       durationText: formatDurationZh(route.durationMin),
       steps: route.steps,
-      note: `${NAV_MODE_LABEL[mode]}路线（高德${mode === 'driving' ? '，含实时路况' : ''}）：${origin.point.label} → ${destination.point.label}`,
+      note: `${NAV_MODE_LABEL[mode]}路线（高德${mode === 'driving' ? '，含实时路况' : ''}）：${origin.point.label} → ${destination.point.label}${precision === 'imprecise' ? '（有一端是近似定位，结果仅供参考）' : ''}`,
     }
   } catch (err) {
     return { ...base, note: `高德路线规划暂时失败（${err instanceof Error ? err.message : String(err)}），先用导航链接打开地图查看。` }
@@ -1429,12 +1614,15 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'ambient_save_address',
-      description: 'Save one of the user\'s resident addresses (multiple allowed: 家/公司/老家…). `address` is the detailed free-form address; `city` is optional — when omitted it is geocoded from the address itself (degraded to district/city level). The first address (or make_primary=true) becomes the primary whose city drives weather. Use when the user says "记住我家地址是…/我公司在…".',
+      description: 'Save one of the user\'s resident addresses (multiple allowed: 家/公司/老家…). `address` is the detailed free-form address, or a pasted "longitude,latitude" coordinate pair for zero-error positioning. Re-saving with the same label REPLACES that address. `city` is optional — when omitted it is resolved from the address itself (Amap POI/door-level when keyed, else city level). The first address (or make_primary=true) becomes the primary whose city drives weather. Use when the user says "记住我家地址是…/我公司在…".',
       parameters: z.toJSONSchema(ambientSaveAddressSchema),
       execute: async (raw: unknown) => {
         guard()
         const args = ambientSaveAddressSchema.parse(raw ?? {})
-        const city = await geocodeCity(args.city?.trim() || args.address)
+        const city = await resolveAddressCity(args.address, {
+          ...(deps.getAmapApiKey?.() ? { amapKey: deps.getAmapApiKey() } : {}),
+          ...(args.city?.trim() ? { cityHint: args.city.trim() } : {}),
+        })
         if (!city) return { ok: false, error: `No city matched for address "${args.address}"; ask the user which city it is in.` }
         const saved = upsertResidentAddress(deps.getAmbientConfig(), {
           address: args.address,
@@ -1468,7 +1656,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'navigation_route',
-      description: 'Plan a route and (when an Amap key is configured) report distance, duration (traffic-aware for driving) and step summary; always returns Amap/Baidu navigation deep links the user can tap to start navigating. Origin defaults to the primary resident address; origin/destination may be saved address labels （家/公司）, detailed addresses, or place names. Use for "我回家要多久", "去X怎么走", "导航去X".',
+      description: 'Plan a route and (when an Amap key is configured) report distance, duration (traffic-aware for driving) and step summary; always returns Amap/Baidu navigation deep links. Origin defaults to the primary resident address; endpoints may be saved labels （家/公司）, detailed addresses, place names (resolved via Amap POI search), or "longitude,latitude" coordinates. IMPORTANT: when the result has needsConfirmation=true, several places matched — list the candidates and ask the user which one; NEVER silently pick one or claim a location is precise when precision is "imprecise". After the user picks, call again with to set to that candidate\'s "longitude,latitude". Use for "我回家要多久", "去X怎么走", "导航去X".',
       parameters: z.toJSONSchema(navigationRouteSchema),
       execute: async (raw: unknown) => {
         guard()

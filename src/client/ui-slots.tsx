@@ -709,7 +709,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       id: `addr-new-${Date.now()}`,
       label: addressLabel.trim() || (lang === 'zh' ? '常驻地址' : 'Address'),
       address: addressDraft.trim(),
-      city: { name: selectedCity.name, latitude: selectedCity.latitude, longitude: selectedCity.longitude, timezone: selectedCity.timezone },
+      city: { name: selectedCity.cityName ?? selectedCity.name, latitude: selectedCity.latitude, longitude: selectedCity.longitude, timezone: selectedCity.timezone },
       isPrimary: addressPrimary || current.length === 0,
       createdAt: nowIso,
       updatedAt: nowIso,
@@ -751,11 +751,12 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       setNotice(lang === 'zh' ? '已清除保存的高德 Key（若设了环境变量 RHARNESS_AMAP_KEY 则仍以它为准）' : 'Amap key cleared')
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
-  const queryNavigation = async () => {
-    if (!navTo.trim()) return
+  const queryNavigation = async (override?: { to: string; toLabel?: string }) => {
+    const to = (override?.to ?? navTo).trim()
+    if (!to) return
     setNavBusy(true); setErr('')
     try {
-      const params = new URLSearchParams({ to: navTo.trim(), mode: navMode, ...(navFrom.trim() ? { from: navFrom.trim() } : {}) })
+      const params = new URLSearchParams({ to, mode: navMode, ...(navFrom.trim() ? { from: navFrom.trim() } : {}), ...(override?.toLabel ? { toLabel: override.toLabel } : {}) })
       const res = await standaloneFetch<NavigationResultInfo>(`assistant/navigation/route?${params.toString()}`, 'GET')
       setNavResult(res)
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setNavBusy(false) }
@@ -913,7 +914,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
                 <div className="dt-row-buttons">
                   {cityCandidates.map((c, idx) => (
                     <Button key={`${c.name}-${c.latitude}-${c.longitude}`} size="sm" variant={selectedCity === c ? 'primary' : 'outline'} onClick={() => pickCity(c)} data-testid={`ambient-city-candidate-${idx}`}>
-                      📍 {c.name}{c.admin1 && c.admin1 !== c.name ? ` · ${c.admin1}` : ''}{c.country ? ` · ${c.country}` : ''}
+                      📍 {c.name}{c.address ? ` · ${c.address}` : ''}{c.admin1 && c.admin1 !== c.name ? ` · ${c.admin1}` : ''}{!c.address && c.country ? ` · ${c.country}` : ''}
                     </Button>
                   ))}
                 </div>
@@ -950,6 +951,15 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
               <div className="dt-ambient-card" data-testid="nav-result">
                 <strong>{navResult.origin.label} → {navResult.destination.label}{navResult.distanceKm !== undefined ? ` · ${navResult.distanceKm} km` : ''}{navResult.durationText ? ` · ${navResult.durationText}` : ''}</strong>
                 {navResult.note && <span className="dt-hint">{navResult.note}</span>}
+                {navResult.needsConfirmation && (navResult.candidates?.length ?? 0) > 0 && (
+                  <div className="dt-row-buttons" data-testid="nav-candidates">
+                    {navResult.candidates!.map((c, idx) => (
+                      <Button key={`${c.name}-${c.longitude}-${c.latitude}`} size="sm" variant="outline" disabled={navBusy} onClick={() => { void queryNavigation({ to: `${c.longitude},${c.latitude}`, toLabel: c.name }) }} data-testid={`nav-candidate-${idx}`}>
+                        📍 {c.name}{c.address ? ` · ${c.address}` : ''}{c.district ? ` · ${c.district}` : ''}
+                      </Button>
+                    ))}
+                  </div>
+                )}
                 {navResult.steps.length > 0 && (
                   <ol className="dt-news-list">
                     {navResult.steps.map((s, i) => <li key={i} className="dt-news-item"><span>{s}</span></li>)}

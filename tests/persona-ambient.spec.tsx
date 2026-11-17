@@ -27,7 +27,10 @@ import {
   cityQueryVariants,
   formatDurationZh,
   formatLunarDate,
+  parseCoordinateText,
   planNavigation,
+  scorePlaceMatch,
+  searchPlacesWithAmap,
   geocodeCity,
   getNewsBrief,
   searchCityCandidates,
@@ -312,6 +315,68 @@ describe('ambient awareness', () => {
     expect(linksOnly.links.amap).toContain('uri.amap.com')
     expect(buildBaiduNavigationUrl('家', '公司', 'transit', '上海')).toContain('mode=transit')
     expect(buildAmapNavigationUrl({ label: '家' }, { label: '公司', longitude: 116.4, latitude: 39.9 }, 'driving')).toBeUndefined()
+  })
+
+  it('resolves place names via POI search, stops for confirmation when ambiguous, and accepts pasted coordinates', async () => {
+    expect(parseCoordinateText('121.446272, 31.126632')).toEqual({ longitude: 121.446272, latitude: 31.126632 })
+    expect(parseCoordinateText('上海市徐汇区')).toBeUndefined()
+    expect(parseCoordinateText('999, 999')).toBeUndefined()
+    const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
+    const cfg = upsertResidentAddress(defaultAssistantAmbientConfig(), { label: '家', address: '上海市徐汇区梅陇十一村46号401', city: shanghai }).config
+    const fetcher = vi.fn(async (url: string) => {
+      if (url.includes('place/text')) {
+        return new Response(JSON.stringify({ status: '1', pois: [
+          { name: '米哈游(北杨园区)', address: '华发路811号', location: '121.438,31.128', cityname: '上海市', adname: '徐汇区' },
+          { name: '米哈游总部', address: '宜山路700号', location: '121.396,31.169', cityname: '上海市', adname: '徐汇区' },
+        ] }), { status: 200 })
+      }
+      if (url.includes('geocode/geo')) {
+        // Deliberately WRONG road-side point (the original bug): must not be used for place names.
+        return new Response(JSON.stringify({ status: '1', geocodes: [{ location: '121.395,31.169', formatted_address: '上海市徐汇区', city: '上海市', level: '区县' }] }), { status: 200 })
+      }
+      if (url.includes('direction/driving')) {
+        return new Response(JSON.stringify({ status: '1', route: { paths: [{ distance: '2700', duration: '420', steps: [{ instruction: '沿华发路行驶' }] }] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ results: [] }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    // "米哈游" matches both POIs: planning must stop and ask, not silently route to either.
+    const ambiguous = await planNavigation({ toText: '米哈游', mode: 'driving', addresses: cfg.residentAddresses, amapKey: 'k', fetcher })
+    expect(ambiguous.needsConfirmation).toBe(true)
+    expect(ambiguous.confirmationFor).toBe('destination')
+    expect(ambiguous.candidates?.map(c => c.name)).toEqual(['米哈游(北杨园区)', '米哈游总部'])
+    expect(ambiguous.durationText).toBeUndefined()
+
+    // Exact place name resolves decisively via POI (not the wrong geocode point).
+    const decisive = await planNavigation({ toText: '米哈游(北杨园区)', mode: 'driving', addresses: cfg.residentAddresses, amapKey: 'k', fetcher })
+    expect(decisive.needsConfirmation).toBeUndefined()
+    expect(decisive.provider).toBe('amap')
+    expect(decisive.precision).toBe('poi')
+    expect(decisive.destination).toMatchObject({ longitude: 121.438, latitude: 31.128 })
+    expect(decisive.distanceKm).toBe(2.7)
+
+    // Pasted coordinates go straight through with zero resolution error.
+    const byCoord = await planNavigation({ toText: '121.438,31.128', toLabel: '米哈游(北杨园区)', mode: 'driving', addresses: cfg.residentAddresses, amapKey: 'k', fetcher })
+    // Overall precision reports the weakest link (origin resolved via POI here); the pasted coordinate itself is used verbatim.
+    expect(byCoord.precision).toBe('poi')
+    expect(byCoord.destination).toMatchObject({ longitude: 121.438, latitude: 31.128 })
+    expect(byCoord.destination.label).toBe('米哈游(北杨园区)')
+    expect(byCoord.provider).toBe('amap')
+
+    expect(scorePlaceMatch('米哈游(北杨园区)', { name: '米哈游(北杨园区)', longitude: 1, latitude: 1 })).toBe(100)
+    const places = await searchPlacesWithAmap('米哈游', { apiKey: 'k', fetcher })
+    expect(places).toHaveLength(2)
+    expect(places[0]).toMatchObject({ district: '徐汇区', cityName: '上海市' })
+  })
+
+  it('re-saving an address under the same label replaces it instead of stacking a stale duplicate', () => {
+    const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
+    let cfg = upsertResidentAddress(defaultAssistantAmbientConfig(), { label: '老婆公司', address: '上海市徐汇区华发路米哈游(北杨园区)-北区2号楼', city: shanghai }).config
+    const firstId = cfg.residentAddresses[0]!.id
+    cfg = upsertResidentAddress(cfg, { label: '老婆公司', address: '上海市徐汇区华发路888弄北区2号楼', city: { ...shanghai, longitude: 121.438, latitude: 31.128 } }).config
+    expect(cfg.residentAddresses).toHaveLength(1)
+    expect(cfg.residentAddresses[0]).toMatchObject({ id: firstId, address: '上海市徐汇区华发路888弄北区2号楼' })
+    expect(cfg.residentAddresses[0]!.city.longitude).toBe(121.438)
   })
 
   it('parses RSS and builds a topic brief', () => {

@@ -312,6 +312,10 @@ export interface CityCandidateInfo extends AmbientHomeCityInfo {
   admin1?: string
   country?: string
   population?: number
+  /** Street address when this candidate came from Amap POI search. */
+  address?: string
+  /** City the POI belongs to (weather city name when picked for an address). */
+  cityName?: string
   /** Which degraded query variant (full address → district → city) produced this candidate. */
   matchedQuery?: string
 }
@@ -371,6 +375,10 @@ export interface NavigationResultInfo {
   steps: string[]
   links: { amap?: string; baidu: string }
   note?: string
+  precision?: 'coordinate' | 'poi' | 'door' | 'city' | 'imprecise'
+  needsConfirmation?: boolean
+  candidates?: { name: string; address?: string; district?: string; cityName?: string; longitude: number; latitude: number }[]
+  confirmationFor?: 'origin' | 'destination'
 }
 export interface AssistantChatBackupInfo {
   id: string

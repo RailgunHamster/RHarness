@@ -137,6 +137,7 @@ import {
   purgeExpiredStickerTrash,
   restoreStickerRecord,
   searchCityCandidates,
+  searchPlacesWithAmap,
   saveStickerFromBase64,
   saveStickerFromBuffer,
   stickerAllowedByPolicy,
@@ -2861,7 +2862,25 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           if (req.method === 'GET' && sub === 'assistant/ambient/geocode') {
             const q = String(url.searchParams.get('q') ?? '').trim()
             if (!q) { sendJson(res, 400, { error: 'Missing q (city name or detailed address)' }); return }
-            const candidates = await searchCityCandidates(q)
+            // With an Amap key, place (POI) candidates come first — they carry door-level
+            // coordinates for companies/campuses that plain city geocoding cannot resolve.
+            const amapKey = getAmapApiKey()
+            let candidates: unknown[] = []
+            if (amapKey) {
+              const places = await searchPlacesWithAmap(q, { apiKey: amapKey }).catch(() => [])
+              candidates = places.map(p => ({
+                name: p.name,
+                ...(p.address ? { address: p.address } : {}),
+                ...(p.district ? { admin1: p.district } : {}),
+                ...(p.cityName ? { cityName: p.cityName } : {}),
+                country: '中国',
+                latitude: p.latitude,
+                longitude: p.longitude,
+                timezone: 'Asia/Shanghai',
+                matchedQuery: 'poi',
+              }))
+            }
+            if (!candidates.length) candidates = await searchCityCandidates(q)
             sendJson(res, 200, { query: q, candidates })
             return
           }
@@ -2903,9 +2922,11 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             const modeParam = String(url.searchParams.get('mode') ?? 'driving')
             const mode = modeParam === 'transit' || modeParam === 'walking' ? modeParam : 'driving'
             if (!to) { sendJson(res, 400, { error: 'Missing to (destination)' }); return }
+            const toLabel = String(url.searchParams.get('toLabel') ?? '').trim() || undefined
             const result = await planNavigation({
               ...(from ? { fromText: from } : {}),
               toText: to,
+              ...(toLabel ? { toLabel } : {}),
               mode,
               addresses: getAmbientConfig().residentAddresses,
               ...(getAmapApiKey() ? { amapKey: getAmapApiKey()! } : {}),
