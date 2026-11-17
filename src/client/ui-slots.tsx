@@ -17,6 +17,7 @@ import {
   type AssistantContextConfigInfo,
   type AssistantMessageInfo,
   type AssistantPersonaConfigInfo,
+  type CityCandidateInfo,
   type ClawFeedItemInfo,
   type Lang,
   type LiveSessionRunInfo,
@@ -513,6 +514,9 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
   const [notice, setNotice] = useState('')
   const [draftConfig, setDraftConfig] = useState<AssistantPersonaConfigInfo | null>(null)
   const [cityDraft, setCityDraft] = useState('')
+  const [cityCandidates, setCityCandidates] = useState<CityCandidateInfo[]>([])
+  const [selectedCity, setSelectedCity] = useState<CityCandidateInfo | null>(null)
+  const [searchingCity, setSearchingCity] = useState(false)
   const [newLearning, setNewLearning] = useState('')
   const [newLearningKind, setNewLearningKind] = useState<PersonaLearningInfo['kind']>('preference')
   const [stickerName, setStickerName] = useState('')
@@ -527,6 +531,8 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       setState({ ...res, stickerTrash: res.stickerTrash ?? [] })
       setDraftConfig(res.config)
       setCityDraft(res.ambientConfig.homeCity.name)
+      setSelectedCity(null)
+      setCityCandidates([])
       onAmbientChanged?.(res.ambient)
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
@@ -656,12 +662,47 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       setState(curr => (curr ? { ...curr, learnings: res.learnings } : curr))
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
+  /** Searches candidate cities for the typed text (detailed addresses are degraded server-side to district/city). */
+  const searchCities = async (): Promise<CityCandidateInfo[]> => {
+    const q = cityDraft.trim()
+    if (!q) return []
+    setSearchingCity(true); setErr('')
+    try {
+      const res = await standaloneFetch<{ candidates: CityCandidateInfo[] }>(`assistant/ambient/geocode?q=${encodeURIComponent(q)}`, 'GET')
+      setCityCandidates(res.candidates)
+      return res.candidates
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); return [] } finally { setSearchingCity(false) }
+  }
+  const pickCity = (candidate: CityCandidateInfo) => {
+    setSelectedCity(candidate)
+    setCityDraft(candidate.name)
+  }
   const saveCity = async () => {
     if (!cityDraft.trim() || !state) return
-    setBusy(true); setErr(''); setNotice('')
+    setErr(''); setNotice('')
+    // No explicit pick yet and the text differs from the saved city: offer the candidate list instead of erroring.
+    if (!selectedCity && cityDraft.trim() !== state.ambientConfig.homeCity.name) {
+      const found = await searchCities()
+      if (found.length > 0) {
+        setNotice(lang === 'zh' ? `🔎 已按「${found[0]!.matchedQuery ?? cityDraft.trim()}」找到候选城市，在下面列表里点选你的城市后再保存（填详细地址也没关系，会定位到所在城市）` : 'Pick your city from the candidate list below, then save.')
+        return
+      }
+      setErr(lang === 'zh' ? `没有找到与「${cityDraft.trim()}」匹配的城市，试试只填城市名或区县名再搜索。` : 'No matching city; try a shorter city/district name.')
+      return
+    }
+    setBusy(true)
     try {
-      const res = await standaloneFetch<{ config: PersonaAmbientStateInfo['ambientConfig']; ambient: AmbientSnapshotInfo }>('assistant/ambient/config', 'PUT', { city: cityDraft.trim(), weatherEnabled: state.ambientConfig.weatherEnabled, newsEnabled: state.ambientConfig.newsEnabled })
+      const res = await standaloneFetch<{ config: PersonaAmbientStateInfo['ambientConfig']; ambient: AmbientSnapshotInfo }>('assistant/ambient/config', 'PUT', {
+        ...(selectedCity
+          ? { homeCity: { name: selectedCity.name, latitude: selectedCity.latitude, longitude: selectedCity.longitude, timezone: selectedCity.timezone } }
+          : { city: cityDraft.trim() }),
+        weatherEnabled: state.ambientConfig.weatherEnabled,
+        newsEnabled: state.ambientConfig.newsEnabled,
+      })
       setState(curr => (curr ? { ...curr, ambientConfig: res.config, ambient: res.ambient } : curr))
+      setCityDraft(res.config.homeCity.name)
+      setSelectedCity(null)
+      setCityCandidates([])
       onAmbientChanged?.(res.ambient)
       setNotice(lang === 'zh' ? `✅ 常驻城市已改为 ${res.config.homeCity.name}，天气已刷新` : '✅ Home city updated')
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
@@ -787,15 +828,29 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
               {state.ambient.weather && <span>{state.ambient.weather.oneLiner}{state.ambient.weatherStale ? '（缓存稍旧，点刷新更新）' : ''}</span>}
             </div>
             <div className="dt-persona-grid">
-              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '常驻城市（天气与感知基准）' : 'Home city'}</span><Input value={cityDraft} onChange={e => setCityDraft(e.target.value)} data-testid="ambient-city-input" placeholder="北京 / 上海 / 深圳…" /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? `常驻城市（天气与感知基准 · 当前：${state.ambientConfig.homeCity.name}）` : 'Home city'}</span><Input value={cityDraft} onChange={e => { setCityDraft(e.target.value); setSelectedCity(null) }} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void searchCities() } }} data-testid="ambient-city-input" placeholder={lang === 'zh' ? '可直接填详细地址，如 上海市徐汇区梅陇十一村46号401，回车或点搜索' : 'City or detailed address…'} /></label>
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '天气感知' : 'Weather'}</span><select className="dt-select" value={state.ambientConfig.weatherEnabled ? 'on' : 'off'} onChange={e => setState(curr => (curr ? { ...curr, ambientConfig: { ...curr.ambientConfig, weatherEnabled: e.target.value === 'on' } } : curr))}><option value="on">开启（每45分钟刷新）</option><option value="off">关闭</option></select></label>
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '新闻感知' : 'News'}</span><select className="dt-select" value={state.ambientConfig.newsEnabled ? 'on' : 'off'} onChange={e => setState(curr => (curr ? { ...curr, ambientConfig: { ...curr.ambientConfig, newsEnabled: e.target.value === 'on' } } : curr))}><option value="on">开启（问新闻时用 news_brief）</option><option value="off">关闭</option></select></label>
             </div>
-            <p className="dt-hint">{lang === 'zh' ? '💡 也可以直接在聊天里对助理说「把常驻城市改成上海」，它会调用 ambient_set_home_city 自己改好，和这里完全同步。' : 'Tip: tell the Assistant "change my home city to Shanghai" — it uses the same API.'}</p>
+            <p className="dt-hint">{lang === 'zh' ? '💡 可以填详细地址：系统会自动降级解析到所在城市/区县，列出候选城市让你点选确认，不会再让你对着报错干瞪眼。也可以直接在聊天里对助理说「把常驻城市改成上海」，和这里完全同步。' : 'Tip: detailed addresses are resolved to their city via a candidate picker.'}</p>
             <div className="dt-row-buttons">
-              <Button variant="primary" disabled={busy} onClick={() => { void saveCity() }} data-testid="ambient-save-city-btn">{lang === 'zh' ? '💾 保存城市与开关' : 'Save'}</Button>
+              <Button variant="outline" disabled={busy || searchingCity || !cityDraft.trim()} onClick={() => { void searchCities() }} data-testid="ambient-search-city-btn">{searchingCity ? (lang === 'zh' ? '搜索中…' : 'Searching…') : (lang === 'zh' ? '🔍 搜索候选城市' : '🔍 Search cities')}</Button>
+              <Button variant="primary" disabled={busy} onClick={() => { void saveCity() }} data-testid="ambient-save-city-btn">{selectedCity ? (lang === 'zh' ? `💾 保存为「${selectedCity.name}」` : `Save as ${selectedCity.name}`) : (lang === 'zh' ? '💾 保存城市与开关' : 'Save')}</Button>
               <Button variant="outline" disabled={busy} onClick={() => { void refreshAmbient() }}>{lang === 'zh' ? '↻ 立即刷新天气与新闻' : 'Refresh now'}</Button>
             </div>
+            {cityCandidates.length > 0 && (
+              <div className="dt-form" data-testid="ambient-city-candidates">
+                <strong>{lang === 'zh' ? '点选你的常驻城市：' : 'Pick your home city:'}</strong>
+                <div className="dt-row-buttons">
+                  {cityCandidates.map((c, idx) => (
+                    <Button key={`${c.name}-${c.latitude}-${c.longitude}`} size="sm" variant={selectedCity === c ? 'primary' : 'outline'} onClick={() => pickCity(c)} data-testid={`ambient-city-candidate-${idx}`}>
+                      📍 {c.name}{c.admin1 && c.admin1 !== c.name ? ` · ${c.admin1}` : ''}{c.country ? ` · ${c.country}` : ''}
+                    </Button>
+                  ))}
+                </div>
+                {selectedCity && <span className="dt-hint">{lang === 'zh' ? `已选：${selectedCity.name}（${selectedCity.latitude.toFixed(3)}, ${selectedCity.longitude.toFixed(3)}），点「保存为「${selectedCity.name}」」生效。` : `Selected: ${selectedCity.name}`}</span>}
+              </div>
+            )}
             <strong>{lang === 'zh' ? '📰 最近新闻缓存（问助理「最近有什么新闻」也会用这份）' : '📰 Cached headlines'}</strong>
             {state.news.items.length === 0 ? <p className="dt-hint">{lang === 'zh' ? '暂无缓存，点击「立即刷新」拉取。' : 'No cached news yet.'}</p> : (
               <div className="dt-news-list">

@@ -308,6 +308,12 @@ export interface StickerInfo {
   purgeAt?: string
 }
 export interface AmbientHomeCityInfo { name: string; latitude: number; longitude: number; timezone: string }
+export interface CityCandidateInfo extends AmbientHomeCityInfo {
+  admin1?: string
+  country?: string
+  /** Which degraded query variant (full address → district → city) produced this candidate. */
+  matchedQuery?: string
+}
 export interface AssistantAmbientConfigInfo { homeCity: AmbientHomeCityInfo; weatherEnabled: boolean; newsEnabled: boolean }
 export interface AmbientSnapshotInfo {
   at: string

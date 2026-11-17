@@ -673,20 +673,79 @@ export function buildAmbientPromptSection(snapshot: AmbientSnapshot): string {
 
 type FetchFn = typeof fetch
 
-export async function geocodeCity(name: string, fetcher: FetchFn = fetch): Promise<AmbientHomeCity | undefined> {
-  const q = name.trim()
-  if (!q) return undefined
-  const res = await fetcher(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=1&language=zh&format=json`, { signal: AbortSignal.timeout(10_000) })
-  if (!res.ok) return undefined
-  const data = (await res.json()) as { results?: { name?: string; latitude?: number; longitude?: number; timezone?: string; country?: string; admin1?: string }[] }
-  const hit = data.results?.[0]
-  if (!hit || typeof hit.latitude !== 'number' || typeof hit.longitude !== 'number') return undefined
-  return {
-    name: hit.name || q,
-    latitude: hit.latitude,
-    longitude: hit.longitude,
-    timezone: hit.timezone || 'Asia/Shanghai',
+export interface CityCandidate extends AmbientHomeCity {
+  admin1?: string
+  country?: string
+  /** Which (possibly degraded) query variant produced this candidate. */
+  matchedQuery: string
+}
+
+/**
+ * Degrades a free-form place query (often a detailed street address like
+ * "上海市徐汇区梅陇十一村46号401", which geocoders cannot resolve directly) into
+ * progressively coarser variants: full text → text without the trailing
+ * number-led suffix → district → municipality/city → city without the 市 suffix.
+ */
+export function cityQueryVariants(query: string): string[] {
+  const q = query.trim().replace(/\s+/g, ' ')
+  if (!q) return []
+  const variants: string[] = [q]
+  const noNumberTail = q.replace(/\d[\d\s号楼栋单元室层#-]*.*$/, '').trim()
+  if (noNumberTail && noNumberTail !== q) variants.push(noNumberTail)
+  const cityMatch = /([\u4e00-\u9fa5]{2,8}?市)/.exec(q)
+  const city = cityMatch?.[1]
+  if (city) {
+    const afterCity = q.slice((cityMatch?.index ?? 0) + city.length)
+    const district = /([\u4e00-\u9fa5]{2,6}?(?:区|县))/.exec(afterCity)?.[1]
+    if (district) variants.push(district)
+    variants.push(city)
+    variants.push(city.replace(/市$/, ''))
   }
+  const countyLevel = /([\u4e00-\u9fa5]{2,8}?(?:县|区))/.exec(q)?.[1]
+  if (countyLevel) variants.push(countyLevel)
+  return [...new Set(variants.map(v => v.trim()).filter(v => v.length >= 2))]
+}
+
+/**
+ * Searches Open-Meteo geocoding with progressively degraded query variants and merges
+ * the hits into a de-duplicated candidate list, so users pick their city from a list
+ * instead of hitting a bare "City not found" for detailed addresses.
+ */
+export async function searchCityCandidates(query: string, fetcher: FetchFn = fetch): Promise<CityCandidate[]> {
+  const variants = cityQueryVariants(query)
+  const merged: CityCandidate[] = []
+  const seen = new Set<string>()
+  for (const variant of variants) {
+    try {
+      const res = await fetcher(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variant)}&count=6&language=zh&format=json`, { signal: AbortSignal.timeout(10_000) })
+      if (!res.ok) continue
+      const data = (await res.json()) as { results?: { name?: string; latitude?: number; longitude?: number; timezone?: string; country?: string; admin1?: string }[] }
+      for (const hit of data.results ?? []) {
+        if (typeof hit.latitude !== 'number' || typeof hit.longitude !== 'number' || !hit.name) continue
+        const key = `${hit.name}|${hit.latitude.toFixed(2)}|${hit.longitude.toFixed(2)}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        merged.push({
+          name: hit.name,
+          latitude: hit.latitude,
+          longitude: hit.longitude,
+          timezone: hit.timezone || 'Asia/Shanghai',
+          ...(hit.admin1 ? { admin1: hit.admin1 } : {}),
+          ...(hit.country ? { country: hit.country } : {}),
+          matchedQuery: variant,
+        })
+      }
+    } catch { /* try the next, coarser variant */ }
+    if (merged.length >= 10) break
+  }
+  return merged.slice(0, 10)
+}
+
+export async function geocodeCity(name: string, fetcher: FetchFn = fetch): Promise<AmbientHomeCity | undefined> {
+  const candidates = await searchCityCandidates(name, fetcher)
+  const hit = candidates[0]
+  if (!hit) return undefined
+  return { name: hit.name, latitude: hit.latitude, longitude: hit.longitude, timezone: hit.timezone }
 }
 
 export async function fetchWeatherForCity(city: AmbientHomeCity, fetcher: FetchFn = fetch, now = new Date()): Promise<WeatherCache> {
@@ -1004,7 +1063,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         guard()
         const args = ambientSetCitySchema.parse(raw ?? {})
         const city = await geocodeCity(args.city)
-        if (!city) return { ok: false, error: `City not found: ${args.city}` }
+        if (!city) return { ok: false, error: `No city matched "${args.city}" even after degrading the query to district/city level; ask the user for a shorter city or district name.` }
         const next = normalizeAssistantAmbientConfig({ ...deps.getAmbientConfig(), homeCity: city })
         deps.setAmbientConfig(next)
         try {
@@ -1032,7 +1091,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
           return { ok: true, cached: false, weather }
         }
         const city = await geocodeCity(args.city)
-        if (!city) return { ok: false, error: `City not found: ${args.city}` }
+        if (!city) return { ok: false, error: `No city matched "${args.city}" even after degrading the query to district/city level; ask the user for a shorter city or district name.` }
         const weather = await fetchWeatherForCity(city)
         return { ok: true, cached: false, city, weather }
       },

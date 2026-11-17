@@ -135,6 +135,7 @@ import {
   savePersonaLearning,
   purgeExpiredStickerTrash,
   restoreStickerRecord,
+  searchCityCandidates,
   saveStickerFromBase64,
   saveStickerFromBuffer,
   stickerAllowedByPolicy,
@@ -2847,6 +2848,13 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             sendJson(res, 200, { config: getAmbientConfig(), ambient: getAmbientSnapshot(), news: getNewsBriefPayload() })
             return
           }
+          if (req.method === 'GET' && sub === 'assistant/ambient/geocode') {
+            const q = String(url.searchParams.get('q') ?? '').trim()
+            if (!q) { sendJson(res, 400, { error: 'Missing q (city name or detailed address)' }); return }
+            const candidates = await searchCityCandidates(q)
+            sendJson(res, 200, { query: q, candidates })
+            return
+          }
           if (req.method === 'PUT' && sub === 'assistant/ambient/config') {
             const body = await readJsonBody(req, 64 * 1024) as { config?: Record<string, unknown>; city?: unknown; homeCity?: Record<string, unknown> }
             const cfgBody = (body.config ?? body) as Record<string, unknown>
@@ -2855,7 +2863,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             const requestedCity = typeof cfgBody.city === 'string' ? cfgBody.city : typeof body.city === 'string' ? body.city : undefined
             if (requestedCity && requestedCity.trim() && requestedCity.trim() !== next.homeCity.name) {
               const geo = await geocodeCity(requestedCity.trim())
-              if (!geo) { sendJson(res, 404, { error: `City not found: ${requestedCity}` }); return }
+              if (!geo) { sendJson(res, 404, { error: `没有找到与「${requestedCity}」匹配的城市，请换个更短的地名（如只填城市或区县名）再搜索，从候选列表里点选。` }); return }
               next = normalizeAssistantAmbientConfig({ ...next, homeCity: geo })
             }
             setAmbientConfig(next)

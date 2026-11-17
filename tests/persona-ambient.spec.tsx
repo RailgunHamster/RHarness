@@ -17,8 +17,11 @@ import {
   extractPersonaLearningFromUserMessage,
   fetchWeatherForCity,
   findSticker,
+  cityQueryVariants,
   formatLunarDate,
+  geocodeCity,
   getNewsBrief,
+  searchCityCandidates,
   activeStickers,
   purgeExpiredStickerTrash,
   restoreStickerRecord,
@@ -182,6 +185,30 @@ describe('ambient awareness', () => {
     expect(weather.oneLiner).toContain('今晚降雨概率 85%')
   })
 
+  it('degrades detailed addresses into city candidates instead of failing with City not found', async () => {
+    const address = '上海市徐汇区梅陇十一村46号401'
+    const variants = cityQueryVariants(address)
+    expect(variants[0]).toBe(address)
+    expect(variants).toContain('徐汇区')
+    expect(variants).toContain('上海市')
+    expect(variants).toContain('上海')
+    const fetcher = vi.fn(async (url: string) => {
+      const name = new URL(url).searchParams.get('name')
+      const results = name === '徐汇区'
+        ? [{ name: '徐汇区', admin1: '上海市', country: '中国', latitude: 31.19, longitude: 121.42, timezone: 'Asia/Shanghai' }]
+        : name === '上海市' || name === '上海'
+          ? [{ name: '上海市', country: '中国', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }]
+          : []
+      return new Response(JSON.stringify({ results }), { status: 200 })
+    }) as unknown as typeof fetch
+    const candidates = await searchCityCandidates(address, fetcher)
+    expect(candidates.map(c => c.name)).toEqual(['徐汇区', '上海市'])
+    expect(candidates[0]!.matchedQuery).toBe('徐汇区')
+    // geocodeCity now resolves the same detailed address to its district instead of "not found".
+    expect(await geocodeCity(address, fetcher)).toMatchObject({ name: '徐汇区', latitude: 31.19 })
+    expect(await geocodeCity('不存在的火星地名', fetcher)).toBeUndefined()
+  })
+
   it('parses RSS and builds a topic brief', () => {
     const xml = '<rss><channel><item><title><![CDATA[AI 新进展]]></title><link>https://example.com/a</link><pubDate>Mon, 17 Nov 2026 08:00:00 GMT</pubDate></item><item><title>芯片发布</title><link>https://example.com/b</link></item></channel></rss>'
     const items = parseRssItems(xml, 'AI', 'TestSource')
@@ -271,6 +298,20 @@ describe('persona workbench UI', () => {
           ambient: buildAmbientSnapshot(defaultAssistantAmbientConfig(), undefined, new Date('2026-11-17T10:00:00+08:00')),
           news: { items: [{ title: '测试新闻头条', url: 'https://example.com/news', source: 'Test', topic: '科技' }] },
         }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.includes('ambient/geocode')) {
+        return new Response(JSON.stringify({
+          candidates: [
+            { name: '徐汇区', admin1: '上海市', country: '中国', latitude: 31.19, longitude: 121.42, timezone: 'Asia/Shanghai', matchedQuery: '徐汇区' },
+            { name: '上海市', country: '中国', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai', matchedQuery: '上海市' },
+          ],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.includes('ambient/config') && init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body ?? '{}')) as { homeCity?: { name: string; latitude: number; longitude: number; timezone: string }; city?: string }
+        const homeCity = body.homeCity ?? { name: body.city ?? '北京', latitude: 39.9, longitude: 116.4, timezone: 'Asia/Shanghai' }
+        const cfg = { ...defaultAssistantAmbientConfig(), homeCity }
+        return new Response(JSON.stringify({ config: cfg, ambient: buildAmbientSnapshot(cfg, undefined, new Date('2026-11-17T10:00:00+08:00')) }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
       if (url.includes('/restore')) {
         return new Response(JSON.stringify({
@@ -393,5 +434,35 @@ describe('persona workbench UI', () => {
     expect(container.textContent).toContain('成功加入 1 张')
     expect(container.textContent).toContain('非图片跳过 1 个')
     expect(container.querySelector('[data-testid="sticker-card-stk-new"]')).not.toBeNull()
+  })
+
+  it('resolves a detailed street address through the candidate picker instead of erroring City not found', async () => {
+    await act(async () => root.render(
+      <PersonaAmbientWorkbench lang="zh" open embedded onClose={() => {}} />,
+    ))
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    const page = container.querySelector('#persona-ambient-page')!
+    const ambientTab = page.querySelector<HTMLButtonElement>('[data-testid="persona-tab-ambient"]')!
+    await act(async () => { ambientTab.click() })
+    const cityInput = page.querySelector<HTMLInputElement>('[data-testid="ambient-city-input"]')!
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(cityInput, '上海市徐汇区梅陇十一村46号401')
+      cityInput.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    // Saving unpicked free text now searches candidates instead of throwing "City not found".
+    const saveBtn = page.querySelector<HTMLButtonElement>('[data-testid="ambient-save-city-btn"]')!
+    await act(async () => { saveBtn.click(); await new Promise(r => setTimeout(r, 30)) })
+    const candidates = container.querySelector('[data-testid="ambient-city-candidates"]')!
+    expect(candidates).not.toBeNull()
+    expect(candidates.textContent).toContain('徐汇区')
+    expect(container.textContent).toContain('候选城市')
+    expect(container.textContent).not.toContain('City not found')
+    // Pick the district, then save persists it and reports the resolved city name.
+    const pick = candidates.querySelector<HTMLButtonElement>('[data-testid="ambient-city-candidate-0"]')!
+    await act(async () => { pick.click() })
+    expect(container.querySelector<HTMLButtonElement>('[data-testid="ambient-save-city-btn"]')!.textContent).toContain('徐汇区')
+    await act(async () => { saveBtn.click(); await new Promise(r => setTimeout(r, 30)) })
+    expect(container.textContent).toContain('常驻城市已改为 徐汇区')
+    expect(container.querySelector('[data-testid="ambient-city-candidates"]')).toBeNull()
   })
 })
