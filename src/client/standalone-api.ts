@@ -315,7 +315,22 @@ export interface CityCandidateInfo extends AmbientHomeCityInfo {
   /** Which degraded query variant (full address → district → city) produced this candidate. */
   matchedQuery?: string
 }
-export interface AssistantAmbientConfigInfo { homeCity: AmbientHomeCityInfo; weatherEnabled: boolean; newsEnabled: boolean }
+export interface ResidentAddressInfo {
+  id: string
+  label: string
+  address: string
+  city: AmbientHomeCityInfo
+  isPrimary: boolean
+  createdAt: string
+  updatedAt: string
+}
+export interface AssistantAmbientConfigInfo {
+  homeCity: AmbientHomeCityInfo
+  /** Multiple resident addresses; homeCity mirrors the primary address's city. */
+  residentAddresses: ResidentAddressInfo[]
+  weatherEnabled: boolean
+  newsEnabled: boolean
+}
 export interface AmbientSnapshotInfo {
   at: string
   beijingTime: string
@@ -326,6 +341,7 @@ export interface AmbientSnapshotInfo {
   dayReason: string
   weekdayLabel: string
   homeCity: AmbientHomeCityInfo
+  residentAddresses?: ResidentAddressInfo[]
   weather?: { cityName: string; fetchedAt: string; current: { temperatureC: number; label: string }; oneLiner: string }
   weatherStale?: boolean
   oneLiner: string

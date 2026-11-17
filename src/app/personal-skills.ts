@@ -741,6 +741,8 @@ export function formatAgentToolStatusLabel(
     persona_learning_delete: { zh: '🧠 正在忘掉一条默契', en: '🧠 Forgetting learning' },
     ambient_get: { zh: '🌦 正在感知时间与常驻城市天气', en: '🌦 Sensing time & home weather' },
     ambient_set_home_city: { zh: `📍 正在切换常驻城市${suffix}`, en: `📍 Changing home city${suffix}` },
+    ambient_save_address: { zh: '📍 正在保存常驻地址', en: '📍 Saving resident address' },
+    ambient_delete_address: { zh: '📍 正在删除常驻地址', en: '📍 Deleting resident address' },
     weather_query: { zh: `🌦 正在查询天气${suffix}`, en: `🌦 Querying weather${suffix}` },
     news_brief: { zh: `📰 正在汇总最近新闻${suffix}`, en: `📰 Summarizing recent news${suffix}` },
     assistant_forward_to_engineering: { zh: `🚀 正在打包原话递交工程引擎${suffix}`, en: `🚀 Forwarding verbatim request to Engineering${suffix}` },

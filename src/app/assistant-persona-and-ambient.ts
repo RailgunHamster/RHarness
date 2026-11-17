@@ -483,8 +483,25 @@ export interface AmbientHomeCity {
   timezone: string
 }
 
+/** One resident address: free-form detailed address plus its geocoded city (weather granularity). */
+export interface ResidentAddress {
+  id: string
+  /** Short human label, e.g. 家 / 公司 / 老家. */
+  label: string
+  /** Detailed address exactly as the user wrote it (district/street/building/room). */
+  address: string
+  /** Resolved city used for weather & coarse location context. */
+  city: AmbientHomeCity
+  /** Exactly one primary address when the list is non-empty; its city drives the weather baseline. */
+  isPrimary: boolean
+  createdAt: string
+  updatedAt: string
+}
+
 export interface AssistantAmbientConfig {
   homeCity: AmbientHomeCity
+  /** Multiple resident addresses; `homeCity` always mirrors the primary address's city when present. */
+  residentAddresses: ResidentAddress[]
   weatherEnabled: boolean
   newsEnabled: boolean
 }
@@ -492,28 +509,116 @@ export interface AssistantAmbientConfig {
 export function defaultAssistantAmbientConfig(): AssistantAmbientConfig {
   return {
     homeCity: { name: '北京', latitude: 39.9042, longitude: 116.4074, timezone: 'Asia/Shanghai' },
+    residentAddresses: [],
     weatherEnabled: true,
     newsEnabled: true,
   }
+}
+
+function normalizeHomeCity(raw: unknown, fallback: AmbientHomeCity): AmbientHomeCity {
+  const city = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const lat = Number(city.latitude)
+  const lon = Number(city.longitude)
+  return {
+    name: typeof city.name === 'string' && city.name.trim() ? city.name.trim().slice(0, 40) : fallback.name,
+    latitude: Number.isFinite(lat) && lat >= -90 && lat <= 90 ? lat : fallback.latitude,
+    longitude: Number.isFinite(lon) && lon >= -180 && lon <= 180 ? lon : fallback.longitude,
+    timezone: typeof city.timezone === 'string' && city.timezone.trim() ? city.timezone.trim().slice(0, 60) : fallback.timezone,
+  }
+}
+
+export const MAX_RESIDENT_ADDRESSES = 10
+
+function normalizeResidentAddresses(raw: unknown): ResidentAddress[] {
+  if (!Array.isArray(raw)) return []
+  const out: ResidentAddress[] = []
+  for (const item of raw.slice(0, MAX_RESIDENT_ADDRESSES)) {
+    if (!item || typeof item !== 'object') continue
+    const r = item as Record<string, unknown>
+    const address = typeof r.address === 'string' ? r.address.trim().slice(0, 160) : ''
+    if (!address) continue
+    const cityRaw = (r.city ?? {}) as Record<string, unknown>
+    const lat = Number(cityRaw.latitude)
+    const lon = Number(cityRaw.longitude)
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180) continue
+    const city = normalizeHomeCity(cityRaw, { name: '北京', latitude: lat, longitude: lon, timezone: 'Asia/Shanghai' })
+    const id = typeof r.id === 'string' && r.id.trim()
+      ? r.id.trim().slice(0, 60)
+      : `addr-${createHash('sha256').update(`${address}|${city.name}`).digest('hex').slice(0, 10)}`
+    out.push({
+      id,
+      label: typeof r.label === 'string' && r.label.trim() ? r.label.trim().slice(0, 20) : '常驻地址',
+      address,
+      city,
+      isPrimary: r.isPrimary === true,
+      createdAt: typeof r.createdAt === 'string' ? r.createdAt : new Date(0).toISOString(),
+      updatedAt: typeof r.updatedAt === 'string' ? r.updatedAt : new Date(0).toISOString(),
+    })
+  }
+  if (out.length > 0) {
+    const primaryIdx = out.findIndex(a => a.isPrimary)
+    const keep = primaryIdx >= 0 ? primaryIdx : 0
+    out.forEach((a, i) => { a.isPrimary = i === keep })
+  }
+  return out
 }
 
 export function normalizeAssistantAmbientConfig(raw: unknown): AssistantAmbientConfig {
   const base = defaultAssistantAmbientConfig()
   if (!raw || typeof raw !== 'object') return base
   const r = raw as Record<string, unknown>
-  const city = (r.homeCity ?? {}) as Record<string, unknown>
-  const lat = Number(city.latitude)
-  const lon = Number(city.longitude)
+  const residentAddresses = normalizeResidentAddresses(r.residentAddresses)
+  const primary = residentAddresses.find(a => a.isPrimary)
   return {
-    homeCity: {
-      name: typeof city.name === 'string' && city.name.trim() ? city.name.trim().slice(0, 40) : base.homeCity.name,
-      latitude: Number.isFinite(lat) && lat >= -90 && lat <= 90 ? lat : base.homeCity.latitude,
-      longitude: Number.isFinite(lon) && lon >= -180 && lon <= 180 ? lon : base.homeCity.longitude,
-      timezone: typeof city.timezone === 'string' && city.timezone.trim() ? city.timezone.trim().slice(0, 60) : base.homeCity.timezone,
-    },
+    // With resident addresses present, the weather baseline city always mirrors the primary address.
+    homeCity: primary ? primary.city : normalizeHomeCity(r.homeCity, base.homeCity),
+    residentAddresses,
     weatherEnabled: r.weatherEnabled !== false,
     newsEnabled: r.newsEnabled !== false,
   }
+}
+
+/** Adds or updates (same detailed address text) a resident address, returns the normalized config. */
+export function upsertResidentAddress(
+  config: AssistantAmbientConfig,
+  input: { label?: string; address: string; city: AmbientHomeCity; makePrimary?: boolean },
+  now = new Date(),
+): { config: AssistantAmbientConfig; entry: ResidentAddress } {
+  const address = input.address.trim().slice(0, 160)
+  const existing = config.residentAddresses.find(a => a.address === address)
+  const entry: ResidentAddress = existing
+    ? {
+        ...existing,
+        ...(input.label?.trim() ? { label: input.label.trim().slice(0, 20) } : {}),
+        city: input.city,
+        isPrimary: input.makePrimary ? true : existing.isPrimary,
+        updatedAt: now.toISOString(),
+      }
+    : {
+        id: `addr-${now.getTime()}-${randomUUID().slice(0, 6)}`,
+        label: input.label?.trim().slice(0, 20) || '常驻地址',
+        address,
+        city: input.city,
+        isPrimary: input.makePrimary === true || config.residentAddresses.length === 0,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      }
+  const list = existing
+    ? config.residentAddresses.map(a => (a.id === existing.id ? entry : entry.isPrimary ? { ...a, isPrimary: false } : a))
+    : [...config.residentAddresses, ...(entry.isPrimary ? config.residentAddresses.map(a => ({ ...a, isPrimary: false })) : []), entry].slice(-MAX_RESIDENT_ADDRESSES)
+  const normalized = normalizeAssistantAmbientConfig({ ...config, residentAddresses: list })
+  return { config: normalized, entry: normalized.residentAddresses.find(a => a.address === address) ?? entry }
+}
+
+export function removeResidentAddress(config: AssistantAmbientConfig, id: string): AssistantAmbientConfig {
+  return normalizeAssistantAmbientConfig({ ...config, residentAddresses: config.residentAddresses.filter(a => a.id !== id) })
+}
+
+export function setPrimaryResidentAddress(config: AssistantAmbientConfig, id: string): AssistantAmbientConfig {
+  return normalizeAssistantAmbientConfig({
+    ...config,
+    residentAddresses: config.residentAddresses.map(a => ({ ...a, isPrimary: a.id === id })),
+  })
 }
 
 export interface WeatherCache {
@@ -614,6 +719,7 @@ export interface AmbientSnapshot {
   dayReason: string
   weekdayLabel: string
   homeCity: AmbientHomeCity
+  residentAddresses: ResidentAddress[]
   weather?: WeatherCache
   weatherStale?: boolean
   oneLiner: string
@@ -653,6 +759,7 @@ export function buildAmbientSnapshot(
     dayReason: day.reason.zh,
     weekdayLabel: day.weekdayLabel.zh,
     homeCity: config.homeCity,
+    residentAddresses: config.residentAddresses,
     ...(weather ? { weather } : {}),
     ...(weather && !weatherFresh ? { weatherStale: true } : {}),
     oneLiner: parts.join(' · '),
@@ -665,6 +772,9 @@ export function buildAmbientPromptSection(snapshot: AmbientSnapshot): string {
     `- Now: ${snapshot.beijingTime}（${snapshot.period}），农历${snapshot.lunarDate || '—'}，${snapshot.solarTerm.current}（距${snapshot.solarTerm.next}还有 ${snapshot.solarTerm.daysToNext} 天），${snapshot.weekdayLabel} · ${snapshot.dayType === 'workday' ? '工作日' : '休息日'}（${snapshot.dayReason}）。`,
   ]
   if (snapshot.weather) lines.push(`- 常驻城市 ${snapshot.homeCity.name} 天气：${snapshot.weather.oneLiner}${snapshot.weatherStale ? '（缓存稍旧）' : ''}。用户问天气/出行/穿衣时优先用这里的数据，需要其他城市或逐日详情再调用 \`weather_query\`。`)
+  for (const addr of snapshot.residentAddresses) {
+    lines.push(`- 常驻地址${addr.isPrimary ? '（主要，天气基准）' : ''}「${addr.label}」：${addr.address}（所在城市：${addr.city.name}）。用户聊通勤、外卖、快递、附近生活或出行时按这个地址理解，不要主动复述完整门牌号，除非用户问起。`)
+  }
   lines.push('- 用户问「最近有什么新闻/热点」时调用 `news_brief`（可带 topic：科技/AI/财经/综合），不要凭训练记忆编造新闻。')
   return lines.join('\n')
 }
@@ -925,6 +1035,13 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
   const learningDeleteSchema = z.object({ id_or_text: z.string().min(1) })
   const ambientGetSchema = z.object({})
   const ambientSetCitySchema = z.object({ city: z.string().min(1).describe('New home/resident city name, e.g. "上海"') })
+  const ambientSaveAddressSchema = z.object({
+    label: z.string().optional().describe('Short label, e.g. 家 / 公司 / 老家'),
+    address: z.string().min(1).describe('Detailed address exactly as the user states it'),
+    city: z.string().optional().describe('City the address belongs to; geocoded from the address when omitted'),
+    make_primary: z.boolean().optional().describe('Make this the primary address (weather baseline city)'),
+  })
+  const ambientDeleteAddressSchema = z.object({ id_or_label: z.string().min(1) })
   const weatherQuerySchema = z.object({ city: z.string().optional().describe('City name. Defaults to the configured home city.') })
   const newsBriefSchema = z.object({ topic: z.string().optional().describe('综合 / 科技 / AI / 财经. Defaults to 综合.') })
 
@@ -1081,14 +1198,19 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'ambient_set_home_city',
-      description: 'Change the resident/home city used for weather and ambient context (geocoded via Open-Meteo, weather refreshed immediately). Use when the user says "把常驻城市改成上海". Mirrors in Web UI.',
+      description: 'Change the resident/home city used for weather and ambient context (geocoded via Open-Meteo, detailed addresses degrade to their city automatically, weather refreshed immediately). If resident addresses exist, this updates the primary address\'s city. Use when the user says "把常驻城市改成上海". Mirrors in Web UI.',
       parameters: z.toJSONSchema(ambientSetCitySchema),
       execute: async (raw: unknown) => {
         guard()
         const args = ambientSetCitySchema.parse(raw ?? {})
         const city = await geocodeCity(args.city)
         if (!city) return { ok: false, error: `No city matched "${args.city}" even after degrading the query to district/city level; ask the user for a shorter city or district name.` }
-        const next = normalizeAssistantAmbientConfig({ ...deps.getAmbientConfig(), homeCity: city })
+        const current = deps.getAmbientConfig()
+        const next = normalizeAssistantAmbientConfig({
+          ...current,
+          homeCity: city,
+          residentAddresses: current.residentAddresses.map(a => (a.isPrimary ? { ...a, city } : a)),
+        })
         deps.setAmbientConfig(next)
         try {
           const weather = await fetchWeatherForCity(city)
@@ -1097,6 +1219,45 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         } catch (err) {
           return { ok: true, config: next, weatherError: err instanceof Error ? err.message : String(err) }
         }
+      },
+    },
+    {
+      name: 'ambient_save_address',
+      description: 'Save one of the user\'s resident addresses (multiple allowed: 家/公司/老家…). `address` is the detailed free-form address; `city` is optional — when omitted it is geocoded from the address itself (degraded to district/city level). The first address (or make_primary=true) becomes the primary whose city drives weather. Use when the user says "记住我家地址是…/我公司在…".',
+      parameters: z.toJSONSchema(ambientSaveAddressSchema),
+      execute: async (raw: unknown) => {
+        guard()
+        const args = ambientSaveAddressSchema.parse(raw ?? {})
+        const city = await geocodeCity(args.city?.trim() || args.address)
+        if (!city) return { ok: false, error: `No city matched for address "${args.address}"; ask the user which city it is in.` }
+        const saved = upsertResidentAddress(deps.getAmbientConfig(), {
+          address: args.address,
+          ...(args.label ? { label: args.label } : {}),
+          city,
+          ...(args.make_primary ? { makePrimary: true } : {}),
+        })
+        deps.setAmbientConfig(saved.config)
+        if (saved.entry.isPrimary) {
+          try { deps.setWeatherCache(await fetchWeatherForCity(saved.entry.city)) } catch { /* weather refresh is best-effort */ }
+        }
+        return { ok: true, address: saved.entry, addresses: saved.config.residentAddresses, homeCity: saved.config.homeCity }
+      },
+    },
+    {
+      name: 'ambient_delete_address',
+      description: 'Delete a saved resident address by ID or unambiguous label/address fragment (see ambient_get). Deleting the primary promotes the next address and re-bases the weather city.',
+      parameters: z.toJSONSchema(ambientDeleteAddressSchema),
+      execute: async (raw: unknown) => {
+        guard()
+        const args = ambientDeleteAddressSchema.parse(raw ?? {})
+        const cfg = deps.getAmbientConfig()
+        const q = args.id_or_label.trim().toLowerCase()
+        const matches = cfg.residentAddresses.filter(a => a.id === q || a.label.toLowerCase() === q || a.address.toLowerCase().includes(q))
+        if (matches.length === 0) return { ok: false, error: `No resident address matches: ${args.id_or_label}` }
+        if (matches.length > 1) return { ok: false, error: 'Multiple addresses match; ask the user to pick one', candidates: matches.map(a => ({ id: a.id, label: a.label, address: a.address })) }
+        const next = removeResidentAddress(cfg, matches[0]!.id)
+        deps.setAmbientConfig(next)
+        return { ok: true, deleted: { id: matches[0]!.id, label: matches[0]!.label }, addresses: next.residentAddresses, homeCity: next.homeCity }
       },
     },
     {

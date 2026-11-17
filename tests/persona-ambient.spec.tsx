@@ -7,7 +7,12 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  buildAmbientPromptSection,
   buildAmbientSnapshot,
+  normalizeAssistantAmbientConfig,
+  removeResidentAddress,
+  setPrimaryResidentAddress,
+  upsertResidentAddress,
   buildAssistantPersonaAmbientTools,
   buildPersonaLearningPromptSummary,
   buildPersonaPromptSection,
@@ -219,6 +224,45 @@ describe('ambient awareness', () => {
     expect(shCandidates[0]).toMatchObject({ country: '中国', latitude: 31.23 })
   })
 
+  it('supports multiple resident addresses: primary drives the weather city, detailed text is kept verbatim', () => {
+    const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
+    const beijing = { name: '北京', latitude: 39.9, longitude: 116.4, timezone: 'Asia/Shanghai' }
+    let cfg = defaultAssistantAmbientConfig()
+    expect(cfg.residentAddresses).toEqual([])
+    const home = upsertResidentAddress(cfg, { label: '家', address: '上海市徐汇区梅陇十一村46号401', city: shanghai })
+    cfg = home.config
+    expect(cfg.residentAddresses).toHaveLength(1)
+    expect(cfg.residentAddresses[0]).toMatchObject({ label: '家', address: '上海市徐汇区梅陇十一村46号401', isPrimary: true })
+    // Weather baseline follows the primary address's city, not the legacy default.
+    expect(cfg.homeCity.name).toBe('上海')
+    const office = upsertResidentAddress(cfg, { label: '公司', address: '北京市海淀区中关村大街1号', city: beijing })
+    cfg = office.config
+    expect(cfg.residentAddresses).toHaveLength(2)
+    expect(cfg.homeCity.name).toBe('上海')
+    cfg = setPrimaryResidentAddress(cfg, office.entry.id)
+    expect(cfg.homeCity.name).toBe('北京')
+    expect(cfg.residentAddresses.filter(a => a.isPrimary)).toHaveLength(1)
+    // Same detailed address upserts instead of duplicating.
+    cfg = upsertResidentAddress(cfg, { label: '家', address: '上海市徐汇区梅陇十一村46号401', city: shanghai }).config
+    expect(cfg.residentAddresses).toHaveLength(2)
+    // Removing the primary promotes the remaining address and re-bases the weather city.
+    const primaryId = cfg.residentAddresses.find(a => a.isPrimary)!.id
+    cfg = removeResidentAddress(cfg, primaryId)
+    expect(cfg.residentAddresses).toHaveLength(1)
+    expect(cfg.homeCity.name).toBe('上海')
+    // Garbage entries are dropped by normalization; legacy configs without addresses still work.
+    const messy = normalizeAssistantAmbientConfig({ homeCity: beijing, residentAddresses: [{ address: '' }, { address: '无坐标地址' }, null] })
+    expect(messy.residentAddresses).toEqual([])
+    expect(messy.homeCity.name).toBe('北京')
+    // The prompt section carries the detailed addresses (primary marked), snapshot carries them too.
+    const withHome = upsertResidentAddress(defaultAssistantAmbientConfig(), { label: '家', address: '上海市徐汇区梅陇十一村46号401', city: shanghai }).config
+    const snapshot = buildAmbientSnapshot(withHome, undefined, new Date('2026-11-17T10:00:00+08:00'))
+    expect(snapshot.residentAddresses).toHaveLength(1)
+    const section = buildAmbientPromptSection(snapshot)
+    expect(section).toContain('上海市徐汇区梅陇十一村46号401')
+    expect(section).toContain('主要')
+  })
+
   it('parses RSS and builds a topic brief', () => {
     const xml = '<rss><channel><item><title><![CDATA[AI 新进展]]></title><link>https://example.com/a</link><pubDate>Mon, 17 Nov 2026 08:00:00 GMT</pubDate></item><item><title>芯片发布</title><link>https://example.com/b</link></item></channel></rss>'
     const items = parseRssItems(xml, 'AI', 'TestSource')
@@ -318,7 +362,12 @@ describe('persona workbench UI', () => {
         }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
       if (url.includes('ambient/config') && init?.method === 'PUT') {
-        const body = JSON.parse(String(init.body ?? '{}')) as { homeCity?: { name: string; latitude: number; longitude: number; timezone: string }; city?: string }
+        const body = JSON.parse(String(init.body ?? '{}')) as { homeCity?: { name: string; latitude: number; longitude: number; timezone: string }; city?: string; residentAddresses?: { id: string; label: string; address: string; city: { name: string; latitude: number; longitude: number; timezone: string }; isPrimary: boolean; createdAt: string; updatedAt: string }[] }
+        if (Array.isArray(body.residentAddresses)) {
+          const primary = body.residentAddresses.find(a => a.isPrimary) ?? body.residentAddresses[0]
+          const cfg = { ...defaultAssistantAmbientConfig(), residentAddresses: body.residentAddresses, ...(primary ? { homeCity: primary.city } : {}) }
+          return new Response(JSON.stringify({ config: cfg, ambient: buildAmbientSnapshot(cfg, undefined, new Date('2026-11-17T10:00:00+08:00')) }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
         const homeCity = body.homeCity ?? { name: body.city ?? '北京', latitude: 39.9, longitude: 116.4, timezone: 'Asia/Shanghai' }
         const cfg = { ...defaultAssistantAmbientConfig(), homeCity }
         return new Response(JSON.stringify({ config: cfg, ambient: buildAmbientSnapshot(cfg, undefined, new Date('2026-11-17T10:00:00+08:00')) }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -388,8 +437,8 @@ describe('persona workbench UI', () => {
 
     const ambientTab = dialog.querySelector<HTMLButtonElement>('[data-testid="persona-tab-ambient"]')!
     await act(async () => { ambientTab.click() })
-    const cityInput = dialog.querySelector<HTMLInputElement>('[data-testid="ambient-city-input"]')!
-    expect(cityInput.value).toBe('北京')
+    expect(dialog.querySelector('[data-testid="ambient-address-input"]')).not.toBeNull()
+    expect(dialog.textContent).toContain('常驻地址')
     expect(dialog.textContent).toContain('测试新闻头条')
   })
 
@@ -401,13 +450,13 @@ describe('persona workbench UI', () => {
     const page = container.querySelector('#persona-ambient-page')!
     expect(page).not.toBeNull()
     expect(document.querySelector('[role="dialog"]')).toBeNull()
-    expect(page.textContent).toContain('常驻城市')
+    expect(page.textContent).toContain('人设风格')
     const stickerTab = page.querySelector<HTMLButtonElement>('[data-testid="persona-tab-stickers"]')!
     await act(async () => { stickerTab.click() })
     expect(page.querySelector('[data-testid="sticker-card-stk-1"]')).not.toBeNull()
     const ambientTab = page.querySelector<HTMLButtonElement>('[data-testid="persona-tab-ambient"]')!
     await act(async () => { ambientTab.click() })
-    expect(page.querySelector<HTMLInputElement>('[data-testid="ambient-city-input"]')!.value).toBe('北京')
+    expect(page.querySelector<HTMLInputElement>('[data-testid="ambient-address-input"]')).not.toBeNull()
   })
 
   it('restores stickers from the 1-day trash and uploads a whole folder (recursive scan, GIF kept, non-images skipped)', async () => {
@@ -454,25 +503,31 @@ describe('persona workbench UI', () => {
     const page = container.querySelector('#persona-ambient-page')!
     const ambientTab = page.querySelector<HTMLButtonElement>('[data-testid="persona-tab-ambient"]')!
     await act(async () => { ambientTab.click() })
-    const cityInput = page.querySelector<HTMLInputElement>('[data-testid="ambient-city-input"]')!
-    await act(async () => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(cityInput, '上海市徐汇区梅陇十一村46号401')
-      cityInput.dispatchEvent(new Event('input', { bubbles: true }))
-    })
-    // Saving unpicked free text now searches candidates instead of throwing "City not found".
-    const saveBtn = page.querySelector<HTMLButtonElement>('[data-testid="ambient-save-city-btn"]')!
-    await act(async () => { saveBtn.click(); await new Promise(r => setTimeout(r, 30)) })
+    const setInput = async (input: HTMLInputElement, value: string) => {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value)
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+    }
+    await setInput(page.querySelector<HTMLInputElement>('[data-testid="ambient-address-label-input"]')!, '家')
+    await setInput(page.querySelector<HTMLInputElement>('[data-testid="ambient-address-input"]')!, '上海市徐汇区梅陇十一村46号401')
+    // Resolve the city from the detailed address via the candidate picker (no "City not found").
+    const resolveBtn = page.querySelector<HTMLButtonElement>('[data-testid="ambient-search-city-btn"]')!
+    await act(async () => { resolveBtn.click(); await new Promise(r => setTimeout(r, 30)) })
     const candidates = container.querySelector('[data-testid="ambient-city-candidates"]')!
     expect(candidates).not.toBeNull()
     expect(candidates.textContent).toContain('徐汇区')
-    expect(container.textContent).toContain('候选城市')
-    expect(container.textContent).not.toContain('City not found')
-    // Pick the district, then save persists it and reports the resolved city name.
     const pick = candidates.querySelector<HTMLButtonElement>('[data-testid="ambient-city-candidate-0"]')!
     await act(async () => { pick.click() })
-    expect(container.querySelector<HTMLButtonElement>('[data-testid="ambient-save-city-btn"]')!.textContent).toContain('徐汇区')
-    await act(async () => { saveBtn.click(); await new Promise(r => setTimeout(r, 30)) })
-    expect(container.textContent).toContain('常驻城市已改为 徐汇区')
+    // Save the address: it appears as a primary resident-address row with its detailed text + city.
+    const addBtn = page.querySelector<HTMLButtonElement>('[data-testid="ambient-add-address-btn"]')!
+    await act(async () => { addBtn.click(); await new Promise(r => setTimeout(r, 30)) })
+    expect(container.textContent).toContain('已保存常驻地址「家」')
+    const rows = [...container.querySelectorAll('[data-testid^="ambient-address-row-"]')]
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.textContent).toContain('上海市徐汇区梅陇十一村46号401')
+    expect(rows[0]!.textContent).toContain('徐汇区')
+    expect(rows[0]!.textContent).toContain('主要')
     expect(container.querySelector('[data-testid="ambient-city-candidates"]')).toBeNull()
   })
 })
