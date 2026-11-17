@@ -29,7 +29,7 @@ import {
   type StickerInfo,
 } from './standalone-api.ts'
 
-export type MainViewSlotId = 'workbench' | 'assistant' | 'clawfeed' | 'rhtoolkit' | 'memory-library' | 'siyuan-kb' | 'plugin-center' | 'live-inspector' | 'pipeline' | 'management'
+export type MainViewSlotId = 'workbench' | 'assistant' | 'clawfeed' | 'rhtoolkit' | 'memory-library' | 'siyuan-kb' | 'persona-ambient' | 'plugin-center' | 'live-inspector' | 'pipeline' | 'management'
 
 export interface UIViewSlotCounts {
   assistantCount: number
@@ -149,6 +149,15 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
         ? `记忆与知识库 (${c.memoryCount})`
         : `Memory & Knowledge (${c.memoryCount})`,
     label: lang => (lang === 'zh' ? '📚 思源知识库' : '📚 SiYuan KB'),
+  },
+  {
+    id: 'persona-ambient',
+    pluginId: 'dsh-assistant-persona',
+    order: 34,
+    tabBarId: 'knowledge',
+    tabBarLabel: lang => (lang === 'zh' ? '🧠 记忆与知识库' : '🧠 Memory & Knowledge'),
+    tabBarOrder: 30,
+    label: lang => (lang === 'zh' ? '🎭 人设·表情·城市' : '🎭 Persona · Stickers · City'),
   },
   {
     id: 'plugin-center',
@@ -487,12 +496,15 @@ export function StickerImage({ sticker, lang }: { sticker: { id: string; name: s
   void lang
 }
 
-/** 🎭 人设·表情·感知 workbench: Persona knobs, Sticker Gallery, Learned Knowledge, Home City / Weather / News. */
-export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged }: {
+/** 🎭 人设·表情·感知 workbench: Persona knobs, Sticker Gallery, Learned Knowledge, Home City / Weather / News.
+ *  Rendered as a modal from the Personal Assistant header, or embedded as a full page under the
+ *  「记忆与知识库」 tab bar's 🎭 人设·表情·城市 sub-tab (`embedded`). */
+export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged, embedded = false }: {
   lang: Lang
   open: boolean
   onClose: () => void
   onAmbientChanged?: ((ambient: AmbientSnapshotInfo) => void) | undefined
+  embedded?: boolean
 }): ReactNode {
   const [tab, setTab] = useState<'persona' | 'stickers' | 'learnings' | 'ambient'>('persona')
   const [state, setState] = useState<PersonaAmbientStateInfo | null>(null)
@@ -605,8 +617,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged 
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
 
-  return (
-    <Modal className="dt-fullscreen-modal" open={open} onClose={onClose} title={lang === 'zh' ? '🎭 人设 · 表情包 · 已学默契 · 环境感知' : '🎭 Persona · Stickers · Learnings · Ambient'} closeLabel={lang === 'zh' ? '关闭 (ESC)' : 'Close (ESC)'} description={lang === 'zh' ? '仅作用于个人助理（不影响工程 Eval / Worker）。这里能改的，助理自己也能通过工具改。' : 'Personal Assistant only. Everything here is also editable by the Assistant via tools.'} footer={<Button size="sm" variant="primary" onClick={onClose}>{lang === 'zh' ? '完成' : 'Done'}</Button>}>
+  const body = (
       <div className="dt-form">
         <div className="dt-persona-tabs" role="tablist">
           {([['persona', '🎭 人设风格'], ['stickers', `😀 表情包图库 (${state?.stickers.length ?? 0})`], ['learnings', `🧠 已学默契 (${state?.learnings.length ?? 0})`], ['ambient', '🌦 感知与城市']] as const).map(([id, label]) => (
@@ -711,6 +722,23 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged 
           </div>
         )}
       </div>
+  )
+  if (embedded) {
+    return (
+      <section id="persona-ambient-page" className="dt-live-workspace" aria-label={lang === 'zh' ? '人设、表情包与常驻城市维护' : 'Persona, stickers and home city maintenance'}>
+        <div className="dt-live-head">
+          <div>
+            <h2>{lang === 'zh' ? '🎭 人设 · 表情包 · 已学默契 · 环境感知' : '🎭 Persona · Stickers · Learnings · Ambient'}</h2>
+            <span className="dt-hint">{lang === 'zh' ? '维护个人助理的人设风格、表情包图库、已学默契与常驻城市（天气感知基准）。与个人助理完全同步，改完即生效；助理自己也能通过工具修改同样的内容。' : 'Maintain the Personal Assistant persona, sticker gallery, learnings and home city. Fully in sync with the Assistant.'}</span>
+          </div>
+        </div>
+        {body}
+      </section>
+    )
+  }
+  return (
+    <Modal className="dt-fullscreen-modal" open={open} onClose={onClose} title={lang === 'zh' ? '🎭 人设 · 表情包 · 已学默契 · 环境感知' : '🎭 Persona · Stickers · Learnings · Ambient'} closeLabel={lang === 'zh' ? '关闭 (ESC)' : 'Close (ESC)'} description={lang === 'zh' ? '仅作用于个人助理（不影响工程 Eval / Worker）。这里能改的，助理自己也能通过工具改。' : 'Personal Assistant only. Everything here is also editable by the Assistant via tools.'} footer={<Button size="sm" variant="primary" onClick={onClose}>{lang === 'zh' ? '完成' : 'Done'}</Button>}>
+      {body}
     </Modal>
   )
 }

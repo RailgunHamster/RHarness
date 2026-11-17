@@ -789,7 +789,6 @@ function MemoryAndPluginsSection({
   }>()
   const [pluginDraftConfig, setPluginDraftConfig] = useState<Record<string, unknown>>({})
   const [pluginPanelFeedback, setPluginPanelFeedback] = useState('')
-  const [personaWorkbenchOpen, setPersonaWorkbenchOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
@@ -1149,17 +1148,6 @@ function MemoryAndPluginsSection({
             </div>}
           </div>
           <div className="dt-row-buttons">
-            {pl.id === 'dsh-assistant-persona' && (
-              <Button
-                size="sm"
-                variant="primary"
-                onClick={() => setPersonaWorkbenchOpen(true)}
-                data-testid="plugin-persona-workbench-btn"
-                title={lang === 'zh' ? '打开人设、表情包图库、已学默契与常驻城市维护工作台（与个人助理标题栏的 🎭 入口相同）' : 'Open Persona / Stickers / Home City workbench'}
-              >
-                {lang === 'zh' ? '🎭 人设·表情·城市维护' : '🎭 Persona & City'}
-              </Button>
-            )}
             <Button
               size="sm"
               variant="outline"
@@ -1328,7 +1316,6 @@ function MemoryAndPluginsSection({
         </div>
       )}
     </Modal>
-    <PersonaAmbientWorkbench lang={lang} open={personaWorkbenchOpen} onClose={() => setPersonaWorkbenchOpen(false)} />
     </>}
 
     {section === 'memory' && <>
@@ -2556,6 +2543,13 @@ export function StandaloneRoot() {
           onMemoryBackupsUpdated={setMemoryBackups}
           onPluginsUpdated={setPlugins}
         />}
+        {viewMode === 'persona-ambient' && <PersonaAmbientWorkbench
+          lang={lang}
+          open
+          embedded
+          onClose={() => setViewMode('memory-library')}
+          onAmbientChanged={setAssistantAmbient}
+        />}
         {viewMode === 'pipeline' && <section className="dt-pipeline-card" aria-label={lang === 'zh' ? '全链路管线与审计' : 'End-to-end pipeline audit'}>
           <div className="dt-live-head">
             <div>
@@ -2565,7 +2559,7 @@ export function StandaloneRoot() {
           </div>
           <PipelineAuditSection rows={pipelineRows} lang={lang} onInspectSession={id => { handleInspectSession(id) }} />
         </section>}
-        <div className="dt-management-suite" hidden={viewMode === 'pipeline' || viewMode === 'memory-library' || viewMode === 'siyuan-kb' || viewMode === 'plugin-center' || viewMode === 'live-inspector' || viewMode === 'assistant' || viewMode === 'clawfeed' || viewMode === 'rhtoolkit'}>
+        <div className="dt-management-suite" hidden={viewMode === 'pipeline' || viewMode === 'memory-library' || viewMode === 'siyuan-kb' || viewMode === 'persona-ambient' || viewMode === 'plugin-center' || viewMode === 'live-inspector' || viewMode === 'assistant' || viewMode === 'clawfeed' || viewMode === 'rhtoolkit'}>
           <App t={t} openSession={async id => setActiveSession(id)} deploymentForm={undefined}
             renderSessionActivity={id => <TicketActivity key={id} sessionId={id} lang={lang} />} />
         </div>

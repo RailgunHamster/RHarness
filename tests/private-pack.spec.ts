@@ -86,19 +86,19 @@ describe('clean-room public deployment & external private pack isolation', () =>
 
     const visibleSlots = getEnabledUIViewSlots(plugins).map(s => s.id)
     expect(visibleSlots).not.toContain('rhtoolkit')
-    expect(visibleSlots).toEqual(['assistant', 'workbench', 'memory-library', 'plugin-center', 'live-inspector', 'pipeline', 'management'])
+    expect(visibleSlots).toEqual(['assistant', 'workbench', 'memory-library', 'persona-ambient', 'plugin-center', 'live-inspector', 'pipeline', 'management'])
 
     // Views registering the same tab-bar name collapse into ONE top-level tab with members ordered inside.
-    // In clean-room mode the SiYuan slot is unregistered, so the knowledge bar degrades to a single member.
+    // In clean-room mode the SiYuan slot is unregistered, so the knowledge bar keeps memory + persona members.
     const cleanBars = groupUIViewSlotsIntoTabBars(getEnabledUIViewSlots(plugins))
     expect(cleanBars.map(b => b.id)).toEqual(['assistant', 'workbench', 'knowledge', 'plugin-center', 'live-inspector', 'pipeline', 'management'])
-    expect(cleanBars.find(b => b.id === 'knowledge')?.members.map(m => m.id)).toEqual(['memory-library'])
+    expect(cleanBars.find(b => b.id === 'knowledge')?.members.map(m => m.id)).toEqual(['memory-library', 'persona-ambient'])
     const fullBars = groupUIViewSlotsIntoTabBars(getEnabledUIViewSlots([
       ...plugins,
       { id: 'dsh-personal-skills', enabled: true },
       { id: 'dsh-memory', enabled: true },
     ] as never))
-    expect(fullBars.find(b => b.id === 'knowledge')?.members.map(m => m.id)).toEqual(['memory-library', 'siyuan-kb'])
+    expect(fullBars.find(b => b.id === 'knowledge')?.members.map(m => m.id)).toEqual(['memory-library', 'siyuan-kb', 'persona-ambient'])
 
     const stateDir = mkdtempSync(join(tmpdir(), 'rharness-clean-room-'))
     const srv = await startStandaloneServer({

@@ -30,7 +30,7 @@ import {
   type PersonaLearningEntry,
   type StickerRecord,
 } from '../src/app/assistant-persona-and-ambient.ts'
-import { PersonalAssistantSlotView } from '../src/client/ui-slots.tsx'
+import { PersonaAmbientWorkbench, PersonalAssistantSlotView } from '../src/client/ui-slots.tsx'
 
 declare global { var IS_REACT_ACT_ENVIRONMENT: boolean }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -272,5 +272,22 @@ describe('persona workbench UI', () => {
     const cityInput = dialog.querySelector<HTMLInputElement>('[data-testid="ambient-city-input"]')!
     expect(cityInput.value).toBe('北京')
     expect(dialog.textContent).toContain('测试新闻头条')
+  })
+
+  it('renders the same workbench embedded as a page (记忆与知识库 sub-tab) without a dialog shell', async () => {
+    await act(async () => root.render(
+      <PersonaAmbientWorkbench lang="zh" open embedded onClose={() => {}} />,
+    ))
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    const page = container.querySelector('#persona-ambient-page')!
+    expect(page).not.toBeNull()
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(page.textContent).toContain('常驻城市')
+    const stickerTab = page.querySelector<HTMLButtonElement>('[data-testid="persona-tab-stickers"]')!
+    await act(async () => { stickerTab.click() })
+    expect(page.querySelector('[data-testid="sticker-card-stk-1"]')).not.toBeNull()
+    const ambientTab = page.querySelector<HTMLButtonElement>('[data-testid="persona-tab-ambient"]')!
+    await act(async () => { ambientTab.click() })
+    expect(page.querySelector<HTMLInputElement>('[data-testid="ambient-city-input"]')!.value).toBe('北京')
   })
 })

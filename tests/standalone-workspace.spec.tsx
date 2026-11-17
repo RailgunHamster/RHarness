@@ -401,6 +401,8 @@ it('edits a long-term memory inline as delete-old + add-new with the old version
   expect(container.querySelector('[data-testid="view-subtabs-knowledge"]')).not.toBeNull()
   expect(container.querySelector('[data-testid="view-subtab-memory-library"]')).not.toBeNull()
   expect(container.querySelector('[data-testid="view-subtab-siyuan-kb"]')).not.toBeNull()
+  // 🎭 人设·表情·城市 maintenance lives as the third sub-tab of the same knowledge tab bar.
+  expect(container.querySelector('[data-testid="view-subtab-persona-ambient"]')).not.toBeNull()
   expect(container.textContent).toContain('旧版内容')
   // Plugin Center is its own separate top-level tab now (no longer mixed into the memory view)
   expect(container.querySelector('[data-testid="view-tab-plugin-center"]')).not.toBeNull()
