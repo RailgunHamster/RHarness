@@ -504,6 +504,32 @@ describe('persona workbench UI', () => {
     expect(dialog.textContent).toContain('测试新闻头条')
   })
 
+  it('keeps the unsent assistant composer text (and restores it after remount, like a refresh)', async () => {
+    const view = (
+      <PersonalAssistantSlotView
+        lang="zh"
+        messages={[]}
+        memories={[]}
+        onRefresh={async () => {}}
+        onJumpToEngineeringTicket={() => {}}
+        onSwitchToMemoryTab={() => {}}
+      />
+    )
+    await act(async () => root.render(view))
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(textarea, '还没发出去的半句话')
+      textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(localStorage.length).toBeGreaterThan(0)
+    await act(async () => root.unmount())
+    const root2 = createRoot(container)
+    await act(async () => root2.render(view))
+    expect(container.querySelector<HTMLTextAreaElement>('textarea')!.value).toBe('还没发出去的半句话')
+    await act(async () => root2.unmount())
+    localStorage.clear()
+  })
+
   it('renders the same workbench embedded as a page (记忆与知识库 sub-tab) without a dialog shell', async () => {
     await act(async () => root.render(
       <PersonaAmbientWorkbench lang="zh" open embedded onClose={() => {}} />,

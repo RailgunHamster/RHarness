@@ -401,7 +401,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/standalone-activity.tsx` | Cursor-based Session polling and public assistant/tool activity in the main workspace and console |
 | `src/client/ticket-activity.tsx` | Embedded live Session activity panel on the Ticket detail page |
 | `src/client/standalone-composer.tsx` | Inline local conversation, per-topic draft restoration, image selection, clipboard/drop input, previews and reply targets |
-| `src/client/panel-draft.ts` | Browser-local conversation drafts and preferences, synchronous text storage and ordered IndexedDB image storage |
+| `src/client/panel-draft.ts` | Browser-local conversation drafts and preferences, synchronous text storage and ordered IndexedDB image storage; generic refresh-safe field drafts (`useTextDraft`) plus the global input-draft safety net (`useGlobalInputDrafts`, testid/name-keyed, empty-fields-only refill, password/file excluded) |
 | `src/client/image-composer.tsx` | Shared image attachment limits, MIME validation and standalone composer controls |
 | `src/client/markdown-view.tsx` | Context-free safe Markdown rendering, shared by the management panel and standalone workspace |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
@@ -476,7 +476,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/standalone-client.spec.tsx` | Durable per-topic drafts, storage failure feedback, send retention/clearing, image input, reply targets and live worker event polling |
 | `tests/standalone-workspace.spec.tsx` | Inline conversation-first workspace order, direct area navigation and language changes without losing the draft |
 | `tests/persona-ambient.spec.tsx` | Persona presets & prompt, sticker gallery file CRUD and marker/cooldown policy, persona learning extraction/dedupe, lunar/solar-term/weather/news ambient helpers, Assistant-only persona tools, and the 🎭 Persona/Sticker/Learning/Home-City workbench UI |
-| `tests/panel-draft.spec.ts` | Text and preference storage recovery, topic/path isolation, corrupt/unavailable storage and ordered image transactions |
+| `tests/panel-draft.spec.ts` | Text and preference storage recovery, topic/path isolation, corrupt/unavailable storage and ordered image transactions; generic field drafts and the global input-draft safety net (save-on-type, refill-after-remount, programmatic-clear sync) |
 | `tests/standalone.spec.ts` | The standalone server, multi-provider catalog (`dsh`, `codex`, `claude`, `cursor` and `human`), Local Panel Source and Session Console |
 | `tests/standalone-events.spec.ts` | Incremental event cursors, live provider text/tool collectors, full-body trace snapshots, privacy, deduplication and session-isolated DSH log fallback |
 | `tests/worktree-merge.spec.ts` | Ticket Git worktree inspection and one-click merge into the main repository branch |

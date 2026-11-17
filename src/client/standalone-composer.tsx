@@ -22,6 +22,7 @@ import {
 } from './image-composer.tsx'
 import {
   readPanelDraft,
+  useTextDraft,
   writePanelDraft,
   readPanelPreferences,
   writePanelPreferences,
@@ -67,7 +68,7 @@ function MessageReceiptCard({
   onInspectSession?: ((sessionId: string, ticketId?: string) => void) | undefined
   onAnswered?: (() => void) | undefined
 }) {
-  const [answerDraft, setAnswerDraft] = useState('')
+  const [answerDraft, setAnswerDraft] = useTextDraft(`panel:receipt-answer:${receipt.triggerId}`)
   const [sendingAnswer, setSendingAnswer] = useState(false)
   const shortId = receipt.ticketId ? `#${receipt.ticketId.slice(0, 6)}` : ''
   const isSelected = !!receipt.sessionId && inspectedSessionId === receipt.sessionId
@@ -234,7 +235,7 @@ export function PanelConversation({
         ...topics,
       ]
 
-  return <section id="local-chat" className="dt-panel-conversation" aria-labelledby="local-chat-title" hidden={!visible} style={!visible ? { display: 'none' } : undefined}>
+  return <section id="local-chat" className="dt-panel-conversation" data-draft-managed aria-labelledby="local-chat-title" hidden={!visible} style={!visible ? { display: 'none' } : undefined}>
     <div className="dt-chat-top">
       <div className="dt-live-head">
         <div className="dt-chat-head-title">

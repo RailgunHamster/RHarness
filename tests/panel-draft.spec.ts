@@ -1,12 +1,22 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+declare global { var IS_REACT_ACT_ENVIRONMENT: boolean }
+globalThis.IS_REACT_ACT_ENVIRONMENT = true
+import { createElement } from 'react'
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
 import {
   readPanelDraft,
   readPanelDraftImages,
   readPanelPreferences,
+  readTextDraft,
+  useGlobalInputDrafts,
+  useTextDraft,
   writePanelDraft,
   writePanelDraftImages,
   writePanelPreferences,
+  writeTextDraft,
   type PanelImageDraft,
 } from '../src/client/panel-draft.ts'
 
@@ -228,5 +238,75 @@ describe('panel image IndexedDB persistence', () => {
     indexedDb.values.set(imageKey('broken'), [{ ...image, mediaType: 'image/svg+xml' }])
     expect(await readPanelDraftImages('broken')).toEqual([])
     await expect(writePanelDraftImages('broken', [{ ...image, data: 'bad' }])).rejects.toThrow('Invalid image draft')
+  })
+})
+
+describe('generic field drafts (useTextDraft + global safety net)', () => {
+  it('round-trips text drafts and clears them when emptied', () => {
+    expect(readTextDraft('assistant:main')).toBeUndefined()
+    writeTextDraft('assistant:main', '没发出去的话')
+    expect(readTextDraft('assistant:main')).toBe('没发出去的话')
+    writeTextDraft('assistant:main', '')
+    expect(readTextDraft('assistant:main')).toBeUndefined()
+  })
+
+  it('useTextDraft restores on remount and self-clears after send', async () => {
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    let setDraft: (next: string) => void = () => {}
+    const Field = () => {
+      const [value, set] = useTextDraft('assistant:main')
+      setDraft = set
+      return createElement('textarea', { 'data-testid': 'field', value, onChange: (e: { target: { value: string } }) => set(e.target.value) })
+    }
+    await act(async () => root.render(createElement(Field)))
+    await act(async () => setDraft('打了一半的消息'))
+    expect(readTextDraft('assistant:main')).toBe('打了一半的消息')
+    await act(async () => root.unmount())
+    const root2 = createRoot(container)
+    await act(async () => root2.render(createElement(Field)))
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="field"]')!.value).toBe('打了一半的消息')
+    await act(async () => setDraft(''))
+    expect(readTextDraft('assistant:main')).toBeUndefined()
+    await act(async () => root2.unmount())
+    container.remove()
+  })
+
+  it('global safety net saves testid fields on typing and refills them after remount', async () => {
+    const container = document.createElement('div')
+    document.body.append(container)
+    const Harness = () => {
+      useGlobalInputDrafts()
+      return createElement('div', null,
+        createElement('input', { 'data-testid': 'some-form-field', defaultValue: '' }),
+        createElement('input', { 'data-testid': 'preset-field', defaultValue: '服务端值' }),
+        createElement('input', { 'data-testid': 'secret-field', type: 'password', defaultValue: '' }),
+      )
+    }
+    const root = createRoot(container)
+    await act(async () => root.render(createElement(Harness)))
+    const setNative = (el: HTMLInputElement, value: string) => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(el, value)
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+    }
+    const field = container.querySelector<HTMLInputElement>('[data-testid="some-form-field"]')!
+    await act(async () => setNative(field, '刷新前别丢'))
+    expect(readTextDraft('global:testid:some-form-field')).toBe('刷新前别丢')
+    const secret = container.querySelector<HTMLInputElement>('[data-testid="secret-field"]')!
+    await act(async () => setNative(secret, '不要存密码'))
+    expect(readTextDraft('global:testid:secret-field')).toBeUndefined()
+    await act(async () => root.unmount())
+    const root2 = createRoot(container)
+    await act(async () => root2.render(createElement(Harness)))
+    expect(container.querySelector<HTMLInputElement>('[data-testid="some-form-field"]')!.value).toBe('刷新前别丢')
+    // Non-empty (server-loaded) fields are never clobbered by a stale draft.
+    writeTextDraft('global:testid:preset-field', '过期草稿')
+    await act(async () => root2.unmount())
+    const root3 = createRoot(container)
+    await act(async () => root3.render(createElement(Harness)))
+    expect(container.querySelector<HTMLInputElement>('[data-testid="preset-field"]')!.value).toBe('服务端值')
+    await act(async () => root3.unmount())
+    container.remove()
   })
 })

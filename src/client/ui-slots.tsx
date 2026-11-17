@@ -8,6 +8,7 @@ import {
   isPanelImageMediaType,
   type PanelImageMediaType,
 } from './image-composer.tsx'
+import { readPanelDraftImages, readTextDraft, useTextDraft, writePanelDraftImages, writeTextDraft } from './panel-draft.ts'
 import { MarkdownText as MarkdownLite } from './markdown-view.tsx'
 import {
   formatSmartTimestamp,
@@ -250,7 +251,12 @@ export function PendingDecisionsPanel({
   onAnswered?: ((next: PendingUserQuestionInfo[]) => void) | undefined
   onInspectTicket?: ((ticketId: string) => void) | undefined
 }): ReactNode {
-  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [drafts, setDrafts] = useState<Record<string, string>>(() => {
+    try { return JSON.parse(readTextDraft('pending-decision-answers') ?? '{}') as Record<string, string> } catch { return {} }
+  })
+  useEffect(() => {
+    writeTextDraft('pending-decision-answers', Object.keys(drafts).length ? JSON.stringify(drafts) : '')
+  }, [drafts])
   const [submittingId, setSubmittingId] = useState<string | null>(null)
   const [err, setErr] = useState('')
 
@@ -515,22 +521,22 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
   const [err, setErr] = useState('')
   const [notice, setNotice] = useState('')
   const [draftConfig, setDraftConfig] = useState<AssistantPersonaConfigInfo | null>(null)
-  const [addressLabel, setAddressLabel] = useState('')
-  const [addressDraft, setAddressDraft] = useState('')
+  const [addressLabel, setAddressLabel] = useTextDraft('persona:address-label')
+  const [addressDraft, setAddressDraft] = useTextDraft('persona:address')
   const [addressPrimary, setAddressPrimary] = useState(false)
   const [cityCandidates, setCityCandidates] = useState<CityCandidateInfo[]>([])
   const [selectedCity, setSelectedCity] = useState<CityCandidateInfo | null>(null)
   const [searchingCity, setSearchingCity] = useState(false)
   const [amapKeyDraft, setAmapKeyDraft] = useState('')
-  const [navFrom, setNavFrom] = useState('')
-  const [navTo, setNavTo] = useState('')
+  const [navFrom, setNavFrom] = useTextDraft('persona:nav-from')
+  const [navTo, setNavTo] = useTextDraft('persona:nav-to')
   const [navMode, setNavMode] = useState<'driving' | 'transit' | 'walking'>('driving')
   const [navResult, setNavResult] = useState<NavigationResultInfo | null>(null)
   const [navBusy, setNavBusy] = useState(false)
-  const [newLearning, setNewLearning] = useState('')
+  const [newLearning, setNewLearning] = useTextDraft('persona:new-learning')
   const [newLearningKind, setNewLearningKind] = useState<PersonaLearningInfo['kind']>('preference')
-  const [stickerName, setStickerName] = useState('')
-  const [stickerTags, setStickerTags] = useState('')
+  const [stickerName, setStickerName] = useTextDraft('persona:sticker-name')
+  const [stickerTags, setStickerTags] = useTextDraft('persona:sticker-tags')
   const stickerFileRef = useRef<HTMLInputElement>(null)
   const [stickerFolderInput, setStickerFolderInput] = useState<HTMLInputElement | null>(null)
 
@@ -1028,9 +1034,24 @@ export function PersonalAssistantSlotView(props: {
     onSwitchToMemoryTab,
     onOpenAssistantSession,
   } = props
-  const [draft, setDraft] = useState('')
-  const [handoffAnswerDrafts, setHandoffAnswerDrafts] = useState<Record<string, string>>({})
+  // Composer draft (text + images) persists locally like the Engineering Chat panel drafts: refresh-safe.
+  const [draft, setDraft] = useTextDraft('assistant:main')
+  const [handoffAnswerDrafts, setHandoffAnswerDrafts] = useState<Record<string, string>>(() => {
+    try { return JSON.parse(readTextDraft('assistant:handoff-answers') ?? '{}') as Record<string, string> } catch { return {} }
+  })
+  useEffect(() => {
+    writeTextDraft('assistant:handoff-answers', Object.keys(handoffAnswerDrafts).length ? JSON.stringify(handoffAnswerDrafts) : '')
+  }, [handoffAnswerDrafts])
   const [images, setImages] = useState<AssistantImageDraft[]>([])
+  const assistantImagesLoaded = useRef(false)
+  useEffect(() => {
+    readPanelDraftImages('claw-assistant-main')
+      .then(restored => { setImages(restored); assistantImagesLoaded.current = true })
+      .catch(() => { assistantImagesLoaded.current = true })
+  }, [])
+  useEffect(() => {
+    if (assistantImagesLoaded.current) void writePanelDraftImages('claw-assistant-main', images).catch(() => {})
+  }, [images])
   const [readingImages, setReadingImages] = useState(false)
   const [busy, setBusy] = useState(false)
   const [clearChatConfirm, setClearChatConfirm] = useState(false)
@@ -1047,8 +1068,8 @@ export function PersonalAssistantSlotView(props: {
   const [personaWorkbenchOpen, setPersonaWorkbenchOpen] = useState(false)
   const [ambientOverride, setAmbientOverride] = useState<AmbientSnapshotInfo | undefined>()
   const [stickerSaveFor, setStickerSaveFor] = useState<{ messageId: string; imageIndex: number } | null>(null)
-  const [stickerSaveName, setStickerSaveName] = useState('')
-  const [stickerSaveTags, setStickerSaveTags] = useState('')
+  const [stickerSaveName, setStickerSaveName] = useTextDraft('assistant:sticker-save-name')
+  const [stickerSaveTags, setStickerSaveTags] = useTextDraft('assistant:sticker-save-tags')
   const [error, setError] = useState<string | null>(null)
   const displayAmbient = ambientOverride ?? ambient
 
@@ -1534,7 +1555,7 @@ export function PersonalAssistantSlotView(props: {
         )}
 
         {/* Message & Image Composer (docked at the bottom in Chat App style via `.dt-assistant-composer`) */}
-        <form className="dt-form dt-assistant-composer" onSubmit={event => { void submitMessage(event) }}>
+        <form className="dt-form dt-assistant-composer" data-draft-managed onSubmit={event => { void submitMessage(event) }}>
           <div
             className="dt-image-drop"
             onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault() }}

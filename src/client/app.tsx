@@ -8,6 +8,7 @@ import { ExecutionStatus } from './execution.tsx'
 import { ticketMark } from './marks.ts'
 import { GLOSSARY, GLOSSARY_VALUES, en, zh, type DshSuperagentKey } from './locales.ts'
 import { OverviewPage } from './overview.tsx'
+import { useTextDraft } from './panel-draft.ts'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
 import { HOME, TABS, initialLocation, lastSettingsGroup, remember, routeLabel, settingsRoute, type Location, type Route,
   type Tab } from './route.ts'
@@ -102,7 +103,7 @@ function SearchResults({ result, query, onClose }: { result: SearchView; query: 
 function Header({ masterId }: { masterId: string | undefined }) {
   const { t, call, openSession, notify } = usePanel()
   const [glossary, setGlossary] = useState(false)
-  const [query, setQuery] = useState('')
+  const [query, setQuery] = useTextDraft('management:global-search')
   const [result, setResult] = useState<{ query: string; value: SearchView }>()
   // Ignore responses from superseded or cleared search requests.
   const latest = useRef(0)

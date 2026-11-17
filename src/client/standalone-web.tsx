@@ -11,6 +11,7 @@ import {
   type VisualModelCatalog,
 } from './settings-kit.tsx'
 import { PanelConversation } from './standalone-composer.tsx'
+import { readTextDraft, useGlobalInputDrafts, useTextDraft, writeTextDraft } from './panel-draft.ts'
 import { LiveWorkspace, SessionActivity, useLiveSession } from './standalone-activity.tsx'
 import { TicketActivity } from './ticket-activity.tsx'
 import { MarkdownText as MarkdownLite, headingAnchorId, openMarkdownViewer, type OpenMarkdownEventDetail } from './markdown-view.tsx'
@@ -510,14 +511,14 @@ function WorkerNodesModal({
   onClose: () => void
   onNodesUpdated: (next: WorkerNodeInfo[]) => void
 }) {
-  const [id, setId] = useState('')
-  const [name, setName] = useState('')
-  const [url, setUrl] = useState('')
-  const [nodeHostname, setNodeHostname] = useState('')
-  const [tailscaleDnsName, setTailscaleDnsName] = useState('')
-  const [tailscaleIps, setTailscaleIps] = useState('')
+  const [id, setId] = useTextDraft('nodes:new-id')
+  const [name, setName] = useTextDraft('nodes:new-name')
+  const [url, setUrl] = useTextDraft('nodes:new-url')
+  const [nodeHostname, setNodeHostname] = useTextDraft('nodes:new-hostname')
+  const [tailscaleDnsName, setTailscaleDnsName] = useTextDraft('nodes:new-ts-dns')
+  const [tailscaleIps, setTailscaleIps] = useTextDraft('nodes:new-ts-ips')
   const [tags, setTags] = useState('heavy-coding, windows, preferred')
-  const [gitUrl, setGitUrl] = useState('')
+  const [gitUrl, setGitUrl] = useTextDraft('nodes:new-git-url')
   const [inviteUri, setInviteUri] = useState('')
   const [joinUri, setJoinUri] = useState('')
   const [busy, setBusy] = useState(false)
@@ -736,17 +737,17 @@ function MemoryAndPluginsSection({
   onMemoryBackupsUpdated: (next: MemoryBackupInfo[]) => void
   onPluginsUpdated: (next: PluginDescriptorInfo[]) => void
 }) {
-  const [title, setTitle] = useState('')
-  const [content, setContent] = useState('')
+  const [title, setTitle] = useTextDraft('memory:add-title')
+  const [content, setContent] = useTextDraft('memory:add-content')
   const [category, setCategory] = useState<MemoryCategoryInfo>('preference')
-  const [tags, setTags] = useState('')
+  const [tags, setTags] = useTextDraft('memory:add-tags')
   const [pinned, setPinned] = useState(true)
-  const [milestoneDate, setMilestoneDate] = useState('')
+  const [milestoneDate, setMilestoneDate] = useTextDraft('memory:add-milestone-date')
   const [milestoneRecurrence, setMilestoneRecurrence] = useState<'yearly' | 'once'>('yearly')
   const [milestoneLeadDays, setMilestoneLeadDays] = useState('30, 14, 7, 1, 0')
   const [pluginCat, setPluginCat] = useState<string>('all')
   const [filterCat, setFilterCat] = useState<string>('all')
-  const [searchQ, setSearchQ] = useState('')
+  const [searchQ, setSearchQ] = useTextDraft('memory:search')
   const [clearConfirmStep, setClearConfirmStep] = useState<0 | 1 | 2>(0)
   const [consolidateFeedback, setConsolidateFeedback] = useState('')
   const [siyuanInstances, setSiyuanInstances] = useState<{
@@ -758,7 +759,7 @@ function MemoryAndPluginsSection({
     recentDocs: { docId: string; notebookId: string; notebookName: string; title: string; hpath: string; updated?: string }[]
   }[]>([])
   const [siyuanFilterInst, setSiyuanFilterInst] = useState<'all' | 'siyuan' | 'siyuan-rh'>('all')
-  const [siyuanQuery, setSiyuanQuery] = useState('')
+  const [siyuanQuery, setSiyuanQuery] = useTextDraft('memory:siyuan-search')
   const [siyuanSearchResults, setSiyuanSearchResults] = useState<{
     instance: 'siyuan' | 'siyuan-rh'
     instanceLabel: string
@@ -1858,8 +1859,8 @@ function SessionConsoleModal({ sessionId, lang, onClose, onSelectSession }: {
 }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [toolName, setToolName] = useState('')
-  const [toolArgs, setToolArgs] = useState('{}')
-  const [replyText, setReplyText] = useState('')
+  const [toolArgs, setToolArgs] = useTextDraft(`session-console:${sessionId ?? 'none'}:tool-args`, '{}')
+  const [replyText, setReplyText] = useTextDraft(`session-console:${sessionId ?? 'none'}:reply`)
   const [feedback, setFeedback] = useState('')
   const [busy, setBusy] = useState(false)
   const [revision, setRevision] = useState(0)
@@ -1868,7 +1869,7 @@ function SessionConsoleModal({ sessionId, lang, onClose, onSelectSession }: {
   useEffect(() => {
     epoch.current++
     setBusy(false)
-    setToolName(''); setFeedback(''); setReplyText(''); setToolArgs('{}')
+    setToolName(''); setFeedback('')
     if (!sessionId) return
     const controller = new AbortController()
     void standaloneFetch<{ sessions: SessionSummary[] }>('sessions', 'GET', undefined, controller.signal)
@@ -1974,7 +1975,7 @@ function MarkdownReaderModal({
 }) {
   const [catalog, setCatalog] = useState<MarkdownCatalogItem[]>([])
   const [doc, setDoc] = useState<MarkdownDocPayload>()
-  const [customPath, setCustomPath] = useState('')
+  const [customPath, setCustomPath] = useTextDraft('markdown:custom-path')
   const [mode, setMode] = useState<'rendered' | 'raw'>('rendered')
   const [loading, setLoading] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -2207,6 +2208,9 @@ function MarkdownReaderModal({
 }
 
 export function StandaloneRoot() {
+  // Every text input on the page auto-saves its draft (refresh-safe); explicit useTextDraft
+  // fields and [data-draft-managed] composers manage their own keys.
+  useGlobalInputDrafts()
   const [lang, setLang] = useState<'zh' | 'en'>('zh')
   const [activeSession, setActiveSession] = useState<string>()
   const [inspectedSession, setInspectedSession] = useState<string>()
