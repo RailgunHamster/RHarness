@@ -240,6 +240,7 @@ function loadedReplyHint(lang: Lang): string {
 
 export function LiveWorkspace({
   lang,
+  active = true,
   onOpenSession,
   inspectedSessionId,
   preferredSessionId,
@@ -247,6 +248,13 @@ export function LiveWorkspace({
   onMetaUpdate,
 }: {
   lang: Lang
+  /**
+   * The inspector UI only renders on its own dedicated tab (`live-inspector`).
+   * The component itself stays mounted on every view so the `/sessions` polling
+   * behind `onMetaUpdate` (global app state) never stops; with `active: false`
+   * it renders nothing and does not poll any single-session detail stream.
+   */
+  active?: boolean
   onOpenSession: (id: string) => void
   inspectedSessionId?: string | undefined
   preferredSessionId?: string | undefined
@@ -345,12 +353,14 @@ export function LiveWorkspace({
     return () => { controller.abort(); clearTimeout(timer) }
   }, [manual, preferredSessionId, onMetaUpdate])
 
-  const live = useLiveSession(selected || undefined)
+  const live = useLiveSession(active ? (selected || undefined) : undefined)
   const ticketId = selected.startsWith('worker-') ? selected.slice('worker-'.length) : undefined
+
+  if (!active) return null
 
   return <section id="live-execution" className="dt-live-workspace" aria-label={lang === 'zh' ? '实时执行' : 'Live execution'}>
     <div className="dt-live-head"><div><h2>{lang === 'zh' ? '实时执行检视器' : 'Live execution inspector'}</h2>
-      <span className="dt-hint">{lang === 'zh' ? '点击上方消息回执可切换检视目标 · 每秒自动更新' : 'Click any message receipt above to inspect · Updates every second'}
+      <span className="dt-hint">{lang === 'zh' ? '在「工程对话」点击任意消息回执可跳转到本页检视对应会话 · 每秒自动更新' : 'Click any message receipt in Engineering Chat to inspect its session here · Updates every second'}
         {live.updated && ` · ${live.updated}`}</span></div>
       <div className="dt-row-buttons">
         {manual && <Button size="sm" onClick={() => setManual(false)}>{lang === 'zh' ? '自动关注运行中的工单' : 'Follow running tickets'}</Button>}

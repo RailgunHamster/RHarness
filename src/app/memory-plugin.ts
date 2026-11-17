@@ -1108,7 +1108,7 @@ export function buildPluginCatalog(input: {
       packageName: '@rharness/ui-engineering-workbench',
       title: { zh: 'UI 视图插件：工程对话与实时检视台 (Engineering Chat Slot)', en: 'UI Slot Plugin: Engineering Chat & Live Inspector' },
       description: {
-        zh: '排在顶栏第 2 位的「工程对话」工作台插槽（左侧话题列表、全宽工程对话与内联工单回执、下方实时执行检视器）。关闭后顶栏「工程对话」窗口实时卸载。',
+        zh: '排在顶栏第 2 位的「工程对话」工作台插槽（左侧话题列表、全宽工程对话与内联工单回执），以及独立的「实时执行检视器」标签页（点击任意消息回执即跳转过去）。关闭后两个窗口实时卸载。',
         en: 'Second-tab 3-column Engineering Chat workbench and live execution inspector slot.',
       },
       category: 'ui-slot',

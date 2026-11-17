@@ -19,6 +19,7 @@ import {
   ClawFeedNotificationsSlotView,
   getEnabledUIViewSlots,
   groupUIViewSlotsIntoTabBars,
+  PersonaAmbientWorkbench,
   PersonalAssistantSlotView,
   RHToolkitSlotView,
   type MainViewSlotId,
@@ -788,6 +789,7 @@ function MemoryAndPluginsSection({
   }>()
   const [pluginDraftConfig, setPluginDraftConfig] = useState<Record<string, unknown>>({})
   const [pluginPanelFeedback, setPluginPanelFeedback] = useState('')
+  const [personaWorkbenchOpen, setPersonaWorkbenchOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
@@ -1147,6 +1149,17 @@ function MemoryAndPluginsSection({
             </div>}
           </div>
           <div className="dt-row-buttons">
+            {pl.id === 'dsh-assistant-persona' && (
+              <Button
+                size="sm"
+                variant="primary"
+                onClick={() => setPersonaWorkbenchOpen(true)}
+                data-testid="plugin-persona-workbench-btn"
+                title={lang === 'zh' ? '打开人设、表情包图库、已学默契与常驻城市维护工作台（与个人助理标题栏的 🎭 入口相同）' : 'Open Persona / Stickers / Home City workbench'}
+              >
+                {lang === 'zh' ? '🎭 人设·表情·城市维护' : '🎭 Persona & City'}
+              </Button>
+            )}
             <Button
               size="sm"
               variant="outline"
@@ -1315,6 +1328,7 @@ function MemoryAndPluginsSection({
         </div>
       )}
     </Modal>
+    <PersonaAmbientWorkbench lang={lang} open={personaWorkbenchOpen} onClose={() => setPersonaWorkbenchOpen(false)} />
     </>}
 
     {section === 'memory' && <>
@@ -2353,8 +2367,11 @@ export function StandaloneRoot() {
 
   const handleInspectSession = useCallback((sessionId: string) => {
     setInspectedSession(sessionId)
-    const el = document.getElementById('live-execution')
-    el?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' })
+    // The Live Execution Inspector lives on its own dedicated tab now: jump straight to it.
+    setViewMode('live-inspector')
+    setTimeout(() => {
+      document.getElementById('live-execution')?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' })
+    }, 60)
   }, [])
 
   const t = useMemo(() => makeTranslator(lang === 'zh' ? zh : en), [lang])
@@ -2448,7 +2465,7 @@ export function StandaloneRoot() {
         <nav className="dt-workspace-nav" aria-label={lang === 'zh' ? '工作台区域' : 'Workspace sections'}>
           <a href="#local-chat" onClick={() => setViewMode('workbench')}>{lang === 'zh' ? '工程对话' : 'Local chat'}</a>
           <a href="#management" onClick={() => setViewMode('management')}>{lang === 'zh' ? '管理面板' : 'Management'}</a>
-          <a href="#live-execution" onClick={() => setViewMode('workbench')}>{lang === 'zh' ? '实时执行' : 'Live execution'}</a>
+          <a href="#live-execution" onClick={() => setViewMode('live-inspector')}>{lang === 'zh' ? '实时执行' : 'Live execution'}</a>
         </nav>
         <Button variant="outline" size="sm" onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}>{lang === 'zh' ? 'English' : '中文'}</Button>
       </div>
@@ -2546,15 +2563,16 @@ export function StandaloneRoot() {
               <span className="dt-hint">{lang === 'zh' ? '按横截面展示每条消息从触发、准入研判、分布式节点分配到代码合入的完整路径' : 'Cross-section of every request from trigger intake to node assignment and branch merge'}</span>
             </div>
           </div>
-          <PipelineAuditSection rows={pipelineRows} lang={lang} onInspectSession={id => { setViewMode('workbench'); handleInspectSession(id) }} />
+          <PipelineAuditSection rows={pipelineRows} lang={lang} onInspectSession={id => { handleInspectSession(id) }} />
         </section>}
-        <div className="dt-management-suite" hidden={viewMode === 'pipeline' || viewMode === 'memory-library' || viewMode === 'siyuan-kb' || viewMode === 'plugin-center' || viewMode === 'assistant' || viewMode === 'clawfeed' || viewMode === 'rhtoolkit'}>
+        <div className="dt-management-suite" hidden={viewMode === 'pipeline' || viewMode === 'memory-library' || viewMode === 'siyuan-kb' || viewMode === 'plugin-center' || viewMode === 'live-inspector' || viewMode === 'assistant' || viewMode === 'clawfeed' || viewMode === 'rhtoolkit'}>
           <App t={t} openSession={async id => setActiveSession(id)} deploymentForm={undefined}
             renderSessionActivity={id => <TicketActivity key={id} sessionId={id} lang={lang} />} />
         </div>
       </div>
       <LiveWorkspace
         lang={lang}
+        active={viewMode === 'live-inspector'}
         onOpenSession={setActiveSession}
         inspectedSessionId={inspectedSession}
         preferredSessionId={viewMode === 'assistant' ? 'claw-assistant-main' : undefined}

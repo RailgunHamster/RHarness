@@ -29,7 +29,7 @@ import {
   type StickerInfo,
 } from './standalone-api.ts'
 
-export type MainViewSlotId = 'workbench' | 'assistant' | 'clawfeed' | 'rhtoolkit' | 'memory-library' | 'siyuan-kb' | 'plugin-center' | 'pipeline' | 'management'
+export type MainViewSlotId = 'workbench' | 'assistant' | 'clawfeed' | 'rhtoolkit' | 'memory-library' | 'siyuan-kb' | 'plugin-center' | 'live-inspector' | 'pipeline' | 'management'
 
 export interface UIViewSlotCounts {
   assistantCount: number
@@ -157,6 +157,12 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
       lang === 'zh'
         ? `🧩 插件中心 (${c.enabledPlugins}/${c.totalPlugins})`
         : `🧩 Plugin Center (${c.enabledPlugins}/${c.totalPlugins})`,
+  },
+  {
+    id: 'live-inspector',
+    pluginId: 'ui-workbench',
+    order: 38,
+    label: lang => (lang === 'zh' ? '🔍 实时执行检视器' : '🔍 Live Inspector'),
   },
   {
     id: 'pipeline',

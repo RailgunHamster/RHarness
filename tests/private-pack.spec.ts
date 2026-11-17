@@ -86,12 +86,12 @@ describe('clean-room public deployment & external private pack isolation', () =>
 
     const visibleSlots = getEnabledUIViewSlots(plugins).map(s => s.id)
     expect(visibleSlots).not.toContain('rhtoolkit')
-    expect(visibleSlots).toEqual(['assistant', 'workbench', 'memory-library', 'plugin-center', 'pipeline', 'management'])
+    expect(visibleSlots).toEqual(['assistant', 'workbench', 'memory-library', 'plugin-center', 'live-inspector', 'pipeline', 'management'])
 
     // Views registering the same tab-bar name collapse into ONE top-level tab with members ordered inside.
     // In clean-room mode the SiYuan slot is unregistered, so the knowledge bar degrades to a single member.
     const cleanBars = groupUIViewSlotsIntoTabBars(getEnabledUIViewSlots(plugins))
-    expect(cleanBars.map(b => b.id)).toEqual(['assistant', 'workbench', 'knowledge', 'plugin-center', 'pipeline', 'management'])
+    expect(cleanBars.map(b => b.id)).toEqual(['assistant', 'workbench', 'knowledge', 'plugin-center', 'live-inspector', 'pipeline', 'management'])
     expect(cleanBars.find(b => b.id === 'knowledge')?.members.map(m => m.id)).toEqual(['memory-library'])
     const fullBars = groupUIViewSlotsIntoTabBars(getEnabledUIViewSlots([
       ...plugins,

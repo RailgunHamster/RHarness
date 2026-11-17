@@ -124,13 +124,19 @@ it('renders conversation and input first, management next, and live execution la
   await act(async () => root.render(<StandaloneRoot />))
   const chat = container.querySelector('#local-chat')!
   const management = container.querySelector('#management')!
-  const live = container.querySelector('#live-execution')!
   expect(container.querySelector('svg.dt-brand-logo')).not.toBeNull()
   expect(chat.querySelector('textarea')).not.toBeNull()
   expect(document.querySelector('[role="dialog"]')).toBeNull()
   expect(chat.compareDocumentPosition(management) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-  expect(management.compareDocumentPosition(live) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   expect(chat.querySelector('details')?.open).toBe(false)
+  // The Live Execution Inspector is NOT rendered on other views anymore: it lives on its own tab only
+  expect(container.querySelector('#live-execution')).toBeNull()
+  const inspectorTab = container.querySelector<HTMLButtonElement>('[data-testid="view-tab-live-inspector"]')!
+  expect(inspectorTab).not.toBeNull()
+  await act(async () => { inspectorTab.click() })
+  const live = container.querySelector('#live-execution')!
+  expect(live).not.toBeNull()
+  expect(management.compareDocumentPosition(live) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   const links = [...container.querySelectorAll<HTMLAnchorElement>('.dt-workspace-nav a')]
   expect(links.map(link => link.getAttribute('href'))).toEqual(['#local-chat', '#management', '#live-execution'])
   expect(links.every(link => container.querySelector(link.getAttribute('href')!))).toBe(true)
@@ -167,6 +173,8 @@ it('keeps the inline input and draft while switching the workspace language', as
   await act(async () => { [...container.querySelectorAll('button')].find(button => button.textContent === 'English')!.click() })
   expect(container.querySelector('textarea')?.value).toBe('keep across language changes')
   expect(container.querySelector('#local-chat-title')?.textContent).toBe('Local chat')
+  // The inspector lives on its own tab now: open its tab, then check the localized label.
+  await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="view-tab-live-inspector"]')!.click() })
   expect(container.querySelector('#live-execution')?.getAttribute('aria-label')).toBe('Live execution')
 })
 
