@@ -676,6 +676,7 @@ type FetchFn = typeof fetch
 export interface CityCandidate extends AmbientHomeCity {
   admin1?: string
   country?: string
+  population?: number
   /** Which (possibly degraded) query variant produced this candidate. */
   matchedQuery: string
 }
@@ -697,7 +698,10 @@ export function cityQueryVariants(query: string): string[] {
   if (city) {
     const afterCity = q.slice((cityMatch?.index ?? 0) + city.length)
     const district = /([\u4e00-\u9fa5]{2,6}?(?:区|县))/.exec(afterCity)?.[1]
-    if (district) variants.push(district)
+    if (district) {
+      variants.push(district)
+      variants.push(district.replace(/(?:区|县)$/, ''))
+    }
     variants.push(city)
     variants.push(city.replace(/市$/, ''))
   }
@@ -713,32 +717,52 @@ export function cityQueryVariants(query: string): string[] {
  */
 export async function searchCityCandidates(query: string, fetcher: FetchFn = fetch): Promise<CityCandidate[]> {
   const variants = cityQueryVariants(query)
-  const merged: CityCandidate[] = []
+  const isCjkQuery = /[\u4e00-\u9fa5]/.test(query)
+  const cityFromQuery = /([\u4e00-\u9fa5]{2,8}?市)/.exec(query)?.[1]
+  const scored: { candidate: CityCandidate; variantIndex: number }[] = []
   const seen = new Set<string>()
-  for (const variant of variants) {
+  for (const [variantIndex, variant] of variants.entries()) {
     try {
       const res = await fetcher(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(variant)}&count=6&language=zh&format=json`, { signal: AbortSignal.timeout(10_000) })
       if (!res.ok) continue
-      const data = (await res.json()) as { results?: { name?: string; latitude?: number; longitude?: number; timezone?: string; country?: string; admin1?: string }[] }
+      const data = (await res.json()) as { results?: { name?: string; latitude?: number; longitude?: number; timezone?: string; country?: string; admin1?: string; population?: number }[] }
       for (const hit of data.results ?? []) {
         if (typeof hit.latitude !== 'number' || typeof hit.longitude !== 'number' || !hit.name) continue
         const key = `${hit.name}|${hit.latitude.toFixed(2)}|${hit.longitude.toFixed(2)}`
         if (seen.has(key)) continue
         seen.add(key)
-        merged.push({
-          name: hit.name,
-          latitude: hit.latitude,
-          longitude: hit.longitude,
-          timezone: hit.timezone || 'Asia/Shanghai',
-          ...(hit.admin1 ? { admin1: hit.admin1 } : {}),
-          ...(hit.country ? { country: hit.country } : {}),
-          matchedQuery: variant,
+        scored.push({
+          variantIndex,
+          candidate: {
+            name: hit.name,
+            latitude: hit.latitude,
+            longitude: hit.longitude,
+            timezone: hit.timezone || 'Asia/Shanghai',
+            ...(hit.admin1 ? { admin1: hit.admin1 } : {}),
+            ...(hit.country ? { country: hit.country } : {}),
+            ...(typeof hit.population === 'number' ? { population: hit.population } : {}),
+            matchedQuery: variant,
+          },
         })
       }
     } catch { /* try the next, coarser variant */ }
-    if (merged.length >= 10) break
   }
-  return merged.slice(0, 10)
+  // Rank so the *right* same-named place wins: for Chinese queries, Chinese results first
+  // (a query for 上海市 otherwise surfaces Shanghai, Illinois), then places inside the
+  // province/city named in the query, exact name hits, big populations, earlier variants.
+  scored.sort((a, b) => {
+    const countryRank = (c: CityCandidate) => (isCjkQuery && c.country !== '中国' ? 1 : 0)
+    const adminRank = (c: CityCandidate) => (cityFromQuery && (c.admin1 === cityFromQuery || c.name === cityFromQuery) ? 0 : 1)
+    const exactRank = (s: { candidate: CityCandidate }) => (s.candidate.name === s.candidate.matchedQuery ? 0 : 1)
+    return (
+      countryRank(a.candidate) - countryRank(b.candidate) ||
+      adminRank(a.candidate) - adminRank(b.candidate) ||
+      exactRank(a) - exactRank(b) ||
+      (b.candidate.population ?? 0) - (a.candidate.population ?? 0) ||
+      a.variantIndex - b.variantIndex
+    )
+  })
+  return scored.slice(0, 10).map(s => s.candidate)
 }
 
 export async function geocodeCity(name: string, fetcher: FetchFn = fetch): Promise<AmbientHomeCity | undefined> {

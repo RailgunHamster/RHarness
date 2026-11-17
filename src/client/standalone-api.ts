@@ -311,6 +311,7 @@ export interface AmbientHomeCityInfo { name: string; latitude: number; longitude
 export interface CityCandidateInfo extends AmbientHomeCityInfo {
   admin1?: string
   country?: string
+  population?: number
   /** Which degraded query variant (full address → district → city) produced this candidate. */
   matchedQuery?: string
 }

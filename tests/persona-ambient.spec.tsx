@@ -207,6 +207,16 @@ describe('ambient awareness', () => {
     // geocodeCity now resolves the same detailed address to its district instead of "not found".
     expect(await geocodeCity(address, fetcher)).toMatchObject({ name: '徐汇区', latitude: 31.19 })
     expect(await geocodeCity('不存在的火星地名', fetcher)).toBeUndefined()
+
+    // Same-named foreign places must not outrank the Chinese city for Chinese queries.
+    const shFetcher = vi.fn(async () => new Response(JSON.stringify({
+      results: [
+        { name: '上海市', admin1: '伊利诺伊州', country: '美国', latitude: 41.05, longitude: -90.49, timezone: 'America/Chicago', population: 99999999 },
+        { name: '上海市', admin1: '上海市', country: '中国', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai', population: 100 },
+      ],
+    }), { status: 200 })) as unknown as typeof fetch
+    const shCandidates = await searchCityCandidates('上海市徐汇区某路1号', shFetcher)
+    expect(shCandidates[0]).toMatchObject({ country: '中国', latitude: 31.23 })
   })
 
   it('parses RSS and builds a topic brief', () => {
