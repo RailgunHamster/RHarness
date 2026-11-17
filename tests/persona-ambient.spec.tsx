@@ -706,9 +706,9 @@ describe('persona workbench UI', () => {
     expect(addressInput.value).toContain('梅陇十一村')
     expect(page.querySelector<HTMLButtonElement>('[data-testid="ambient-add-address-btn"]')!.textContent).toContain('保存修改')
     await setInput(addressInput, '上海市徐汇区华发路888弄北区2号楼')
-    await act(async () => { page.querySelector<HTMLButtonElement>('[data-testid="ambient-search-city-btn"]')!.click(); await new Promise(r => setTimeout(r, 30)) })
-    const editCandidates = container.querySelector('[data-testid="ambient-city-candidates"]')!
-    await act(async () => { editCandidates.querySelector<HTMLButtonElement>('[data-testid="ambient-city-candidate-0"]')!.click() })
+    // No forced re-resolve: the stored city is reused, so 保存修改 works immediately.
+    expect(page.querySelector<HTMLButtonElement>('[data-testid="ambient-add-address-btn"]')!.disabled).toBe(false)
+    expect(container.textContent).toContain('沿用已解析的')
     await act(async () => { page.querySelector<HTMLButtonElement>('[data-testid="ambient-add-address-btn"]')!.click(); await new Promise(r => setTimeout(r, 30)) })
     expect(container.textContent).toContain('已修改常驻地址「家」')
     const rowsAfter = [...container.querySelectorAll('[data-testid^="ambient-address-row-"]')]

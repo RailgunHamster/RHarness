@@ -522,6 +522,8 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
   const [notice, setNotice] = useState('')
   const [draftConfig, setDraftConfig] = useState<AssistantPersonaConfigInfo | null>(null)
   const [editingAddressId, setEditingAddressId] = useState<string | null>(null)
+  /** The address text the currently selected city was resolved for (to detect stale reuse). */
+  const [selectedCityFor, setSelectedCityFor] = useState('')
   const [addressLabel, setAddressLabel] = useTextDraft('persona:address-label')
   const [addressDraft, setAddressDraft] = useTextDraft('persona:address')
   const [addressPrimary, setAddressPrimary] = useState(false)
@@ -548,6 +550,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       setState({ ...res, stickerTrash: res.stickerTrash ?? [], ambientConfig: { ...res.ambientConfig, residentAddresses: res.ambientConfig.residentAddresses ?? [] } })
       setDraftConfig(res.config)
       setSelectedCity(null)
+      setSelectedCityFor('')
       setCityCandidates([])
       onAmbientChanged?.(res.ambient)
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
@@ -690,7 +693,10 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       return res.candidates
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)); return [] } finally { setSearchingCity(false) }
   }
-  const pickCity = (candidate: CityCandidateInfo) => { setSelectedCity(candidate) }
+  const pickCity = (candidate: CityCandidateInfo) => {
+    setSelectedCity(candidate)
+    setSelectedCityFor(addressDraft.trim())
+  }
   /** Persists the whole resident-address list (add/remove/set-primary/label edit all go through here). */
   const persistAddresses = async (list: ResidentAddressInfo[], noticeText?: string) => {
     if (!state) return
@@ -708,9 +714,11 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
     setAddressLabel(addr.label)
     setAddressDraft(addr.address)
     setAddressPrimary(addr.isPrimary)
+    // The stored city is reused as-is: editing the address text never forces a re-resolve.
     setSelectedCity({ name: addr.city.name, latitude: addr.city.latitude, longitude: addr.city.longitude, timezone: addr.city.timezone })
+    setSelectedCityFor(addr.address)
     setCityCandidates([])
-    setNotice(lang === 'zh' ? `✏️ 正在修改「${addr.label}」：改完详细地址后可重新解析城市，最后点「保存修改」。` : `Editing ${addr.label}`)
+    setNotice(lang === 'zh' ? `✏️ 正在修改「${addr.label}」：直接改完点「保存修改」即可，不需要重新解析城市（除非地址换到了另一个城市）。` : `Editing ${addr.label}`)
   }
   const cancelEditAddress = () => {
     setEditingAddressId(null)
@@ -718,13 +726,28 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
     setAddressDraft('')
     setAddressPrimary(false)
     setSelectedCity(null)
+    setSelectedCityFor('')
     setCityCandidates([])
   }
   const addAddress = async () => {
-    if (!state || !addressDraft.trim() || !selectedCity) return
+    if (!state || !addressDraft.trim()) return
+    // City resolution is automatic, never a gate: a previously resolved/stored city is
+    // reused as-is; only a brand-new address with several plausible candidates asks for a pick.
+    let chosen = selectedCity
+    if (!chosen) {
+      const found = await searchCities()
+      if (found.length === 1) chosen = found[0]!
+      else if (found.length > 1) {
+        setNotice(lang === 'zh' ? '🔎 这条地址能解析到不止一个地方，在下面列表里点选它所在的那一个就能保存（只在这一次需要）。' : 'Pick which candidate this address belongs to.')
+        return
+      } else {
+        setErr(lang === 'zh' ? `没能从「${addressDraft.trim()}」解析出城市，检查一下地址是否完整（带上城市名）。` : 'Could not resolve a city from that address.')
+        return
+      }
+    }
     const nowIso = new Date().toISOString()
     const current = state.ambientConfig.residentAddresses ?? []
-    const city = { name: selectedCity.cityName ?? selectedCity.name, latitude: selectedCity.latitude, longitude: selectedCity.longitude, timezone: selectedCity.timezone }
+    const city = { name: chosen.cityName ?? chosen.name, latitude: chosen.latitude, longitude: chosen.longitude, timezone: chosen.timezone }
     if (editingAddressId) {
       const original = current.find(a => a.id === editingAddressId)
       if (original) {
@@ -756,6 +779,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
     await persistAddresses([...list, entry], lang === 'zh' ? `✅ 已保存常驻地址「${entry.label}」（城市：${entry.city.name}${entry.isPrimary ? '，已设为主要地址，天气按此城市' : ''}）` : '✅ Address saved')
     setAddressDraft('')
     setSelectedCity(null)
+    setSelectedCityFor('')
     setCityCandidates([])
   }
   const saveAmbientToggles = async () => {
@@ -940,18 +964,18 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
             {editingAddressId && <p className="dt-hint" data-testid="ambient-editing-hint">{lang === 'zh' ? '✏️ 正在修改一条已有地址（改完点「保存修改」原地替换，不会新增一条）。只改称呼也可以直接在上面列表里改。' : 'Editing an existing address.'}</p>}
             <div className="dt-persona-grid">
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '地址称呼' : 'Label'}</span><Input value={addressLabel} onChange={e => setAddressLabel(e.target.value)} data-testid="ambient-address-label-input" placeholder={lang === 'zh' ? '家 / 公司 / 老家…' : 'Home / Office…'} /></label>
-              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '详细地址（可写到门牌号）' : 'Detailed address'}</span><Input value={addressDraft} onChange={e => { setAddressDraft(e.target.value); setSelectedCity(null) }} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void searchCities() } }} data-testid="ambient-address-input" placeholder={lang === 'zh' ? '上海市徐汇区梅陇十一村46号401' : 'Street address…'} /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '详细地址（可写到门牌号）' : 'Detailed address'}</span><Input value={addressDraft} onChange={e => setAddressDraft(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void searchCities() } }} data-testid="ambient-address-input" placeholder={lang === 'zh' ? '上海市徐汇区梅陇十一村46号401' : 'Street address…'} /></label>
             </div>
             <div className="dt-row-buttons">
               <Button variant="outline" disabled={busy || searchingCity || !addressDraft.trim()} onClick={() => { void searchCities() }} data-testid="ambient-search-city-btn">{searchingCity ? (lang === 'zh' ? '解析中…' : 'Resolving…') : (lang === 'zh' ? '🔍 解析所在城市' : '🔍 Resolve city')}</Button>
-              {selectedCity && <Tag tone="success">{lang === 'zh' ? `所在城市：${selectedCity.cityName ?? selectedCity.name}` : `City: ${selectedCity.cityName ?? selectedCity.name}`}</Tag>}
+              {selectedCity && <Tag tone="success">{lang === 'zh' ? `所在城市：${selectedCity.cityName ?? selectedCity.name}${selectedCityFor && addressDraft.trim() !== selectedCityFor ? '（沿用已解析的，保存直接生效）' : ''}` : `City: ${selectedCity.cityName ?? selectedCity.name}`}</Tag>}
               <label className="dt-hint"><input type="checkbox" checked={addressPrimary} onChange={e => setAddressPrimary(e.target.checked)} /> {lang === 'zh' ? '设为主要地址（天气按它的城市）' : 'Make primary (weather city)'}</label>
-              <Button variant="primary" disabled={busy || !addressDraft.trim() || !selectedCity} onClick={() => { void addAddress() }} data-testid="ambient-add-address-btn">{editingAddressId ? (lang === 'zh' ? '💾 保存修改' : '💾 Save changes') : (lang === 'zh' ? '➕ 保存这个地址' : '➕ Save address')}</Button>
+              <Button variant="primary" disabled={busy || !addressDraft.trim()} onClick={() => { void addAddress() }} data-testid="ambient-add-address-btn">{editingAddressId ? (lang === 'zh' ? '💾 保存修改' : '💾 Save changes') : (lang === 'zh' ? '➕ 保存这个地址' : '➕ Save address')}</Button>
               {editingAddressId && <Button variant="ghost" disabled={busy} onClick={cancelEditAddress} data-testid="ambient-cancel-edit-btn">{lang === 'zh' ? '取消修改' : 'Cancel'}</Button>}
             </div>
             {cityCandidates.length > 0 && (
               <div className="dt-form" data-testid="ambient-city-candidates">
-                <strong>{lang === 'zh' ? '解析到以下城市，点选这条地址所在的城市：' : 'Pick the city for this address:'}</strong>
+                <strong>{lang === 'zh' ? '解析到以下位置，点选这条地址所在的那一个（选中后保存才生效）：' : 'Pick the matching place:'}</strong>
                 <div className="dt-row-buttons">
                   {cityCandidates.map((c, idx) => (
                     <Button key={`${c.name}-${c.latitude}-${c.longitude}`} size="sm" variant={selectedCity === c ? 'primary' : 'outline'} onClick={() => pickCity(c)} data-testid={`ambient-city-candidate-${idx}`}>
