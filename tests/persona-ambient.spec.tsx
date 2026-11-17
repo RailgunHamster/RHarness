@@ -695,5 +695,25 @@ describe('persona workbench UI', () => {
     expect(result.textContent).toContain('沪闵路')
     expect(result.querySelector<HTMLAnchorElement>('[data-testid="nav-link-amap"]')!.href).toContain('uri.amap.com')
     expect(result.querySelector<HTMLAnchorElement>('[data-testid="nav-link-baidu"]')!.href).toContain('map.baidu.com')
+
+    // Edit the saved address in place: form refills, saving replaces the row (no duplicate).
+    const row = container.querySelector('[data-testid^="ambient-address-row-"]')!
+    const rowId = row.getAttribute('data-testid')!.replace('ambient-address-row-', '')
+    const editBtn = container.querySelector<HTMLButtonElement>(`[data-testid="ambient-address-edit-${rowId}"]`)!
+    await act(async () => { editBtn.click() })
+    expect(container.querySelector('[data-testid="ambient-editing-hint"]')).not.toBeNull()
+    const addressInput = page.querySelector<HTMLInputElement>('[data-testid="ambient-address-input"]')!
+    expect(addressInput.value).toContain('梅陇十一村')
+    expect(page.querySelector<HTMLButtonElement>('[data-testid="ambient-add-address-btn"]')!.textContent).toContain('保存修改')
+    await setInput(addressInput, '上海市徐汇区华发路888弄北区2号楼')
+    await act(async () => { page.querySelector<HTMLButtonElement>('[data-testid="ambient-search-city-btn"]')!.click(); await new Promise(r => setTimeout(r, 30)) })
+    const editCandidates = container.querySelector('[data-testid="ambient-city-candidates"]')!
+    await act(async () => { editCandidates.querySelector<HTMLButtonElement>('[data-testid="ambient-city-candidate-0"]')!.click() })
+    await act(async () => { page.querySelector<HTMLButtonElement>('[data-testid="ambient-add-address-btn"]')!.click(); await new Promise(r => setTimeout(r, 30)) })
+    expect(container.textContent).toContain('已修改常驻地址「家」')
+    const rowsAfter = [...container.querySelectorAll('[data-testid^="ambient-address-row-"]')]
+    expect(rowsAfter).toHaveLength(1)
+    expect(rowsAfter[0]!.textContent).toContain('华发路888弄北区2号楼')
+    expect(container.querySelector('[data-testid="ambient-editing-hint"]')).toBeNull()
   })
 })

@@ -521,6 +521,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
   const [err, setErr] = useState('')
   const [notice, setNotice] = useState('')
   const [draftConfig, setDraftConfig] = useState<AssistantPersonaConfigInfo | null>(null)
+  const [editingAddressId, setEditingAddressId] = useState<string | null>(null)
   const [addressLabel, setAddressLabel] = useTextDraft('persona:address-label')
   const [addressDraft, setAddressDraft] = useTextDraft('persona:address')
   const [addressPrimary, setAddressPrimary] = useState(false)
@@ -701,15 +702,52 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       if (noticeText) setNotice(noticeText)
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
+  /** Loads an existing address back into the form for editing (address text, label, city). */
+  const startEditAddress = (addr: ResidentAddressInfo) => {
+    setEditingAddressId(addr.id)
+    setAddressLabel(addr.label)
+    setAddressDraft(addr.address)
+    setAddressPrimary(addr.isPrimary)
+    setSelectedCity({ name: addr.city.name, latitude: addr.city.latitude, longitude: addr.city.longitude, timezone: addr.city.timezone })
+    setCityCandidates([])
+    setNotice(lang === 'zh' ? `✏️ 正在修改「${addr.label}」：改完详细地址后可重新解析城市，最后点「保存修改」。` : `Editing ${addr.label}`)
+  }
+  const cancelEditAddress = () => {
+    setEditingAddressId(null)
+    setAddressLabel('')
+    setAddressDraft('')
+    setAddressPrimary(false)
+    setSelectedCity(null)
+    setCityCandidates([])
+  }
   const addAddress = async () => {
     if (!state || !addressDraft.trim() || !selectedCity) return
     const nowIso = new Date().toISOString()
     const current = state.ambientConfig.residentAddresses ?? []
+    const city = { name: selectedCity.cityName ?? selectedCity.name, latitude: selectedCity.latitude, longitude: selectedCity.longitude, timezone: selectedCity.timezone }
+    if (editingAddressId) {
+      const original = current.find(a => a.id === editingAddressId)
+      if (original) {
+        const updated: ResidentAddressInfo = {
+          ...original,
+          label: addressLabel.trim() || original.label,
+          address: addressDraft.trim(),
+          city,
+          isPrimary: addressPrimary || original.isPrimary,
+          updatedAt: nowIso,
+        }
+        const list = current.map(a => (a.id === editingAddressId ? updated : updated.isPrimary ? { ...a, isPrimary: false } : a))
+        await persistAddresses(list, lang === 'zh' ? `✅ 已修改常驻地址「${updated.label}」（城市：${updated.city.name}）` : '✅ Address updated')
+        cancelEditAddress()
+        return
+      }
+      setEditingAddressId(null)
+    }
     const entry: ResidentAddressInfo = {
       id: `addr-new-${Date.now()}`,
       label: addressLabel.trim() || (lang === 'zh' ? '常驻地址' : 'Address'),
       address: addressDraft.trim(),
-      city: { name: selectedCity.cityName ?? selectedCity.name, latitude: selectedCity.latitude, longitude: selectedCity.longitude, timezone: selectedCity.timezone },
+      city,
       isPrimary: addressPrimary || current.length === 0,
       createdAt: nowIso,
       updatedAt: nowIso,
@@ -892,21 +930,24 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
                     <Input value={addr.label} disabled={busy} onChange={e => setState(curr => (curr ? { ...curr, ambientConfig: { ...curr.ambientConfig, residentAddresses: (curr.ambientConfig.residentAddresses ?? []).map(x => x.id === addr.id ? { ...x, label: e.target.value } : x) } } : curr))} onBlur={e => { void persistAddresses((state.ambientConfig.residentAddresses ?? []).map(x => x.id === addr.id ? { ...x, label: e.target.value } : x)) }} />
                     <span>{addr.address}</span>
                     <span className="dt-hint">📍 {addr.city.name}</span>
+                    <Button size="sm" variant="outline" disabled={busy} onClick={() => startEditAddress(addr)} data-testid={`ambient-address-edit-${addr.id}`}>{lang === 'zh' ? '✏️ 修改' : 'Edit'}</Button>
                     {!addr.isPrimary && <Button size="sm" variant="outline" disabled={busy} onClick={() => { void persistAddresses((state.ambientConfig.residentAddresses ?? []).map(x => ({ ...x, isPrimary: x.id === addr.id })), lang === 'zh' ? `✅ 主要地址已切换为「${addr.label}」，天气城市：${addr.city.name}` : 'Primary switched') }} data-testid={`ambient-address-primary-${addr.id}`}>{lang === 'zh' ? '设为主要' : 'Make primary'}</Button>}
                     <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void persistAddresses((state.ambientConfig.residentAddresses ?? []).filter(x => x.id !== addr.id), lang === 'zh' ? `已删除常驻地址「${addr.label}」` : 'Address deleted') }} data-testid={`ambient-address-delete-${addr.id}`}>🗑 删除</Button>
                   </div>
                 ))}
               </div>
             )}
+            {editingAddressId && <p className="dt-hint" data-testid="ambient-editing-hint">{lang === 'zh' ? '✏️ 正在修改一条已有地址（改完点「保存修改」原地替换，不会新增一条）。只改称呼也可以直接在上面列表里改。' : 'Editing an existing address.'}</p>}
             <div className="dt-persona-grid">
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '地址称呼' : 'Label'}</span><Input value={addressLabel} onChange={e => setAddressLabel(e.target.value)} data-testid="ambient-address-label-input" placeholder={lang === 'zh' ? '家 / 公司 / 老家…' : 'Home / Office…'} /></label>
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '详细地址（可写到门牌号）' : 'Detailed address'}</span><Input value={addressDraft} onChange={e => { setAddressDraft(e.target.value); setSelectedCity(null) }} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void searchCities() } }} data-testid="ambient-address-input" placeholder={lang === 'zh' ? '上海市徐汇区梅陇十一村46号401' : 'Street address…'} /></label>
             </div>
             <div className="dt-row-buttons">
               <Button variant="outline" disabled={busy || searchingCity || !addressDraft.trim()} onClick={() => { void searchCities() }} data-testid="ambient-search-city-btn">{searchingCity ? (lang === 'zh' ? '解析中…' : 'Resolving…') : (lang === 'zh' ? '🔍 解析所在城市' : '🔍 Resolve city')}</Button>
-              {selectedCity && <Tag tone="success">{lang === 'zh' ? `所在城市：${selectedCity.name}` : `City: ${selectedCity.name}`}</Tag>}
+              {selectedCity && <Tag tone="success">{lang === 'zh' ? `所在城市：${selectedCity.cityName ?? selectedCity.name}` : `City: ${selectedCity.cityName ?? selectedCity.name}`}</Tag>}
               <label className="dt-hint"><input type="checkbox" checked={addressPrimary} onChange={e => setAddressPrimary(e.target.checked)} /> {lang === 'zh' ? '设为主要地址（天气按它的城市）' : 'Make primary (weather city)'}</label>
-              <Button variant="primary" disabled={busy || !addressDraft.trim() || !selectedCity} onClick={() => { void addAddress() }} data-testid="ambient-add-address-btn">{lang === 'zh' ? '➕ 保存这个地址' : '➕ Save address'}</Button>
+              <Button variant="primary" disabled={busy || !addressDraft.trim() || !selectedCity} onClick={() => { void addAddress() }} data-testid="ambient-add-address-btn">{editingAddressId ? (lang === 'zh' ? '💾 保存修改' : '💾 Save changes') : (lang === 'zh' ? '➕ 保存这个地址' : '➕ Save address')}</Button>
+              {editingAddressId && <Button variant="ghost" disabled={busy} onClick={cancelEditAddress} data-testid="ambient-cancel-edit-btn">{lang === 'zh' ? '取消修改' : 'Cancel'}</Button>}
             </div>
             {cityCandidates.length > 0 && (
               <div className="dt-form" data-testid="ambient-city-candidates">
