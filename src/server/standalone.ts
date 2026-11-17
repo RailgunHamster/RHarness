@@ -133,6 +133,7 @@ import {
   parseStickerMarker,
   readStickerFile,
   savePersonaLearning,
+  planNavigation,
   purgeExpiredStickerTrash,
   restoreStickerRecord,
   searchCityCandidates,
@@ -606,6 +607,13 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   const setAmbientConfig = (next: AssistantAmbientConfig): void => {
     if (!runtime) return
     runtime.store.set(KV.ambient.config, normalizeAssistantAmbientConfig(next))
+  }
+  /** Amap key: env `RHARNESS_AMAP_KEY` wins; otherwise the UI-stored key. Never sent back to clients. */
+  const getAmapApiKey = (): string | undefined => {
+    const fromEnv = process.env.RHARNESS_AMAP_KEY?.trim()
+    if (fromEnv) return fromEnv
+    const stored = runtime?.store.get(KV.ambient.amap)?.apiKey?.trim()
+    return stored || undefined
   }
   const getWeatherCache = (): WeatherCache | undefined => runtime?.store.get(KV.ambient.weather)
   const setWeatherCache = (next: WeatherCache): void => { if (runtime) runtime.store.set(KV.ambient.weather, next) }
@@ -1604,6 +1612,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         setWeatherCache,
         getNewsCache,
         setNewsCache,
+        getAmapApiKey,
         getAssistantMessages: () => (runtime ? (runtime.store.get(KV.assistant.messages) ?? []) : []),
         readStoredImageBytes: async part => {
           const p = part as { image?: { id: string; path: string; mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; bytes: number; name?: string }; data?: string }
@@ -2687,7 +2696,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         }
 
         // ---- Personal Assistant Persona / Stickers / Learning / Ambient endpoints (`dsh-assistant-persona`) ----
-        if (sub === 'assistant/persona-state' || sub.startsWith('assistant/stickers') || sub.startsWith('assistant/persona') || sub.startsWith('assistant/ambient')) {
+        if (sub === 'assistant/persona-state' || sub.startsWith('assistant/stickers') || sub.startsWith('assistant/persona') || sub.startsWith('assistant/ambient') || sub.startsWith('assistant/navigation')) {
           if (!isPluginEnabled('dsh-assistant-persona')) { sendJson(res, 404, { error: 'Assistant Persona & Ambient plugin is disabled' }); return }
           const personaStatePayload = () => ({
             config: getPersonaConfig(),
@@ -2695,6 +2704,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             learnings: getPersonaLearnings(),
             stickers: activeStickers(getStickerRecords()).map(s => ({ ...s, feishuImageKey: undefined })),
             stickerTrash: trashedStickers(getStickerRecords()).map(s => ({ ...s, feishuImageKey: undefined, purgeAt: stickerTrashPurgeAt(s) })),
+            amapConfigured: Boolean(getAmapApiKey()),
             ambientConfig: getAmbientConfig(),
             ambient: getAmbientSnapshot(),
             news: getNewsBriefPayload(),
@@ -2872,6 +2882,35 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
               try { setWeatherCache(await fetchWeatherForCity(next.homeCity)) } catch (err) { weatherError = err instanceof Error ? err.message : String(err) }
             }
             sendJson(res, 200, { config: next, ambient: getAmbientSnapshot(), ...(weatherError ? { weatherError } : {}) })
+            return
+          }
+          if ((req.method === 'PUT' || req.method === 'DELETE') && sub === 'assistant/ambient/amap-key') {
+            if (req.method === 'DELETE') {
+              if (runtime) runtime.store.set(KV.ambient.amap, { apiKey: '' })
+              sendJson(res, 200, { amapConfigured: Boolean(process.env.RHARNESS_AMAP_KEY?.trim()) })
+              return
+            }
+            const body = await readJsonBody(req, 16 * 1024) as { apiKey?: unknown }
+            const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
+            if (!apiKey) { sendJson(res, 400, { error: 'apiKey is required' }); return }
+            if (runtime) runtime.store.set(KV.ambient.amap, { apiKey })
+            sendJson(res, 200, { amapConfigured: true })
+            return
+          }
+          if (req.method === 'GET' && sub === 'assistant/navigation/route') {
+            const from = String(url.searchParams.get('from') ?? '').trim() || undefined
+            const to = String(url.searchParams.get('to') ?? '').trim()
+            const modeParam = String(url.searchParams.get('mode') ?? 'driving')
+            const mode = modeParam === 'transit' || modeParam === 'walking' ? modeParam : 'driving'
+            if (!to) { sendJson(res, 400, { error: 'Missing to (destination)' }); return }
+            const result = await planNavigation({
+              ...(from ? { fromText: from } : {}),
+              toText: to,
+              mode,
+              addresses: getAmbientConfig().residentAddresses,
+              ...(getAmapApiKey() ? { amapKey: getAmapApiKey()! } : {}),
+            })
+            sendJson(res, 200, result)
             return
           }
           if (req.method === 'POST' && sub === 'assistant/ambient/refresh') {

@@ -350,6 +350,8 @@ export interface NewsItemInfo { title: string; url: string; source: string; topi
 export interface PersonaAmbientStateInfo {
   config: AssistantPersonaConfigInfo
   presets: PersonaPresetInfo[]
+  /** Whether an Amap (高德) key is configured (the key itself is never returned). */
+  amapConfigured?: boolean
   learnings: PersonaLearningInfo[]
   stickers: StickerInfo[]
   /** Soft-deleted stickers kept restorable for 1 day, then auto-purged server-side. */
@@ -357,6 +359,18 @@ export interface PersonaAmbientStateInfo {
   ambientConfig: AssistantAmbientConfigInfo
   ambient: AmbientSnapshotInfo
   news: { fetchedAt?: string; stale?: boolean; items: NewsItemInfo[] }
+}
+export interface NavigationResultInfo {
+  provider: 'amap' | 'links'
+  mode: 'driving' | 'transit' | 'walking'
+  origin: { label: string; longitude?: number; latitude?: number; cityName?: string }
+  destination: { label: string; longitude?: number; latitude?: number; cityName?: string }
+  distanceKm?: number
+  durationMin?: number
+  durationText?: string
+  steps: string[]
+  links: { amap?: string; baidu: string }
+  note?: string
 }
 export interface AssistantChatBackupInfo {
   id: string

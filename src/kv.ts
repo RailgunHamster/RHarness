@@ -113,6 +113,8 @@ export const KV = {
     config: record<AssistantAmbientConfig>('assistant-ambient-config'),
     weather: record<WeatherCache>('assistant-ambient-weather-cache'),
     news: record<NewsCache>('assistant-ambient-news-cache'),
+    /** Amap (高德) Web-Service key for geocoding + route planning; write-only via REST, never echoed back. */
+    amap: record<{ apiKey: string }>('assistant-ambient-amap'),
   },
   /** ClawFeed External Git-Repo Plugin (`@rharness/plugin-clawfeed`) notification ring buffer. */
   clawfeed: {

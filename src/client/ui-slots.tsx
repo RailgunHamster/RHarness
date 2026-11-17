@@ -20,6 +20,7 @@ import {
   type CityCandidateInfo,
   type ClawFeedItemInfo,
   type Lang,
+  type NavigationResultInfo,
   type LiveSessionRunInfo,
   type MemoryEntryInfo,
   type PendingUserQuestionInfo,
@@ -520,6 +521,12 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
   const [cityCandidates, setCityCandidates] = useState<CityCandidateInfo[]>([])
   const [selectedCity, setSelectedCity] = useState<CityCandidateInfo | null>(null)
   const [searchingCity, setSearchingCity] = useState(false)
+  const [amapKeyDraft, setAmapKeyDraft] = useState('')
+  const [navFrom, setNavFrom] = useState('')
+  const [navTo, setNavTo] = useState('')
+  const [navMode, setNavMode] = useState<'driving' | 'transit' | 'walking'>('driving')
+  const [navResult, setNavResult] = useState<NavigationResultInfo | null>(null)
+  const [navBusy, setNavBusy] = useState(false)
   const [newLearning, setNewLearning] = useState('')
   const [newLearningKind, setNewLearningKind] = useState<PersonaLearningInfo['kind']>('preference')
   const [stickerName, setStickerName] = useState('')
@@ -720,6 +727,33 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       setNotice(lang === 'zh' ? '✅ 感知开关已保存' : '✅ Settings saved')
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
+  const saveAmapKey = async () => {
+    if (!amapKeyDraft.trim()) return
+    setBusy(true); setErr(''); setNotice('')
+    try {
+      const res = await standaloneFetch<{ amapConfigured: boolean }>('assistant/ambient/amap-key', 'PUT', { apiKey: amapKeyDraft.trim() })
+      setState(curr => (curr ? { ...curr, amapConfigured: res.amapConfigured } : curr))
+      setAmapKeyDraft('')
+      setNotice(lang === 'zh' ? '✅ 高德 Key 已保存，导航可直接报时长/路况了' : '✅ Amap key saved')
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const clearAmapKey = async () => {
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<{ amapConfigured: boolean }>('assistant/ambient/amap-key', 'DELETE')
+      setState(curr => (curr ? { ...curr, amapConfigured: res.amapConfigured } : curr))
+      setNotice(lang === 'zh' ? '已清除保存的高德 Key（若设了环境变量 RHARNESS_AMAP_KEY 则仍以它为准）' : 'Amap key cleared')
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const queryNavigation = async () => {
+    if (!navTo.trim()) return
+    setNavBusy(true); setErr('')
+    try {
+      const params = new URLSearchParams({ to: navTo.trim(), mode: navMode, ...(navFrom.trim() ? { from: navFrom.trim() } : {}) })
+      const res = await standaloneFetch<NavigationResultInfo>(`assistant/navigation/route?${params.toString()}`, 'GET')
+      setNavResult(res)
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setNavBusy(false) }
+  }
   const refreshAmbient = async () => {
     setBusy(true); setErr('')
     try {
@@ -888,6 +922,39 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
               <Button variant="primary" disabled={busy} onClick={() => { void saveAmbientToggles() }} data-testid="ambient-save-settings-btn">{lang === 'zh' ? '💾 保存感知开关' : 'Save toggles'}</Button>
               <Button variant="outline" disabled={busy} onClick={() => { void refreshAmbient() }}>{lang === 'zh' ? '↻ 立即刷新天气与新闻' : 'Refresh now'}</Button>
             </div>
+            <strong>{lang === 'zh' ? '🧭 导航与路线（高德）' : '🧭 Navigation (Amap)'}</strong>
+            <div className="dt-persona-grid">
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '高德地图 Key（Web 服务）' : 'Amap API key'}</span><Input type="password" value={amapKeyDraft} onChange={e => setAmapKeyDraft(e.target.value)} data-testid="amap-key-input" placeholder={state.amapConfigured ? (lang === 'zh' ? '已配置（输入可覆盖）' : 'Configured') : (lang === 'zh' ? '未配置：填入后助理能直接报时长/路况' : 'Not configured')} /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '状态' : 'Status'}</span><span>{state.amapConfigured ? <Tag tone="success">{lang === 'zh' ? '已配置 · 路线数据可用' : 'Configured'}</Tag> : <Tag tone="neutral">{lang === 'zh' ? '未配置 · 仅导航链接' : 'Links only'}</Tag>}</span></label>
+            </div>
+            <p className="dt-hint">{lang === 'zh' ? '在 lbs.amap.com 免费申请「Web 服务」Key 后填入（个人额度足够）。配置后：助理可直接回答「我回家要多久」并给实时路况时长；地址解析也升级为高德门牌级定位。未配置时导航自动降级为高德/百度跳转链接。Key 只保存在本机、不会回显；查询路线时会把起终点地址发给高德。' : 'Get a free Amap Web-Service key at lbs.amap.com. Without one, navigation falls back to map links.'}</p>
+            <div className="dt-row-buttons">
+              <Button variant="primary" disabled={busy || !amapKeyDraft.trim()} onClick={() => { void saveAmapKey() }} data-testid="amap-key-save-btn">{lang === 'zh' ? '💾 保存 Key' : 'Save key'}</Button>
+              <Button variant="ghost" disabled={busy} onClick={() => { void clearAmapKey() }} data-testid="amap-key-clear-btn">{lang === 'zh' ? '清除' : 'Clear'}</Button>
+            </div>
+            <div className="dt-persona-grid">
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '起点（默认主要地址）' : 'From'}</span><Input value={navFrom} onChange={e => setNavFrom(e.target.value)} data-testid="nav-from-input" placeholder={(state.ambientConfig.residentAddresses ?? []).map(a => a.label).join(' / ') || (lang === 'zh' ? '家 / 公司 / 任意地址' : 'Home / Office / address')} /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '终点' : 'To'}</span><Input value={navTo} onChange={e => setNavTo(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void queryNavigation() } }} data-testid="nav-to-input" placeholder={lang === 'zh' ? '目的地：地址、地点名或 家/公司' : 'Destination'} /></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '出行方式' : 'Mode'}</span><select className="dt-select" value={navMode} onChange={e => setNavMode(e.target.value as 'driving' | 'transit' | 'walking')} data-testid="nav-mode-select"><option value="driving">🚗 驾车（含实时路况）</option><option value="transit">🚇 公交/地铁</option><option value="walking">🚶 步行</option></select></label>
+            </div>
+            <div className="dt-row-buttons">
+              <Button variant="primary" disabled={navBusy || !navTo.trim()} onClick={() => { void queryNavigation() }} data-testid="nav-query-btn">{navBusy ? (lang === 'zh' ? '规划中…' : 'Planning…') : (lang === 'zh' ? '🧭 查询路线' : '🧭 Plan route')}</Button>
+            </div>
+            {navResult && (
+              <div className="dt-ambient-card" data-testid="nav-result">
+                <strong>{navResult.origin.label} → {navResult.destination.label}{navResult.distanceKm !== undefined ? ` · ${navResult.distanceKm} km` : ''}{navResult.durationText ? ` · ${navResult.durationText}` : ''}</strong>
+                {navResult.note && <span className="dt-hint">{navResult.note}</span>}
+                {navResult.steps.length > 0 && (
+                  <ol className="dt-news-list">
+                    {navResult.steps.map((s, i) => <li key={i} className="dt-news-item"><span>{s}</span></li>)}
+                  </ol>
+                )}
+                <div className="dt-row-buttons">
+                  {navResult.links.amap && <a className="dt-pill" href={navResult.links.amap} target="_blank" rel="noreferrer" data-testid="nav-link-amap">{lang === 'zh' ? '📍 高德地图导航' : 'Amap'}</a>}
+                  <a className="dt-pill" href={navResult.links.baidu} target="_blank" rel="noreferrer" data-testid="nav-link-baidu">{lang === 'zh' ? '📍 百度地图导航' : 'Baidu'}</a>
+                </div>
+              </div>
+            )}
             <strong>{lang === 'zh' ? '📰 最近新闻缓存（问助理「最近有什么新闻」也会用这份）' : '📰 Cached headlines'}</strong>
             {state.news.items.length === 0 ? <p className="dt-hint">{lang === 'zh' ? '暂无缓存，点击「立即刷新」拉取。' : 'No cached news yet.'}</p> : (
               <div className="dt-news-list">

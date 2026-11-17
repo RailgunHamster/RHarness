@@ -22,8 +22,12 @@ import {
   extractPersonaLearningFromUserMessage,
   fetchWeatherForCity,
   findSticker,
+  buildAmapNavigationUrl,
+  buildBaiduNavigationUrl,
   cityQueryVariants,
+  formatDurationZh,
   formatLunarDate,
+  planNavigation,
   geocodeCity,
   getNewsBrief,
   searchCityCandidates,
@@ -263,6 +267,53 @@ describe('ambient awareness', () => {
     expect(section).toContain('主要')
   })
 
+  it('plans navigation with Amap when a key exists and degrades to map links without one', async () => {
+    expect(formatDurationZh(25)).toBe('约 25 分钟')
+    expect(formatDurationZh(95)).toBe('约 1 小时 35 分钟')
+    const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
+    const beijing = { name: '北京', latitude: 39.9, longitude: 116.4, timezone: 'Asia/Shanghai' }
+    let cfg = upsertResidentAddress(defaultAssistantAmbientConfig(), { label: '家', address: '上海市徐汇区梅陇十一村46号401', city: shanghai }).config
+    cfg = upsertResidentAddress(cfg, { label: '公司', address: '北京市海淀区中关村大街1号', city: beijing }).config
+    const fetcher = vi.fn(async (url: string) => {
+      if (url.includes('geocode/geo')) {
+        const address = new URL(url).searchParams.get('address') ?? ''
+        const location = address.includes('徐汇') ? '121.42,31.19' : '116.40,39.99'
+        return new Response(JSON.stringify({ status: '1', geocodes: [{ location, formatted_address: address, city: '上海市' }] }), { status: 200 })
+      }
+      if (url.includes('direction/driving')) {
+        return new Response(JSON.stringify({ status: '1', route: { paths: [{ distance: '12500', duration: '1800', steps: [{ instruction: '沿沪闵路向北行驶' }, { instruction: '到达目的地' }] }] } }), { status: 200 })
+      }
+      if (url.includes('direction/transit')) {
+        return new Response(JSON.stringify({ status: '1', route: { transits: [{ distance: '9800', duration: '2400', segments: [{ walking: { distance: '300' }, bus: { buslines: [{ name: '地铁1号线', departure_stop: { name: '徐家汇' }, arrival_stop: { name: '人民广场' } }] } }] }] } }), { status: 200 })
+      }
+      // Open-Meteo city-candidate fallback (no-key path): no hits in this mock.
+      return new Response(JSON.stringify({ results: [] }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const driving = await planNavigation({ toText: '公司', mode: 'driving', addresses: cfg.residentAddresses, amapKey: 'test-key', fetcher })
+    expect(driving.provider).toBe('amap')
+    expect(driving.origin.label).toBe('家')
+    expect(driving.destination.label).toBe('公司')
+    expect(driving.distanceKm).toBe(12.5)
+    expect(driving.durationText).toBe('约 30 分钟')
+    expect(driving.steps[0]).toContain('沪闵路')
+    expect(driving.links.amap).toContain('uri.amap.com/navigation')
+    expect(driving.links.baidu).toContain('api.map.baidu.com/direction')
+
+    const transit = await planNavigation({ fromText: '家', toText: '市中心', mode: 'transit', addresses: cfg.residentAddresses, amapKey: 'test-key', fetcher })
+    expect(transit.provider).toBe('amap')
+    expect(transit.steps.join(' ')).toContain('地铁1号线')
+
+    // No key: still returns tappable links from saved city coordinates, with an explanatory note.
+    const linksOnly = await planNavigation({ toText: '公司', mode: 'driving', addresses: cfg.residentAddresses, fetcher })
+    expect(linksOnly.provider).toBe('links')
+    expect(linksOnly.durationText).toBeUndefined()
+    expect(linksOnly.note).toContain('高德地图 Key')
+    expect(linksOnly.links.amap).toContain('uri.amap.com')
+    expect(buildBaiduNavigationUrl('家', '公司', 'transit', '上海')).toContain('mode=transit')
+    expect(buildAmapNavigationUrl({ label: '家' }, { label: '公司', longitude: 116.4, latitude: 39.9 }, 'driving')).toBeUndefined()
+  })
+
   it('parses RSS and builds a topic brief', () => {
     const xml = '<rss><channel><item><title><![CDATA[AI 新进展]]></title><link>https://example.com/a</link><pubDate>Mon, 17 Nov 2026 08:00:00 GMT</pubDate></item><item><title>芯片发布</title><link>https://example.com/b</link></item></channel></rss>'
     const items = parseRssItems(xml, 'AI', 'TestSource')
@@ -351,6 +402,17 @@ describe('persona workbench UI', () => {
           ambientConfig: defaultAssistantAmbientConfig(),
           ambient: buildAmbientSnapshot(defaultAssistantAmbientConfig(), undefined, new Date('2026-11-17T10:00:00+08:00')),
           news: { items: [{ title: '测试新闻头条', url: 'https://example.com/news', source: 'Test', topic: '科技' }] },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.includes('navigation/route')) {
+        return new Response(JSON.stringify({
+          provider: 'amap', mode: 'driving',
+          origin: { label: '家', longitude: 121.42, latitude: 31.19 },
+          destination: { label: '公司', longitude: 116.4, latitude: 39.99 },
+          distanceKm: 12.5, durationMin: 25, durationText: '约 25 分钟',
+          steps: ['沿沪闵路向北行驶', '到达目的地'],
+          links: { amap: 'https://uri.amap.com/navigation?from=a&to=b&mode=car', baidu: 'https://api.map.baidu.com/direction?origin=a&destination=b' },
+          note: '驾车路线（高德，含实时路况）：家 → 公司',
         }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
       if (url.includes('ambient/geocode')) {
@@ -529,5 +591,18 @@ describe('persona workbench UI', () => {
     expect(rows[0]!.textContent).toContain('徐汇区')
     expect(rows[0]!.textContent).toContain('主要')
     expect(container.querySelector('[data-testid="ambient-city-candidates"]')).toBeNull()
+
+    // Navigation panel: query a route and render duration + map links.
+    expect(page.querySelector('[data-testid="amap-key-input"]')).not.toBeNull()
+    const toInput = page.querySelector<HTMLInputElement>('[data-testid="nav-to-input"]')!
+    await setInput(toInput, '公司')
+    const queryBtn = page.querySelector<HTMLButtonElement>('[data-testid="nav-query-btn"]')!
+    await act(async () => { queryBtn.click(); await new Promise(r => setTimeout(r, 30)) })
+    const result = container.querySelector('[data-testid="nav-result"]')!
+    expect(result).not.toBeNull()
+    expect(result.textContent).toContain('约 25 分钟')
+    expect(result.textContent).toContain('沪闵路')
+    expect(result.querySelector<HTMLAnchorElement>('[data-testid="nav-link-amap"]')!.href).toContain('uri.amap.com')
+    expect(result.querySelector<HTMLAnchorElement>('[data-testid="nav-link-baidu"]')!.href).toContain('map.baidu.com')
   })
 })

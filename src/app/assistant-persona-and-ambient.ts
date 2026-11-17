@@ -468,7 +468,7 @@ export function buildPersonaPromptSection(
   const learned = buildPersonaLearningPromptSummary(learnings)
   if (learned) lines.push('', '### 已学会的相处默契（自动学习生效中，用户可在面板增删）', learned)
   lines.push('', '### 语气示例（学习分寸，不要照抄）', ...PRESET_FEW_SHOT[config.presetId].map(s => `- ${s}`))
-  lines.push('- 管理接口：用户让你增删表情包/学习条目/改常驻城市或人设时，直接调用 sticker_*、persona_learning_*、persona_*、ambient_* 工具执行，不要只口头答应。')
+  lines.push('- 管理接口：用户让你增删表情包/学习条目/改常驻城市或人设时，直接调用 sticker_*、persona_learning_*、persona_*、ambient_* 工具执行，不要只口头答应。用户问路线/通勤时长/怎么走（「我回家要多久」「去公司怎么走」）时调用 `navigation_route`（起点默认主要常驻地址，可传 家/公司 等标签），把时长、距离和导航链接一起给到，不要凭感觉估路程时间。')
   return lines.join('\n')
 }
 
@@ -983,6 +983,205 @@ export function getNewsBrief(cache: NewsCache | undefined, topic?: string, limit
 }
 
 // ============================================================================
+// Navigation (Amap route planning + map deep links, resident-address aware)
+// ============================================================================
+
+export type NavigationMode = 'driving' | 'transit' | 'walking'
+
+export interface NavigationPoint { label: string; longitude?: number; latitude?: number; cityName?: string }
+
+export interface NavigationResult {
+  provider: 'amap' | 'links'
+  mode: NavigationMode
+  origin: NavigationPoint
+  destination: NavigationPoint
+  distanceKm?: number
+  durationMin?: number
+  durationText?: string
+  steps: string[]
+  links: { amap?: string; baidu: string }
+  note?: string
+}
+
+export function formatDurationZh(totalMinutes: number): string {
+  const min = Math.max(1, Math.round(totalMinutes))
+  if (min < 60) return `约 ${min} 分钟`
+  const h = Math.floor(min / 60)
+  const rest = min % 60
+  return rest > 0 ? `约 ${h} 小时 ${rest} 分钟` : `约 ${h} 小时`
+}
+
+const NAV_MODE_LABEL: Record<NavigationMode, string> = { driving: '驾车', transit: '公交/地铁', walking: '步行' }
+
+export function buildAmapNavigationUrl(origin: NavigationPoint, destination: NavigationPoint, mode: NavigationMode): string | undefined {
+  if (origin.longitude === undefined || origin.latitude === undefined || destination.longitude === undefined || destination.latitude === undefined) return undefined
+  const modeParam = mode === 'driving' ? 'car' : mode === 'transit' ? 'bus' : 'walk'
+  const from = `${origin.longitude},${origin.latitude},${encodeURIComponent(origin.label)}`
+  const to = `${destination.longitude},${destination.latitude},${encodeURIComponent(destination.label)}`
+  return `https://uri.amap.com/navigation?from=${from}&to=${to}&mode=${modeParam}&policy=1&src=rharness&coordinate=gaode&callnative=1`
+}
+
+export function buildBaiduNavigationUrl(originText: string | undefined, destinationText: string, mode: NavigationMode, region?: string): string {
+  const modeParam = mode === 'driving' ? 'driving' : mode === 'transit' ? 'transit' : 'walking'
+  const params = new URLSearchParams({
+    ...(originText ? { origin: originText } : {}),
+    destination: destinationText,
+    mode: modeParam,
+    ...(region ? { region } : {}),
+    output: 'html',
+    src: 'rharness',
+  })
+  return `https://api.map.baidu.com/direction?${params.toString()}`
+}
+
+interface AmapGeocodeHit { longitude: number; latitude: number; formattedAddress: string; city?: string }
+
+export async function geocodeWithAmap(address: string, apiKey: string, fetcher: FetchFn = fetch): Promise<AmapGeocodeHit | undefined> {
+  const res = await fetcher(`https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(apiKey)}&address=${encodeURIComponent(address)}`, { signal: AbortSignal.timeout(10_000) })
+  if (!res.ok) return undefined
+  const data = (await res.json()) as { status?: string; geocodes?: { location?: string; formatted_address?: string; city?: string | string[] }[] }
+  if (data.status !== '1') return undefined
+  const hit = data.geocodes?.[0]
+  const [lon, lat] = (hit?.location ?? '').split(',').map(Number)
+  if (!hit || !Number.isFinite(lon) || !Number.isFinite(lat)) return undefined
+  return { longitude: lon!, latitude: lat!, formattedAddress: hit.formatted_address ?? address, ...(typeof hit.city === 'string' && hit.city ? { city: hit.city } : {}) }
+}
+
+/** Amap direction planning (driving is traffic-aware). Throws Error(info) on API-level failures. */
+export async function planRouteWithAmap(input: {
+  origin: { longitude: number; latitude: number }
+  destination: { longitude: number; latitude: number }
+  mode: NavigationMode
+  originCity?: string
+  apiKey: string
+  fetcher?: FetchFn
+}): Promise<{ distanceKm: number; durationMin: number; steps: string[] }> {
+  const fetcher = input.fetcher ?? fetch
+  const origin = `${input.origin.longitude},${input.origin.latitude}`
+  const destination = `${input.destination.longitude},${input.destination.latitude}`
+  const key = encodeURIComponent(input.apiKey)
+  if (input.mode === 'transit') {
+    const city = encodeURIComponent((input.originCity ?? '').replace(/市$/, '') || '上海')
+    const res = await fetcher(`https://restapi.amap.com/v3/direction/transit/integrated?key=${key}&origin=${origin}&destination=${destination}&city=${city}&extensions=base`, { signal: AbortSignal.timeout(12_000) })
+    const data = (await res.json()) as { status?: string; info?: string; route?: { transits?: { distance?: string; duration?: string; segments?: { bus?: { buslines?: { name?: string; departure_stop?: { name?: string }; arrival_stop?: { name?: string } }[] }; walking?: { distance?: string } }[] }[] } }
+    if (data.status !== '1') throw new Error(`Amap transit failed: ${data.info ?? 'unknown'}`)
+    const best = data.route?.transits?.[0]
+    if (!best) throw new Error('Amap transit returned no route')
+    const steps: string[] = []
+    for (const seg of best.segments ?? []) {
+      const walkM = Number(seg.walking?.distance ?? 0)
+      if (walkM > 30) steps.push(`步行约 ${Math.round(walkM)} 米`)
+      const line = seg.bus?.buslines?.[0]
+      if (line?.name) steps.push(`乘坐 ${line.name}：${line.departure_stop?.name ?? ''} → ${line.arrival_stop?.name ?? ''}`)
+    }
+    return { distanceKm: Number(best.distance ?? 0) / 1000, durationMin: Number(best.duration ?? 0) / 60, steps: steps.slice(0, 10) }
+  }
+  const kind = input.mode === 'walking' ? 'walking' : 'driving'
+  const res = await fetcher(`https://restapi.amap.com/v3/direction/${kind}?key=${key}&origin=${origin}&destination=${destination}&extensions=base`, { signal: AbortSignal.timeout(12_000) })
+  const data = (await res.json()) as { status?: string; info?: string; route?: { paths?: { distance?: string; duration?: string; steps?: { instruction?: string }[] }[] } }
+  if (data.status !== '1') throw new Error(`Amap ${kind} failed: ${data.info ?? 'unknown'}`)
+  const best = data.route?.paths?.[0]
+  if (!best) throw new Error(`Amap ${kind} returned no route`)
+  return {
+    distanceKm: Number(best.distance ?? 0) / 1000,
+    durationMin: Number(best.duration ?? 0) / 60,
+    steps: (best.steps ?? []).map(s => s.instruction ?? '').filter(Boolean).slice(0, 8),
+  }
+}
+
+/**
+ * End-to-end navigation orchestration shared by the Assistant tool and the Web UI:
+ * resolves endpoints from resident addresses (label match → detailed address geocode →
+ * city-level coordinates), plans with Amap when a key is configured, and always returns
+ * map deep links so the user can jump into a maps app either way.
+ */
+export async function planNavigation(input: {
+  fromText?: string
+  toText: string
+  mode?: NavigationMode
+  addresses: readonly ResidentAddress[]
+  amapKey?: string
+  fetcher?: FetchFn
+}): Promise<NavigationResult> {
+  const fetcher = input.fetcher ?? fetch
+  const mode: NavigationMode = input.mode ?? 'driving'
+  const resolveEndpoint = async (text: string | undefined, role: 'origin' | 'destination'): Promise<{ point: NavigationPoint; addressText: string }> => {
+    const t = (text ?? '').trim()
+    const primary = input.addresses.find(a => a.isPrimary) ?? input.addresses[0]
+    if (!t && role === 'origin' && primary) {
+      const base: NavigationPoint = { label: primary.label, longitude: primary.city.longitude, latitude: primary.city.latitude, cityName: primary.city.name }
+      if (input.amapKey) {
+        const geo = await geocodeWithAmap(primary.address, input.amapKey, fetcher).catch(() => undefined)
+        if (geo) return { point: { ...base, longitude: geo.longitude, latitude: geo.latitude }, addressText: primary.address }
+      }
+      return { point: base, addressText: primary.address }
+    }
+    const matched = t
+      ? input.addresses.find(a => a.label === t || a.label.includes(t) || a.address.includes(t))
+      : undefined
+    if (matched) {
+      const base: NavigationPoint = { label: matched.label, longitude: matched.city.longitude, latitude: matched.city.latitude, cityName: matched.city.name }
+      if (input.amapKey) {
+        const geo = await geocodeWithAmap(matched.address, input.amapKey, fetcher).catch(() => undefined)
+        if (geo) return { point: { ...base, longitude: geo.longitude, latitude: geo.latitude }, addressText: matched.address }
+      }
+      return { point: base, addressText: matched.address }
+    }
+    const label = t || (role === 'origin' ? '起点' : '目的地')
+    if (input.amapKey && t) {
+      const geo = await geocodeWithAmap(t, input.amapKey, fetcher).catch(() => undefined)
+      if (geo) return { point: { label, longitude: geo.longitude, latitude: geo.latitude, ...(geo.city ? { cityName: geo.city } : {}) }, addressText: t }
+    }
+    if (t) {
+      const candidate = (await searchCityCandidates(t, fetcher).catch(() => []))[0]
+      if (candidate) return { point: { label, longitude: candidate.longitude, latitude: candidate.latitude, cityName: candidate.name }, addressText: t }
+    }
+    return { point: { label }, addressText: t }
+  }
+  const origin = await resolveEndpoint(input.fromText, 'origin')
+  const destination = await resolveEndpoint(input.toText, 'destination')
+  const links = {
+    ...(buildAmapNavigationUrl(origin.point, destination.point, mode) ? { amap: buildAmapNavigationUrl(origin.point, destination.point, mode)! } : {}),
+    baidu: buildBaiduNavigationUrl(origin.addressText || undefined, destination.addressText, mode, destination.point.cityName ?? origin.point.cityName),
+  }
+  const base: NavigationResult = { provider: 'links', mode, origin: origin.point, destination: destination.point, steps: [], links }
+  if (!input.amapKey) {
+    return { ...base, note: '尚未配置高德地图 Key，暂时只能提供导航链接（点开直接跳地图 App）。配置后助理可直接报距离、时长与实时路况。' }
+  }
+  if (origin.point.longitude === undefined || destination.point.longitude === undefined) {
+    return { ...base, note: '有一端地址没能定位到坐标，先给导航链接；把地址写得更完整（带城市名）会更准。' }
+  }
+  const originLon = origin.point.longitude
+  const originLat = origin.point.latitude
+  const destLon = destination.point.longitude
+  const destLat = destination.point.latitude
+  if (originLon === undefined || originLat === undefined || destLon === undefined || destLat === undefined) {
+    return { ...base, note: '有一端地址没能定位到坐标，先给导航链接；把地址写得更完整（带城市名）会更准。' }
+  }
+  try {
+    const route = await planRouteWithAmap({
+      origin: { longitude: originLon, latitude: originLat },
+      destination: { longitude: destLon, latitude: destLat },
+      mode,
+      ...(origin.point.cityName ? { originCity: origin.point.cityName } : {}),
+      apiKey: input.amapKey,
+      fetcher,
+    })
+    return {
+      ...base,
+      provider: 'amap',
+      distanceKm: Math.round(route.distanceKm * 10) / 10,
+      durationMin: Math.round(route.durationMin),
+      durationText: formatDurationZh(route.durationMin),
+      steps: route.steps,
+      note: `${NAV_MODE_LABEL[mode]}路线（高德${mode === 'driving' ? '，含实时路况' : ''}）：${origin.point.label} → ${destination.point.label}`,
+    }
+  } catch (err) {
+    return { ...base, note: `高德路线规划暂时失败（${err instanceof Error ? err.message : String(err)}），先用导航链接打开地图查看。` }
+  }
+}
+
+// ============================================================================
 // Assistant-only tools
 // ============================================================================
 
@@ -1003,6 +1202,8 @@ export interface PersonaAmbientToolDeps {
   /** Reads stored assistant messages (for sticker_add_from_message). Content parts use StoredPanelContent shape. */
   getAssistantMessages: () => readonly { id: string; bot?: boolean; at: string; content?: readonly unknown[] }[]
   readStoredImageBytes: (imagePart: unknown) => Promise<Buffer | undefined>
+  /** Amap (高德) Web-Service key for navigation; when unset, navigation degrades to map deep links. */
+  getAmapApiKey?: () => string | undefined
 }
 
 export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps): RegisteredToolSpec[] {
@@ -1042,6 +1243,11 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     make_primary: z.boolean().optional().describe('Make this the primary address (weather baseline city)'),
   })
   const ambientDeleteAddressSchema = z.object({ id_or_label: z.string().min(1) })
+  const navigationRouteSchema = z.object({
+    from: z.string().optional().describe('Origin: a saved address label （家/公司）, a detailed address, or a place name. Defaults to the primary resident address.'),
+    to: z.string().min(1).describe('Destination: address label, detailed address, or place name'),
+    mode: z.enum(['driving', 'transit', 'walking']).optional().describe('Travel mode, default driving'),
+  })
   const weatherQuerySchema = z.object({ city: z.string().optional().describe('City name. Defaults to the configured home city.') })
   const newsBriefSchema = z.object({ topic: z.string().optional().describe('综合 / 科技 / AI / 财经. Defaults to 综合.') })
 
@@ -1258,6 +1464,24 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         const next = removeResidentAddress(cfg, matches[0]!.id)
         deps.setAmbientConfig(next)
         return { ok: true, deleted: { id: matches[0]!.id, label: matches[0]!.label }, addresses: next.residentAddresses, homeCity: next.homeCity }
+      },
+    },
+    {
+      name: 'navigation_route',
+      description: 'Plan a route and (when an Amap key is configured) report distance, duration (traffic-aware for driving) and step summary; always returns Amap/Baidu navigation deep links the user can tap to start navigating. Origin defaults to the primary resident address; origin/destination may be saved address labels （家/公司）, detailed addresses, or place names. Use for "我回家要多久", "去X怎么走", "导航去X".',
+      parameters: z.toJSONSchema(navigationRouteSchema),
+      execute: async (raw: unknown) => {
+        guard()
+        const args = navigationRouteSchema.parse(raw ?? {})
+        const cfg = deps.getAmbientConfig()
+        const result = await planNavigation({
+          ...(args.from ? { fromText: args.from } : {}),
+          toText: args.to,
+          ...(args.mode ? { mode: args.mode } : {}),
+          addresses: cfg.residentAddresses,
+          ...(deps.getAmapApiKey?.() ? { amapKey: deps.getAmapApiKey() } : {}),
+        })
+        return { ok: true, ...result }
       },
     },
     {

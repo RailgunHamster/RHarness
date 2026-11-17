@@ -1046,7 +1046,7 @@ export function buildPluginCatalog(input: {
       enabled: isEnabled('dsh-assistant-persona'),
       canToggle: true,
       roles: ['assistant', 'ui-slot'],
-      tools: ['persona_get', 'persona_update', 'sticker_list', 'sticker_add_from_message', 'sticker_delete', 'sticker_restore', 'sticker_update', 'persona_learning_list', 'persona_learning_add', 'persona_learning_delete', 'ambient_get', 'ambient_set_home_city', 'ambient_save_address', 'ambient_delete_address', 'weather_query', 'news_brief'],
+      tools: ['persona_get', 'persona_update', 'sticker_list', 'sticker_add_from_message', 'sticker_delete', 'sticker_restore', 'sticker_update', 'persona_learning_list', 'persona_learning_add', 'persona_learning_delete', 'ambient_get', 'ambient_set_home_city', 'ambient_save_address', 'ambient_delete_address', 'navigation_route', 'weather_query', 'news_brief'],
       promptSection: 'rharness-assistant-persona-ambient',
       uiSlot: '顶栏「记忆与知识库」→ 🎭 人设·表情·城市 子标签页（个人助理标题栏亦有快捷入口）',
       stats: {
