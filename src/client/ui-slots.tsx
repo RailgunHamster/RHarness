@@ -518,12 +518,13 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
   const [stickerName, setStickerName] = useState('')
   const [stickerTags, setStickerTags] = useState('')
   const stickerFileRef = useRef<HTMLInputElement>(null)
+  const [stickerFolderInput, setStickerFolderInput] = useState<HTMLInputElement | null>(null)
 
   const load = async () => {
     setBusy(true); setErr('')
     try {
       const res = await standaloneFetch<PersonaAmbientStateInfo>('assistant/persona-state', 'GET')
-      setState(res)
+      setState({ ...res, stickerTrash: res.stickerTrash ?? [] })
       setDraftConfig(res.config)
       setCityDraft(res.ambientConfig.homeCity.name)
       onAmbientChanged?.(res.ambient)
@@ -543,29 +544,86 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       setNotice(lang === 'zh' ? '✅ 人设已保存，下一回合生效' : '✅ Persona saved')
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
-  const uploadStickers = async (files: File[]) => {
+  const STICKER_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif'])
+  const isStickerImageFile = (file: File): boolean => {
+    if (file.name.startsWith('.')) return false
+    const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
+    return STICKER_IMAGE_EXTS.has(ext) || file.type.startsWith('image/')
+  }
+  /**
+   * Batch upload used by both the multi-file picker and the whole-folder picker.
+   * In folder mode it scans recursively (the browser flattens the tree into `files` with
+   * `webkitRelativePath`), names each sticker after its file, tags it with its parent folder,
+   * and skips non-image / >8MiB / duplicate files instead of aborting the whole batch.
+   */
+  const uploadStickers = async (files: File[], opts?: { fromFolder?: boolean }) => {
     if (!files.length) return
+    const fromFolder = Boolean(opts?.fromFolder)
+    const skippedNonImage = fromFolder ? files.filter(f => !isStickerImageFile(f)).length : 0
+    const candidates = fromFolder ? files.filter(isStickerImageFile) : files
+    if (!candidates.length) {
+      setNotice(lang === 'zh' ? '这个文件夹里没扫到图片文件（支持 PNG / JPG / WebP / GIF）' : 'No image files found in that folder')
+      return
+    }
+    setBusy(true); setErr(''); setNotice('')
+    let added = 0
+    let duplicated = 0
+    let oversized = 0
+    let failed = 0
+    const seenIds = new Set((state?.stickers ?? []).map(s => s.id))
+    const baseTags = stickerTags.split(/[,，、\s]+/).map(s => s.trim()).filter(Boolean)
+    try {
+      for (const file of candidates) {
+        if (file.size > 8 * 1024 * 1024) { oversized++; continue }
+        try {
+          const loaded = await readAssistantImageFile(file)
+          const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+          const parts = rel.split('/').filter(Boolean)
+          const fileBase = (parts[parts.length - 1] ?? file.name).replace(/\.[^.]+$/, '') || '未命名表情'
+          const parentFolder = fromFolder && parts.length > 1 ? parts[parts.length - 2]! : ''
+          const res = await standaloneFetch<{ sticker: StickerInfo; stickers: StickerInfo[]; stickerTrash: StickerInfo[] }>('assistant/stickers', 'POST', {
+            dataBase64: loaded.data,
+            name: fromFolder ? fileBase.slice(0, 40) : (stickerName.trim() || fileBase),
+            tags: [...new Set([...baseTags, ...(parentFolder ? [parentFolder.slice(0, 20)] : [])])],
+          })
+          if (seenIds.has(res.sticker.id)) duplicated++
+          else { added++; seenIds.add(res.sticker.id) }
+          setState(curr => (curr ? { ...curr, stickers: res.stickers, stickerTrash: res.stickerTrash ?? curr.stickerTrash } : curr))
+        } catch { failed++ }
+      }
+    } finally { setBusy(false) }
+    if (!fromFolder) { setStickerName(''); setStickerTags('') }
+    const summary = [
+      lang === 'zh' ? `✅ 成功加入 ${added} 张` : `✅ Added ${added}`,
+      duplicated ? (lang === 'zh' ? `重复跳过 ${duplicated} 张` : `${duplicated} duplicates skipped`) : '',
+      oversized ? (lang === 'zh' ? `超过 8MiB 跳过 ${oversized} 张` : `${oversized} over 8MiB skipped`) : '',
+      skippedNonImage ? (lang === 'zh' ? `非图片跳过 ${skippedNonImage} 个` : `${skippedNonImage} non-images skipped`) : '',
+      failed ? (lang === 'zh' ? `失败 ${failed} 张` : `${failed} failed`) : '',
+    ].filter(Boolean).join(' · ')
+    setNotice(added > 0 ? `${summary}${lang === 'zh' ? '，助理闲聊时就能发啦（GIF 动图原样保留）' : ''}` : summary)
+  }
+  /** Soft-delete into the 1-day trash (restorable); the file is only removed after 24h or via permanent delete. */
+  const deleteSticker = async (s: StickerInfo) => {
     setBusy(true); setErr(''); setNotice('')
     try {
-      for (const file of files) {
-        const loaded = await readAssistantImageFile(file)
-        const res = await standaloneFetch<{ stickers: StickerInfo[] }>('assistant/stickers', 'POST', {
-          dataBase64: loaded.data,
-          name: stickerName.trim() || file.name.replace(/\.[^.]+$/, '') || '未命名表情',
-          tags: stickerTags.split(/[,，、\s]+/).map(s => s.trim()).filter(Boolean),
-        })
-        setState(curr => (curr ? { ...curr, stickers: res.stickers } : curr))
-      }
-      setStickerName(''); setStickerTags('')
-      setNotice(lang === 'zh' ? '✅ 表情包已加入图库，助理闲聊时就能发啦' : '✅ Sticker added')
+      const res = await standaloneFetch<{ stickers: StickerInfo[]; stickerTrash: StickerInfo[] }>(`assistant/stickers/${encodeURIComponent(s.id)}`, 'DELETE')
+      setState(curr => (curr ? { ...curr, stickers: res.stickers, stickerTrash: res.stickerTrash ?? curr.stickerTrash } : curr))
+      setNotice(lang === 'zh' ? `🗑 「${s.name}」已移入回收站，1 天内可恢复，过期自动彻底删除` : 'Moved to the 1-day trash')
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
-  const deleteSticker = async (s: StickerInfo) => {
+  const restoreSticker = async (s: StickerInfo) => {
     setBusy(true); setErr('')
     try {
-      const res = await standaloneFetch<{ stickers: StickerInfo[] }>(`assistant/stickers/${encodeURIComponent(s.id)}`, 'DELETE')
+      const res = await standaloneFetch<{ stickers: StickerInfo[]; stickerTrash: StickerInfo[] }>(`assistant/stickers/${encodeURIComponent(s.id)}/restore`, 'POST', {})
+      setState(curr => (curr ? { ...curr, stickers: res.stickers, stickerTrash: res.stickerTrash ?? curr.stickerTrash } : curr))
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
+  }
+  const permanentlyDeleteSticker = async (s: StickerInfo) => {
+    setBusy(true); setErr('')
+    try {
+      const res = await standaloneFetch<{ stickers: StickerInfo[]; stickerTrash: StickerInfo[] }>(`assistant/stickers/${encodeURIComponent(s.id)}/permanent`, 'DELETE')
       stickerObjectUrlCache.delete(s.id)
-      setState(curr => (curr ? { ...curr, stickers: res.stickers } : curr))
+      setState(curr => (curr ? { ...curr, stickers: res.stickers, stickerTrash: res.stickerTrash ?? curr.stickerTrash } : curr))
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
   const saveStickerMeta = async (s: StickerInfo, patch: Partial<StickerInfo>) => {
@@ -651,13 +709,17 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
           </div>
         ) : tab === 'stickers' ? (
           <div className="dt-form" data-testid="sticker-gallery-panel">
-            <p className="dt-hint">{lang === 'zh' ? '你上传的表情包保存在 ~/.rharness/stickers/。也可以在对话里给助理发一张图说「存为表情包」，或让它删除/改名；助理发表情包时 Web 会显示图片、飞书会发真实图片消息。' : 'Upload stickers, or ask the Assistant in chat to save/delete them.'}</p>
+            <p className="dt-hint">{lang === 'zh' ? '你上传的表情包保存在 ~/.rharness/stickers/，支持 PNG / JPG / WebP / GIF（动图原样保留）。点「📁 上传整个文件夹」会递归扫描文件夹里所有图片：每张以文件名命名、自动带上所在子文件夹名作标签，重复图自动跳过；上传完在这儿删多余的就行——删除先进回收站保留 1 天可恢复，过期自动彻底清除。也可以在对话里给助理发图说「存为表情包」，或让它恢复/删除。' : 'Upload single images or a whole folder (recursive scan). Deletes go to a 1-day trash first.'}</p>
             <div className="dt-persona-grid">
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '新表情名字（上传时使用）' : 'Name for uploads'}</span><Input value={stickerName} onChange={e => setStickerName(e.target.value)} placeholder="摸鱼" /></label>
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '标签（逗号分隔，助理按标签选图）' : 'Tags'}</span><Input value={stickerTags} onChange={e => setStickerTags(e.target.value)} placeholder="开心, 日常" /></label>
             </div>
             <input ref={stickerFileRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden onChange={e => { const f = Array.from(e.target.files ?? []); e.target.value = ''; void uploadStickers(f) }} />
-            <div className="dt-row-buttons"><Button variant="primary" disabled={busy} onClick={() => stickerFileRef.current?.click()} data-testid="sticker-upload-btn">{lang === 'zh' ? '⬆ 上传表情包图片' : 'Upload stickers'}</Button></div>
+            <input type="file" multiple hidden data-testid="sticker-folder-input" ref={el => { setStickerFolderInput(el); if (el) { el.setAttribute('webkitdirectory', ''); el.setAttribute('directory', '') } }} onChange={e => { const f = Array.from(e.target.files ?? []); e.target.value = ''; void uploadStickers(f, { fromFolder: true }) }} />
+            <div className="dt-row-buttons">
+              <Button variant="primary" disabled={busy} onClick={() => stickerFileRef.current?.click()} data-testid="sticker-upload-btn">{lang === 'zh' ? '⬆ 上传表情包图片（可多选）' : 'Upload stickers'}</Button>
+              <Button variant="outline" disabled={busy} onClick={() => stickerFolderInput?.click()} data-testid="sticker-folder-upload-btn">{lang === 'zh' ? '📁 上传整个文件夹（自动扫描）' : '📁 Upload a whole folder'}</Button>
+            </div>
             {state.stickers.length === 0 ? <p className="dt-hint">{lang === 'zh' ? '图库还是空的，上传第一张表情包吧~' : 'No stickers yet.'}</p> : (
               <div className="dt-sticker-grid">
                 {state.stickers.map(s => (
@@ -666,9 +728,32 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
                     <Input value={s.name} disabled={busy} onChange={e => setState(curr => (curr ? { ...curr, stickers: curr.stickers.map(x => x.id === s.id ? { ...x, name: e.target.value } : x) } : curr))} onBlur={e => { void saveStickerMeta(s, { name: e.target.value }) }} />
                     <Input value={s.tags.join(', ')} disabled={busy} placeholder={lang === 'zh' ? '标签' : 'Tags'} onChange={e => setState(curr => (curr ? { ...curr, stickers: curr.stickers.map(x => x.id === s.id ? { ...x, tags: e.target.value.split(/[,，]/).map(t => t.trim()).filter(Boolean) } : x) } : curr))} onBlur={e => { void saveStickerMeta(s, { tags: e.target.value.split(/[,，]/).map(t => t.trim()).filter(Boolean) }) }} />
                     <span className="dt-hint">{s.emotion ? `${s.emotion} · ` : ''}{(s.sizeBytes / 1024).toFixed(0)} KB · {lang === 'zh' ? '已发' : 'used'} {s.useCount} {lang === 'zh' ? '次' : 'x'}</span>
-                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void deleteSticker(s) }} data-testid={`sticker-delete-${s.id}`}>{lang === 'zh' ? '🗑 删除' : 'Delete'}</Button>
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void deleteSticker(s) }} data-testid={`sticker-delete-${s.id}`} title={lang === 'zh' ? '移入回收站：1 天内可恢复，过期自动彻底删除' : 'Move to 1-day trash'}>{lang === 'zh' ? '🗑 移入回收站' : 'Trash'}</Button>
                   </div>
                 ))}
+              </div>
+            )}
+            {(state.stickerTrash?.length ?? 0) > 0 && (
+              <div className="dt-form" data-testid="sticker-trash-panel">
+                <strong>{lang === 'zh' ? `🗑 回收站（${state.stickerTrash.length} 张 · 删除后保留 1 天，过期自动彻底清除）` : `🗑 Trash (${state.stickerTrash.length} · auto-purged after 1 day)`}</strong>
+                <div className="dt-sticker-grid">
+                  {state.stickerTrash.map(s => {
+                    const purgeMs = s.purgeAt ? Date.parse(s.purgeAt) : NaN
+                    const remainHours = Number.isFinite(purgeMs) ? Math.max(0, (purgeMs - Date.now()) / 3600000) : 24
+                    const remainLabel = remainHours >= 1 ? `${remainHours.toFixed(remainHours >= 10 ? 0 : 1)} ${lang === 'zh' ? '小时' : 'h'}` : `${Math.max(1, Math.round(remainHours * 60))} ${lang === 'zh' ? '分钟' : 'min'}`
+                    return (
+                      <div key={s.id} className="dt-sticker-card" data-testid={`sticker-trash-card-${s.id}`}>
+                        <StickerImage sticker={s} lang={lang} />
+                        <strong>{s.name}</strong>
+                        <span className="dt-hint">{lang === 'zh' ? `还剩 ${remainLabel} 后彻底删除` : `Permanently deleted in ${remainLabel}`}</span>
+                        <div className="dt-row-buttons">
+                          <Button size="sm" variant="outline" disabled={busy} onClick={() => { void restoreSticker(s) }} data-testid={`sticker-restore-${s.id}`}>{lang === 'zh' ? '♻️ 恢复' : 'Restore'}</Button>
+                          <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void permanentlyDeleteSticker(s) }} data-testid={`sticker-permanent-${s.id}`}>{lang === 'zh' ? '❌ 彻底删除' : 'Delete forever'}</Button>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
               </div>
             )}
           </div>

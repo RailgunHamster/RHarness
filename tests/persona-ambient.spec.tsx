@@ -19,6 +19,12 @@ import {
   findSticker,
   formatLunarDate,
   getNewsBrief,
+  activeStickers,
+  purgeExpiredStickerTrash,
+  restoreStickerRecord,
+  stickerTrashPurgeAt,
+  trashStickerRecord,
+  trashedStickers,
   normalizeAssistantPersonaConfig,
   parseRssItems,
   parseStickerMarker,
@@ -109,6 +115,34 @@ describe('sticker gallery', () => {
     expect(readStickerFile(saved.entry)).toBeUndefined()
   })
 
+  it('soft-deletes into a 1-day trash: restorable within 24h, auto-purged (file removed) afterwards', () => {
+    const t0 = new Date('2026-11-17T00:00:00Z')
+    const gif = Buffer.concat([Buffer.from('GIF89a', 'ascii'), Buffer.from('rharness-test-gif-payload')])
+    const saved = saveStickerFromBuffer([], { data: gif, name: '动图猫', tags: ['开心'] }, t0)
+    expect(saved.entry.mediaType).toBe('image/gif')
+    expect(readStickerFile(saved.entry)).toEqual(gif)
+
+    const trashed = trashStickerRecord(saved.list, saved.entry.id, t0)
+    expect(trashed.entry?.deletedAt).toBe(t0.toISOString())
+    expect(activeStickers(trashed.list)).toHaveLength(0)
+    expect(trashedStickers(trashed.list)).toHaveLength(1)
+    expect(findSticker(trashed.list, '开心')).toHaveLength(0)
+    expect(parseStickerMarker('hi\n[sticker:开心]', trashed.list).sticker).toBeUndefined()
+    // Still restorable 23h later; file still on disk.
+    expect(stickerTrashPurgeAt(trashed.entry!)).toBe('2026-11-18T00:00:00.000Z')
+    const kept = purgeExpiredStickerTrash(trashed.list, new Date('2026-11-17T23:00:00Z'))
+    expect(kept.purged).toHaveLength(0)
+    expect(readStickerFile(saved.entry)).toEqual(gif)
+    const restored = restoreStickerRecord(trashed.list, saved.entry.id, new Date('2026-11-17T23:30:00Z'))
+    expect(restored.entry?.deletedAt).toBeUndefined()
+    expect(activeStickers(restored.list)).toHaveLength(1)
+    // After 24h in trash: purged for good and the file is removed.
+    const purged = purgeExpiredStickerTrash(trashed.list, new Date('2026-11-18T00:00:01Z'))
+    expect(purged.purged.map(s => s.id)).toEqual([saved.entry.id])
+    expect(purged.list).toHaveLength(0)
+    expect(readStickerFile(saved.entry)).toBeUndefined()
+  })
+
   it('parses sticker markers and enforces frequency/cooldown policy', () => {
     const saved = saveStickerFromBuffer([], { data: PNG_BYTES, name: '摸鱼', tags: ['开心'] })
     const parsed = parseStickerMarker('今天也很开心呀\n[sticker:开心]', saved.list)
@@ -194,8 +228,20 @@ describe('assistant persona/ambient tools', () => {
     expect(learnings).toHaveLength(1)
     await byName('persona_learning_delete').execute({ id_or_text: '简短' }, { signal: new AbortController().signal })
     expect(learnings).toHaveLength(0)
-    await byName('sticker_delete').execute({ id_or_name: '摸鱼' }, { signal: new AbortController().signal })
-    expect(stickers).toHaveLength(0)
+    // sticker_delete is a soft delete into the 1-day trash now: record kept (flagged), invisible to list/find.
+    const delRes = await byName('sticker_delete').execute({ id_or_name: '摸鱼' }, { signal: new AbortController().signal }) as { ok: boolean; trashed?: { name: string }; restorableUntil?: string }
+    expect(delRes.ok).toBe(true)
+    expect(delRes.trashed?.name).toBe('摸鱼')
+    expect(stickers).toHaveLength(1)
+    expect(stickers[0]!.deletedAt).toBeTruthy()
+    expect(findSticker(stickers, '摸鱼')).toHaveLength(0)
+    const listedAfterDelete = await byName('sticker_list').execute({}, { signal: new AbortController().signal }) as { count: number }
+    expect(listedAfterDelete.count).toBe(0)
+    const restored = await byName('sticker_restore').execute({ id_or_name: '摸鱼' }, { signal: new AbortController().signal }) as { ok: boolean }
+    expect(restored.ok).toBe(true)
+    expect(stickers[0]!.deletedAt).toBeUndefined()
+    const listedAfterRestore = await byName('sticker_list').execute({}, { signal: new AbortController().signal }) as { count: number }
+    expect(listedAfterRestore.count).toBe(1)
     const brief = await byName('news_brief').execute({}, { signal: new AbortController().signal }) as { items: unknown[] }
     expect(brief.items).toHaveLength(1)
   })
@@ -220,9 +266,31 @@ describe('persona workbench UI', () => {
           ],
           learnings: [{ id: 'learn-1', kind: 'style', content: '闲聊时简短一点', enabled: true, source: 'auto', createdAt: '2026-11-17T00:00:00Z', updatedAt: '2026-11-17T00:00:00Z' }],
           stickers: [{ id: 'stk-1', name: '摸鱼', tags: ['开心'], fileName: 'stk-1.png', mediaType: 'image/png', sizeBytes: PNG_BYTES.length, createdAt: '2026-11-17T00:00:00Z', updatedAt: '2026-11-17T00:00:00Z', useCount: 2, source: 'upload' }],
+          stickerTrash: [{ id: 'stk-old', name: '旧表情', tags: [], fileName: 'stk-old.png', mediaType: 'image/png', sizeBytes: 10, createdAt: '2026-11-16T00:00:00Z', updatedAt: '2026-11-17T01:00:00Z', useCount: 0, source: 'upload', deletedAt: '2026-11-17T01:00:00Z', purgeAt: '2026-11-18T01:00:00Z' }],
           ambientConfig: defaultAssistantAmbientConfig(),
           ambient: buildAmbientSnapshot(defaultAssistantAmbientConfig(), undefined, new Date('2026-11-17T10:00:00+08:00')),
           news: { items: [{ title: '测试新闻头条', url: 'https://example.com/news', source: 'Test', topic: '科技' }] },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.includes('/restore')) {
+        return new Response(JSON.stringify({
+          stickers: [
+            { id: 'stk-1', name: '摸鱼', tags: ['开心'], fileName: 'stk-1.png', mediaType: 'image/png', sizeBytes: PNG_BYTES.length, createdAt: '2026-11-17T00:00:00Z', updatedAt: '2026-11-17T00:00:00Z', useCount: 2, source: 'upload' },
+            { id: 'stk-old', name: '旧表情', tags: [], fileName: 'stk-old.png', mediaType: 'image/png', sizeBytes: 10, createdAt: '2026-11-16T00:00:00Z', updatedAt: '2026-11-17T02:00:00Z', useCount: 0, source: 'upload' },
+          ],
+          stickerTrash: [],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.includes('assistant/stickers') && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body ?? '{}')) as { name?: string }
+        const created = { id: 'stk-new', name: body.name ?? '新表情', tags: [], fileName: 'stk-new.gif', mediaType: 'image/gif', sizeBytes: 20, createdAt: '2026-11-17T00:00:00Z', updatedAt: '2026-11-17T00:00:00Z', useCount: 0, source: 'upload' }
+        return new Response(JSON.stringify({
+          sticker: created,
+          stickers: [
+            { id: 'stk-1', name: '摸鱼', tags: ['开心'], fileName: 'stk-1.png', mediaType: 'image/png', sizeBytes: PNG_BYTES.length, createdAt: '2026-11-17T00:00:00Z', updatedAt: '2026-11-17T00:00:00Z', useCount: 2, source: 'upload' },
+            created,
+          ],
+          stickerTrash: [],
         }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
       return new Response(JSON.stringify({ ok: true, ambientConfig: defaultAssistantAmbientConfig(), ambient: buildAmbientSnapshot({ ...defaultAssistantAmbientConfig(), homeCity: { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' } }, undefined), stickers: [], learnings: [], config: defaultAssistantPersonaConfig() }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -289,5 +357,41 @@ describe('persona workbench UI', () => {
     const ambientTab = page.querySelector<HTMLButtonElement>('[data-testid="persona-tab-ambient"]')!
     await act(async () => { ambientTab.click() })
     expect(page.querySelector<HTMLInputElement>('[data-testid="ambient-city-input"]')!.value).toBe('北京')
+  })
+
+  it('restores stickers from the 1-day trash and uploads a whole folder (recursive scan, GIF kept, non-images skipped)', async () => {
+    await act(async () => root.render(
+      <PersonaAmbientWorkbench lang="zh" open embedded onClose={() => {}} />,
+    ))
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    const page = container.querySelector('#persona-ambient-page')!
+    const stickerTab = page.querySelector<HTMLButtonElement>('[data-testid="persona-tab-stickers"]')!
+    await act(async () => { stickerTab.click() })
+
+    // Trash panel: deleted sticker is listed with a restore action; restoring empties the trash.
+    expect(page.querySelector('[data-testid="sticker-trash-panel"]')).not.toBeNull()
+    expect(page.querySelector('[data-testid="sticker-trash-card-stk-old"]')).not.toBeNull()
+    const restoreBtn = page.querySelector<HTMLButtonElement>('[data-testid="sticker-restore-stk-old"]')!
+    await act(async () => { restoreBtn.click() })
+    expect(container.querySelector('[data-testid="sticker-trash-panel"]')).toBeNull()
+    expect(container.querySelector('[data-testid="sticker-card-stk-old"]')).not.toBeNull()
+
+    // Folder upload: a GIF deep in a subfolder + a non-image file. Only the GIF is posted, named after the file.
+    const folderBtn = page.querySelector<HTMLButtonElement>('[data-testid="sticker-folder-upload-btn"]')!
+    expect(folderBtn).not.toBeNull()
+    const input = page.querySelector<HTMLInputElement>('[data-testid="sticker-folder-input"]')!
+    expect(input.getAttribute('webkitdirectory')).not.toBeNull()
+    const gifFile = new File([new Uint8Array([...Buffer.from('GIF89a', 'ascii'), 1, 2, 3])], '开心猫.gif', { type: 'image/gif' })
+    Object.defineProperty(gifFile, 'webkitRelativePath', { value: '表情包/开心/开心猫.gif' })
+    const txtFile = new File(['hello'], 'readme.txt', { type: 'text/plain' })
+    Object.defineProperty(txtFile, 'webkitRelativePath', { value: '表情包/readme.txt' })
+    Object.defineProperty(input, 'files', { value: [gifFile, txtFile], configurable: true })
+    await act(async () => {
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+      await new Promise(r => setTimeout(r, 50))
+    })
+    expect(container.textContent).toContain('成功加入 1 张')
+    expect(container.textContent).toContain('非图片跳过 1 个')
+    expect(container.querySelector('[data-testid="sticker-card-stk-new"]')).not.toBeNull()
   })
 })

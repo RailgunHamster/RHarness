@@ -231,6 +231,60 @@ export interface StickerRecord {
   lastUsedAt?: string
   source: 'upload' | 'chat' | 'feishu'
   feishuImageKey?: string
+  /** Soft-delete marker (ISO): the sticker sits in the 1-day trash and can be restored until then. */
+  deletedAt?: string
+}
+
+/** Deleted stickers are kept restorable for exactly 1 day, then purged for good (file removed). */
+export const STICKER_TRASH_RETENTION_MS = 24 * 60 * 60 * 1000
+
+export function isStickerTrashed(record: StickerRecord): boolean {
+  return Boolean(record.deletedAt)
+}
+export function activeStickers(records: readonly StickerRecord[]): StickerRecord[] {
+  return records.filter(r => !r.deletedAt)
+}
+export function trashedStickers(records: readonly StickerRecord[]): StickerRecord[] {
+  return records.filter(r => Boolean(r.deletedAt))
+}
+export function stickerTrashPurgeAt(record: StickerRecord): string | undefined {
+  if (!record.deletedAt) return undefined
+  const t = Date.parse(record.deletedAt)
+  return Number.isFinite(t) ? new Date(t + STICKER_TRASH_RETENTION_MS).toISOString() : undefined
+}
+/** Removes trash entries older than the 1-day retention (deleting their files). Returns the kept list + purged records. */
+export function purgeExpiredStickerTrash(records: readonly StickerRecord[], now = new Date()): { list: StickerRecord[]; purged: StickerRecord[] } {
+  const cutoff = now.getTime() - STICKER_TRASH_RETENTION_MS
+  const purged: StickerRecord[] = []
+  const list: StickerRecord[] = []
+  for (const r of records) {
+    const deletedAtMs = r.deletedAt ? Date.parse(r.deletedAt) : NaN
+    if (r.deletedAt && (!Number.isFinite(deletedAtMs) || deletedAtMs <= cutoff)) purged.push(r)
+    else list.push(r)
+  }
+  for (const r of purged) deleteStickerFile(r)
+  return { list, purged }
+}
+/** Soft-delete: move a sticker into the 1-day trash (file kept, restorable). */
+export function trashStickerRecord(records: readonly StickerRecord[], id: string, now = new Date()): { list: StickerRecord[]; entry?: StickerRecord } {
+  let entry: StickerRecord | undefined
+  const list = records.map(r => {
+    if (r.id !== id || r.deletedAt) return r
+    entry = { ...r, deletedAt: now.toISOString(), updatedAt: now.toISOString() }
+    return entry
+  })
+  return { list, ...(entry ? { entry } : {}) }
+}
+/** Undo a soft-delete while the sticker is still inside the 1-day trash window. */
+export function restoreStickerRecord(records: readonly StickerRecord[], id: string, now = new Date()): { list: StickerRecord[]; entry?: StickerRecord } {
+  let entry: StickerRecord | undefined
+  const list = records.map(r => {
+    if (r.id !== id || !r.deletedAt) return r
+    const { deletedAt: _drop, ...rest } = r
+    entry = { ...rest, updatedAt: now.toISOString() }
+    return entry
+  })
+  return { list, ...(entry ? { entry } : {}) }
 }
 
 export const STICKER_MAX_BYTES = 8 * 1024 * 1024
@@ -277,7 +331,7 @@ export function saveStickerFromBuffer(
   const mediaType = detectStickerMediaType(input.data)
   if (!mediaType) throw new Error('Sticker must be a PNG, JPEG, WebP, or GIF image')
   const sha256 = createHash('sha256').update(input.data).digest('hex')
-  const dup = records.find(r => r.sha256 === sha256)
+  const dup = records.find(r => r.sha256 === sha256 && !r.deletedAt)
   if (dup) return { entry: dup, list: [...records] }
   const id = `stk-${now.getTime()}-${randomUUID().slice(0, 6)}`
   const fileName = `${id}${STICKER_MEDIA_EXT[mediaType]}`
@@ -323,7 +377,7 @@ export function deleteStickerFile(record: StickerRecord): void {
 export function findSticker(records: readonly StickerRecord[], query: string): StickerRecord[] {
   const q = query.trim().toLowerCase()
   if (!q) return []
-  return records.filter(r => r.id === q || r.name.toLowerCase() === q || r.name.toLowerCase().includes(q) || r.tags.some(t => t.toLowerCase() === q || t.toLowerCase().includes(q)) || (r.emotion ?? '').toLowerCase() === q)
+  return records.filter(r => !r.deletedAt && (r.id === q || r.name.toLowerCase() === q || r.name.toLowerCase().includes(q) || r.tags.some(t => t.toLowerCase() === q || t.toLowerCase().includes(q)) || (r.emotion ?? '').toLowerCase() === q))
 }
 
 /** Parses a trailing `[sticker:<id|name|tag>]` marker the model may append; returns cleaned text + matched sticker. */
@@ -818,7 +872,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         guard()
         const args = stickerListSchema.parse(raw ?? {})
         const all = deps.getStickers()
-        const items = args.query ? findSticker(all, args.query) : all
+        const items = args.query ? findSticker(all, args.query) : activeStickers(all)
         return { ok: true, count: items.length, stickers: items.map(s => ({ id: s.id, name: s.name, tags: s.tags, emotion: s.emotion, sizeBytes: s.sizeBytes, useCount: s.useCount, createdAt: s.createdAt })) }
       },
     },
@@ -848,7 +902,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'sticker_delete',
-      description: 'Delete a sticker by exact ID or unambiguous name/tag (from sticker_list). Use when the user says "删掉那个叫XX的表情包".',
+      description: 'Move a sticker into the 1-day trash by exact ID or unambiguous name/tag (from sticker_list). It stays restorable for 24 hours (UI trash section or sticker_restore), then is permanently purged. Use when the user says "删掉那个叫XX的表情包".',
       parameters: z.toJSONSchema(stickerDeleteSchema),
       execute: async (raw: unknown) => {
         guard()
@@ -858,9 +912,26 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         if (matches.length === 0) return { ok: false, error: `Sticker not found: ${args.id_or_name}` }
         if (matches.length > 1) return { ok: false, error: 'Multiple stickers match; ask the user to pick one', candidates: matches.map(s => ({ id: s.id, name: s.name, tags: s.tags })) }
         const target = matches[0]!
-        deleteStickerFile(target)
-        deps.setStickers(all.filter(s => s.id !== target.id))
-        return { ok: true, deleted: { id: target.id, name: target.name } }
+        const trashed = trashStickerRecord(all, target.id)
+        deps.setStickers(trashed.list)
+        return { ok: true, trashed: { id: target.id, name: target.name }, restorableUntil: stickerTrashPurgeAt(trashed.entry ?? target), note: 'Sticker moved to the 1-day trash; call sticker_restore within 24h to undo, after which it is permanently deleted.' }
+      },
+    },
+    {
+      name: 'sticker_restore',
+      description: 'Restore a sticker from the 1-day trash (undo a recent sticker_delete) by ID or unambiguous name/tag. Only works within 24 hours of deletion.',
+      parameters: z.toJSONSchema(stickerDeleteSchema),
+      execute: async (raw: unknown) => {
+        guard()
+        const args = stickerDeleteSchema.parse(raw ?? {})
+        const all = deps.getStickers()
+        const q = args.id_or_name.trim().toLowerCase()
+        const matches = trashedStickers(all).filter(s => s.id === q || s.name.toLowerCase() === q || s.name.toLowerCase().includes(q) || s.tags.some(t => t.toLowerCase().includes(q)))
+        if (matches.length === 0) return { ok: false, error: `No trashed sticker matches: ${args.id_or_name} (trash only keeps stickers for 1 day)` }
+        if (matches.length > 1) return { ok: false, error: 'Multiple trashed stickers match; ask the user to pick one', candidates: matches.map(s => ({ id: s.id, name: s.name })) }
+        const restored = restoreStickerRecord(all, matches[0]!.id)
+        deps.setStickers(restored.list)
+        return { ok: true, restored: { id: matches[0]!.id, name: matches[0]!.name } }
       },
     },
     {

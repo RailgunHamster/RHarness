@@ -115,6 +115,7 @@ import {
 import {
   PERSONA_PRESETS,
   buildAmbientPromptSection,
+  activeStickers,
   buildAmbientSnapshot,
   buildAssistantPersonaAmbientTools,
   buildPersonaPromptSection,
@@ -132,9 +133,14 @@ import {
   parseStickerMarker,
   readStickerFile,
   savePersonaLearning,
+  purgeExpiredStickerTrash,
+  restoreStickerRecord,
   saveStickerFromBase64,
   saveStickerFromBuffer,
   stickerAllowedByPolicy,
+  stickerTrashPurgeAt,
+  trashStickerRecord,
+  trashedStickers,
   type AssistantAmbientConfig,
   type AssistantPersonaConfig,
   type NewsCache,
@@ -584,8 +590,14 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   }
   const getPersonaLearnings = (): PersonaLearningEntry[] => (runtime ? (runtime.store.get(KV.persona.learnings) ?? []) : [])
   const setPersonaLearnings = (next: PersonaLearningEntry[]): void => { if (runtime) runtime.store.set(KV.persona.learnings, next) }
-  const getStickerRecords = (): StickerRecord[] => (runtime ? (runtime.store.get(KV.persona.stickers) ?? []) : [])
   const setStickerRecords = (next: StickerRecord[]): void => { if (runtime) runtime.store.set(KV.persona.stickers, next) }
+  // Reading stickers lazily purges trash entries past the 1-day retention (files deleted, change persisted).
+  const getStickerRecords = (): StickerRecord[] => {
+    const all = runtime ? (runtime.store.get(KV.persona.stickers) ?? []) : []
+    const { list, purged } = purgeExpiredStickerTrash(all)
+    if (purged.length) setStickerRecords(list)
+    return list
+  }
   const getAmbientConfig = (): AssistantAmbientConfig => {
     if (!runtime) return defaultAssistantAmbientConfig()
     return normalizeAssistantAmbientConfig(runtime.store.get(KV.ambient.config) ?? defaultAssistantAmbientConfig())
@@ -1568,7 +1580,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         text: () => {
           if (!isPluginEnabled('dsh-assistant-persona')) return ''
           return [
-            buildPersonaPromptSection(getPersonaConfig(), getPersonaLearnings(), getStickerRecords()),
+            buildPersonaPromptSection(getPersonaConfig(), getPersonaLearnings(), activeStickers(getStickerRecords())),
             '',
             buildAmbientPromptSection(getAmbientSnapshot()),
           ].join('\n')
@@ -2153,7 +2165,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             totalCostCny,
             lcmNodeCount: lcmDag.nodes.length,
             learningCount: learningsList.length,
-            personaStickerCount: getStickerRecords().length,
+            personaStickerCount: activeStickers(getStickerRecords()).length,
             personaLearningCount: getPersonaLearnings().length,
             progressCardCount: Object.keys(progressCardsMap).length,
             ...(privateToolkitMod
@@ -2680,7 +2692,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             config: getPersonaConfig(),
             presets: PERSONA_PRESETS,
             learnings: getPersonaLearnings(),
-            stickers: getStickerRecords().map(s => ({ ...s, feishuImageKey: undefined })),
+            stickers: activeStickers(getStickerRecords()).map(s => ({ ...s, feishuImageKey: undefined })),
+            stickerTrash: trashedStickers(getStickerRecords()).map(s => ({ ...s, feishuImageKey: undefined, purgeAt: stickerTrashPurgeAt(s) })),
             ambientConfig: getAmbientConfig(),
             ambient: getAmbientSnapshot(),
             news: getNewsBriefPayload(),
@@ -2735,7 +2748,27 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             return
           }
           if (req.method === 'GET' && sub === 'assistant/stickers') {
-            sendJson(res, 200, { stickers: getStickerRecords() })
+            const all = getStickerRecords()
+            sendJson(res, 200, { stickers: activeStickers(all), stickerTrash: trashedStickers(all) })
+            return
+          }
+          const stickerRestoreMatch = /^assistant\/stickers\/([^/]+)\/restore$/.exec(sub)
+          if (req.method === 'POST' && stickerRestoreMatch) {
+            const restored = restoreStickerRecord(getStickerRecords(), decodeURIComponent(stickerRestoreMatch[1]!))
+            if (!restored.entry) { sendJson(res, 404, { error: 'Trashed sticker not found (trash keeps stickers for 1 day only)' }); return }
+            setStickerRecords(restored.list)
+            sendJson(res, 200, { sticker: restored.entry, stickers: activeStickers(restored.list), stickerTrash: trashedStickers(restored.list) })
+            return
+          }
+          const stickerPermanentMatch = /^assistant\/stickers\/([^/]+)\/permanent$/.exec(sub)
+          if (req.method === 'DELETE' && stickerPermanentMatch) {
+            const all = getStickerRecords()
+            const target = all.find(s => s.id === decodeURIComponent(stickerPermanentMatch[1]!))
+            if (!target) { sendJson(res, 404, { error: 'Sticker not found' }); return }
+            deleteStickerFile(target)
+            const next = all.filter(s => s.id !== target.id)
+            setStickerRecords(next)
+            sendJson(res, 200, { deleted: true, permanent: true, stickers: activeStickers(next), stickerTrash: trashedStickers(next) })
             return
           }
           if (req.method === 'POST' && sub === 'assistant/stickers') {
@@ -2748,7 +2781,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
               source: 'upload',
             })
             setStickerRecords(saved.list)
-            sendJson(res, 200, { sticker: saved.entry, stickers: saved.list })
+            sendJson(res, 200, { sticker: saved.entry, stickers: activeStickers(saved.list), stickerTrash: trashedStickers(saved.list) })
             return
           }
           if (req.method === 'POST' && sub === 'assistant/stickers/from-message') {
@@ -2771,7 +2804,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             }
             if (!saved) { sendJson(res, 404, { error: 'No usable image found in the referenced message' }); return }
             setStickerRecords(saved.list)
-            sendJson(res, 200, { sticker: saved.entry, stickers: saved.list })
+            sendJson(res, 200, { sticker: saved.entry, stickers: activeStickers(saved.list), stickerTrash: trashedStickers(saved.list) })
             return
           }
           const stickerContentMatch = /^assistant\/stickers\/([^/]+)\/content$/.exec(sub)
@@ -2790,10 +2823,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             const target = all.find(s => s.id === id)
             if (!target) { sendJson(res, 404, { error: 'Sticker not found' }); return }
             if (req.method === 'DELETE') {
-              deleteStickerFile(target)
-              const next = all.filter(s => s.id !== id)
-              setStickerRecords(next)
-              sendJson(res, 200, { deleted: true, stickers: next })
+              // Soft-delete into the 1-day trash (restorable); permanent removal only via /permanent or after 24h.
+              const trashed = trashStickerRecord(all, id)
+              setStickerRecords(trashed.list)
+              sendJson(res, 200, { deleted: true, trashed: true, purgeAt: trashed.entry ? stickerTrashPurgeAt(trashed.entry) : undefined, stickers: activeStickers(trashed.list), stickerTrash: trashedStickers(trashed.list) })
               return
             }
             const body = await readJsonBody(req, 64 * 1024)

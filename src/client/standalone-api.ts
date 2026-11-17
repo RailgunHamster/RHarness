@@ -303,6 +303,9 @@ export interface StickerInfo {
   useCount: number
   lastUsedAt?: string
   source: 'upload' | 'chat' | 'feishu'
+  /** Set while the sticker sits in the 1-day trash; `purgeAt` is when it gets permanently deleted. */
+  deletedAt?: string
+  purgeAt?: string
 }
 export interface AmbientHomeCityInfo { name: string; latitude: number; longitude: number; timezone: string }
 export interface AssistantAmbientConfigInfo { homeCity: AmbientHomeCityInfo; weatherEnabled: boolean; newsEnabled: boolean }
@@ -326,6 +329,8 @@ export interface PersonaAmbientStateInfo {
   presets: PersonaPresetInfo[]
   learnings: PersonaLearningInfo[]
   stickers: StickerInfo[]
+  /** Soft-deleted stickers kept restorable for 1 day, then auto-purged server-side. */
+  stickerTrash: StickerInfo[]
   ambientConfig: AssistantAmbientConfigInfo
   ambient: AmbientSnapshotInfo
   news: { fetchedAt?: string; stale?: boolean; items: NewsItemInfo[] }
