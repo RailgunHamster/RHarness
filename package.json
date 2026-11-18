@@ -51,6 +51,7 @@
  "typecheck": "tsc --noEmit",
  "test": "vitest run --test-timeout=15000",
  "check": "pnpm typecheck && pnpm test && pnpm build",
+ "release": "pnpm check && node lib/standalone.js --publish-update",
  "start": "node lib/standalone.js --daemon",
  "stop": "node lib/standalone.js --stop"
  },

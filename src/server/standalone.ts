@@ -45,6 +45,25 @@ import {
   type PersistenceChangeRecord,
 } from '../app/claw-assistant.ts'
 import {
+  AUTO_BACKUP_INTERVAL_MS,
+  UPDATE_RESTART_EXIT_CODE,
+  applyVerifiedReleaseToRepo,
+  computeRestoredDataCenterState,
+  createClusterReleasePackage,
+  createDataCenterBackupArchive,
+  inspectLocalBuild,
+  listDataCenterRollingSnapshots,
+  parseDataCenterBackupArchive,
+  readDataCenterRollingSnapshotBytes,
+  readLatestReleaseOnDataCenter,
+  saveReleaseOnDataCenter,
+  unpackAndVerifyClusterRelease,
+  writeDataCenterRollingSnapshot,
+  type ClusterReleaseEnvelope,
+  type ClusterReleaseManifest,
+  type DataCenterBackupPayload,
+} from '../app/cluster-update-and-backup.ts'
+import {
   broadcastGroupPacketToPeers,
   buildNodeCandidateEndpoints,
   createDeviceGroup,
@@ -204,7 +223,10 @@ export interface StandaloneServerOptions {
   tlsKeyFile?: string
   host?: string
   stateDir?: string
+  repoDir?: string
   liveAgents?: boolean
+  /** Optional hook invoked after a staged cluster update swaps `lib/` on disk (CLI passes graceful stop + exit 75). */
+  onUpdateRestart?: () => void
   /** Optional custom local driver for testing or custom worker runtimes. */
   driver?: Parameters<typeof createStandaloneHost>[0]['driver']
 }
@@ -479,6 +501,7 @@ export function recoverStaleStateLock(stateDir: string): boolean {
 export async function startStandaloneServer(options: StandaloneServerOptions = {}) {
   const port = options.port ?? (Number(process.env.DSH_SUPERAGENT_PORT ?? process.env.PORT ?? 4318) || 4318)
   const stateDir = resolve(options.stateDir ?? process.env.DSH_SUPERAGENT_STATE_DIR ?? '.rharness-dev/superagent')
+  const repoDir = resolve(options.repoDir ?? process.cwd())
   const liveAgents = options.liveAgents ?? true
   const privateToolkitMod = await loadRHToolkitDynamicModule()
   mkdirSync(stateDir, { recursive: true })
@@ -2249,13 +2272,250 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   }) as never)
 
   runtime = new Runtime(host.ctx, machine, () => { void restartRuntime() })
+
+  // ---- Cluster Auto-Update (Data-Center authoritative + drain-before-restart) & Data-Center Rolling Backups ----
+  let currentBuild = inspectLocalBuild(repoDir)
+  let stagedUpdate: {
+    envelope: ClusterReleaseEnvelope
+    status: 'waiting-idle' | 'applying'
+    receivedAt: string
+  } | undefined
+  let updateDownloadInFlight = false
+  let updateDrainTimer: ReturnType<typeof setInterval> | undefined
+
+  const isNodeBusyForUpdate = (): { busy: boolean; reasons: string[] } => {
+    const reasons: string[] = []
+    if (summarizeSessionLiveRun(ASSISTANT_SESSION_ID)) reasons.push('个人助理正在回复')
+    if (pendingFeishuDmQueue.length > 0) reasons.push('飞书流式卡片正在输出')
+    if (runtime && summarizeSessionLiveRun(runtime.masterId)) reasons.push('Eval 正在评估')
+    if ([...host.agents.values()].some(a => a.status === 'running')) reasons.push('会话正在执行')
+    if (runtime) {
+      try {
+        if (runtime.store.tickets.open().some(tk => Boolean(summarizeSessionLiveRun(`worker-${tk.id}`)))) {
+          reasons.push('工程工单正在执行')
+        }
+      } catch {}
+    }
+    return { busy: reasons.length > 0, reasons: [...new Set(reasons)] }
+  }
+
+  const tryApplyStagedUpdate = (force = false): { applied: boolean; waiting?: boolean; reasons?: string[] } => {
+    if (!stagedUpdate || stagedUpdate.status === 'applying') return { applied: false }
+    if (!force) {
+      const busyCheck = isNodeBusyForUpdate()
+      if (busyCheck.busy) {
+        stagedUpdate.status = 'waiting-idle'
+        return { applied: false, waiting: true, reasons: busyCheck.reasons }
+      }
+    }
+    stagedUpdate.status = 'applying'
+    if (updateDrainTimer) {
+      clearInterval(updateDrainTimer)
+      updateDrainTimer = undefined
+    }
+    try {
+      applyVerifiedReleaseToRepo(repoDir, stagedUpdate.envelope, stateDir)
+      currentBuild = inspectLocalBuild(repoDir)
+      stagedUpdate = undefined
+      options.onUpdateRestart?.()
+      return { applied: true }
+    } catch (err) {
+      stagedUpdate = undefined
+      throw err
+    }
+  }
+
+  const stageVerifiedReleaseBuffer = (packageGz: Buffer, force = false): {
+    upToDate?: boolean
+    staged?: ClusterReleaseManifest
+    applied?: boolean
+    waiting?: boolean
+    reasons?: string[]
+  } => {
+    const envelope = unpackAndVerifyClusterRelease(packageGz)
+    if (envelope.manifest.buildId === currentBuild.buildId) {
+      return { upToDate: true, staged: envelope.manifest }
+    }
+    stagedUpdate = {
+      envelope,
+      status: 'waiting-idle',
+      receivedAt: new Date().toISOString(),
+    }
+    if (!updateDrainTimer) {
+      updateDrainTimer = setInterval(() => {
+        if (!stagedUpdate) {
+          if (updateDrainTimer) { clearInterval(updateDrainTimer); updateDrainTimer = undefined }
+          return
+        }
+        try { tryApplyStagedUpdate(false) } catch {}
+      }, 2500)
+      updateDrainTimer.unref?.()
+    }
+    const res = tryApplyStagedUpdate(force)
+    return { staged: envelope.manifest, ...res }
+  }
+
+  const notifyOnlinePeersOfRelease = async (manifest: ClusterReleaseManifest): Promise<number> => {
+    const peers = getRegisteredNodes().filter(n => n.id !== 'local' && n.status === 'online' && n.url !== 'local')
+    let notified = 0
+    await Promise.allSettled(
+      peers.map(async peer => {
+        const endpoints = [...new Set([...(peer.endpoints ?? []), peer.url])].filter(Boolean)
+        for (const ep of endpoints) {
+          try {
+            const res = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/cluster-update/notify`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'x-orchestrator-request': '1' },
+              body: JSON.stringify({ manifest }),
+              signal: AbortSignal.timeout(5000),
+            })
+            if (res.ok) { notified++; break }
+          } catch {}
+        }
+      }),
+    )
+    return notified
+  }
+
+  const pullAndStageReleaseFromNode = async (node: { endpoints?: string[]; url: string }): Promise<boolean> => {
+    if (updateDownloadInFlight) return false
+    updateDownloadInFlight = true
+    try {
+      const endpoints = [...new Set([...(node.endpoints ?? []), node.url])].filter(Boolean)
+      for (const ep of endpoints) {
+        const base = ep.replace(/\/+$/, '')
+        try {
+          const metaRes = await fetch(`${base}/orchestrator/standalone/cluster-update/latest`, {
+            headers: { 'x-orchestrator-request': '1' },
+            signal: AbortSignal.timeout(4000),
+          })
+          if (!metaRes.ok) continue
+          const meta = (await metaRes.json()) as { manifest?: ClusterReleaseManifest }
+          if (!meta.manifest || meta.manifest.buildId === currentBuild.buildId) return false
+          if (stagedUpdate?.envelope.manifest.buildId === meta.manifest.buildId) {
+            tryApplyStagedUpdate(false)
+            return true
+          }
+          const pkgRes = await fetch(`${base}/orchestrator/standalone/cluster-update/package`, {
+            headers: { 'x-orchestrator-request': '1' },
+            signal: AbortSignal.timeout(30_000),
+          })
+          if (!pkgRes.ok) continue
+          const pkgBuf = Buffer.from(await pkgRes.arrayBuffer())
+          stageVerifiedReleaseBuffer(pkgBuf, false)
+          return true
+        } catch {}
+      }
+      return false
+    } finally {
+      updateDownloadInFlight = false
+    }
+  }
+
+  const reconcileClusterUpdateFromDataCenter = async (): Promise<boolean> => {
+    try {
+      if (!runtime || isLocalDataCenter()) return false
+      const dc = findDataCenterPeer()
+      if (!dc) return false
+      return await pullAndStageReleaseFromNode(dc)
+    } catch {
+      return false
+    }
+  }
+
+  const buildLiveBackupArchive = (reason: DataCenterBackupPayload['reason'], includesSecrets = true) => {
+    const identity = getDeviceIdentity()
+    const storedAmap = runtime?.store.get(KV.ambient.amap)?.apiKey?.trim()
+    return createDataCenterBackupArchive({
+      reason,
+      sourceDeviceName: identity.deviceName || identity.hostname,
+      includesSecrets,
+      personaConfig: getPersonaConfig(),
+      personaLearnings: getPersonaLearnings(),
+      ambientConfig: getAmbientConfig(),
+      ...(storedAmap ? { amapApiKey: storedAmap } : {}),
+      memories: getMemoryEntries(),
+      assistantMessages: runtime?.store.get(KV.assistant.messages) ?? [],
+      assistantContextConfig: getAssistantContextConfig(),
+      ...(runtime?.store.get(KV.modelProfiles.config) ? { modelProfiles: runtime.store.get(KV.modelProfiles.config)! } : {}),
+      ...(runtime?.store.get(KV.plugins.state) ? { pluginState: runtime.store.get(KV.plugins.state)! } : {}),
+      ...(runtime?.store.get(KV.clawfeed.items) ? { clawfeedItems: runtime.store.get(KV.clawfeed.items)! } : {}),
+      ...(runtime?.store.get(KV.lossless.dag) ? { losslessDag: runtime.store.get(KV.lossless.dag) } : {}),
+      ...(runtime?.store.get(KV.learnings.items) ? { selfImprovingLearnings: runtime.store.get(KV.learnings.items)! } : {}),
+      stickers: getStickerRecords(),
+    })
+  }
+
+  const restoreBackupPayloadLocally = (payload: DataCenterBackupPayload, mode: 'merge' | 'replace') => {
+    // Mandatory safety net: snapshot current live state BEFORE applying any import/restore!
+    const preSnap = buildLiveBackupArchive('pre-import', true)
+    const safetySnapshot = writeDataCenterRollingSnapshot(stateDir, preSnap.archiveGz, preSnap.payload)
+    const currentAmap = runtime?.store.get(KV.ambient.amap)?.apiKey?.trim()
+    const restored = computeRestoredDataCenterState(
+      {
+        personaConfig: getPersonaConfig(),
+        personaLearnings: getPersonaLearnings(),
+        ambientConfig: getAmbientConfig(),
+        ...(currentAmap ? { amapApiKey: currentAmap } : {}),
+        memories: getMemoryEntries(),
+        assistantMessages: runtime.store.get(KV.assistant.messages) ?? [],
+        assistantContextConfig: getAssistantContextConfig(),
+        stickers: getStickerRecords(),
+      },
+      payload,
+      mode,
+    )
+    setPersonaConfig(restored.personaConfig, { sync: false })
+    runtime.store.set(KV.persona.learnings, restored.personaLearnings)
+    setAmbientConfig(restored.ambientConfig, { sync: false })
+    if (restored.amapApiKey !== undefined) {
+      runtime.store.set(KV.ambient.amap, { apiKey: restored.amapApiKey })
+    }
+    runtime.store.set(KV.persona.stickers, restored.stickers)
+    runtime.store.set(KV.assistant.contextConfig, restored.assistantContextConfig)
+    runtime.store.set(KV.assistant.messages, restored.assistantMessages)
+    setMemoryEntries(restored.memories, 'replace')
+    if (restored.modelProfiles) runtime.store.set(KV.modelProfiles.config, restored.modelProfiles)
+    if (restored.pluginState && mode === 'replace') runtime.store.set(KV.plugins.state, restored.pluginState)
+    if (restored.clawfeedItems && mode === 'replace') runtime.store.set(KV.clawfeed.items, restored.clawfeedItems as never)
+    if (restored.losslessDag !== undefined && mode === 'replace') runtime.store.set(KV.lossless.dag, restored.losslessDag as never)
+    if (restored.selfImprovingLearnings && mode === 'replace') runtime.store.set(KV.learnings.items, restored.selfImprovingLearnings as never)
+    syncPersonaAfterMutation()
+    void broadcastAssistantStateToPeers('replace')
+    void refreshAmbientCachesInBackground()
+    return { safetySnapshot, summary: payload.summary, restoredStickerFiles: restored.restoredStickerFiles }
+  }
+
+  const maybeRunAutoDailyDataCenterBackup = () => {
+    try {
+      if (!runtime || !liveAgents || !isLocalDataCenter()) return
+      const existing = listDataCenterRollingSnapshots(stateDir)
+      const latestAuto = existing.find(s => s.reason === 'auto-daily' || s.reason === 'manual-snapshot')
+      if (latestAuto && Date.now() - Date.parse(latestAuto.createdAt) < AUTO_BACKUP_INTERVAL_MS) return
+      const built = buildLiveBackupArchive('auto-daily', true)
+      writeDataCenterRollingSnapshot(stateDir, built.archiveGz, built.payload)
+    } catch { /* store may already be closed during shutdown */ }
+  }
+
+  host.ctx.on('agent/status' as never, (({ status }: { status: string }) => {
+    if (status === 'idle' && stagedUpdate?.status === 'waiting-idle') {
+      setTimeout(() => { try { tryApplyStagedUpdate(false) } catch {} }, 400)
+    }
+  }) as never)
+
   // Warm ambient caches shortly after boot, then keep weather/news fresh in the background
   setTimeout(() => { void refreshAmbientCachesInBackground() }, 3000)
-  // Non-hub nodes reconcile persona/ambient state with the hub (boot + periodic pull).
-  setTimeout(() => { void pullPersonaStateFromDataCenter() }, 6000)
+  // Non-data-center nodes reconcile persona/ambient state & cluster releases on boot + every 15 min.
+  setTimeout(() => {
+    void pullPersonaStateFromDataCenter()
+    if (liveAgents) void reconcileClusterUpdateFromDataCenter()
+  }, 6000)
+  setTimeout(() => { maybeRunAutoDailyDataCenterBackup() }, 12_000)
   const ambientRefreshTimer = setInterval(() => {
     void refreshAmbientCachesInBackground()
     void pullPersonaStateFromDataCenter()
+    if (liveAgents) void reconcileClusterUpdateFromDataCenter()
+    maybeRunAutoDailyDataCenterBackup()
   }, 15 * 60 * 1000)
   ambientRefreshTimer.unref?.()
 
@@ -2517,6 +2777,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         sub.startsWith('rhtoolkit/') ||
         sub === 'nodes' ||
         sub.startsWith('device-group') ||
+        sub.startsWith('cluster-update/') ||
+        sub.startsWith('datacenter-backup/') ||
         sub.startsWith('markdown/') ||
         sub === 'model-profiles' ||
         (sub.startsWith('sessions/') && sub.endsWith('/tool'))
@@ -2702,6 +2964,21 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             progressCards: progressCardsMap,
             pendingQuestions: collectPendingQuestions(runtime),
             pipeline: pipelineList,
+            serverBuild: {
+              buildId: currentBuild.buildId,
+              shortCommit: currentBuild.shortCommit,
+              subject: currentBuild.subject,
+              ...(stagedUpdate
+                ? {
+                    pendingUpdate: {
+                      buildId: stagedUpdate.envelope.manifest.buildId,
+                      shortCommit: stagedUpdate.envelope.manifest.shortCommit,
+                      subject: stagedUpdate.envelope.manifest.subject,
+                      status: stagedUpdate.status,
+                    },
+                  }
+                : {}),
+            },
           })
           return
         }
@@ -4990,6 +5267,381 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           }
         }
 
+        // ---- Cluster Auto-Update (`cluster-update/*`) & Data-Center Backup (`datacenter-backup/*`) ----
+        if (sub.startsWith('cluster-update/')) {
+          if (req.method === 'GET' && sub === 'cluster-update/node-status') {
+            sendJson(res, 200, {
+              buildId: currentBuild.buildId,
+              shortCommit: currentBuild.shortCommit,
+              subject: currentBuild.subject,
+              isDataCenter: isLocalDataCenter(),
+              busy: isNodeBusyForUpdate(),
+              stagedBuildId: stagedUpdate?.envelope.manifest.buildId ?? null,
+            })
+            return
+          }
+
+          if (req.method === 'GET' && sub === 'cluster-update/latest') {
+            const latest = readLatestReleaseOnDataCenter(stateDir)
+            if (!latest) {
+              sendJson(res, 404, { error: 'No cluster release stored yet' })
+              return
+            }
+            sendJson(res, 200, { manifest: latest.manifest })
+            return
+          }
+
+          if (req.method === 'GET' && sub === 'cluster-update/package') {
+            const latest = readLatestReleaseOnDataCenter(stateDir)
+            if (!latest || !existsSync(latest.packagePath)) {
+              sendJson(res, 404, { error: 'No cluster release package available' })
+              return
+            }
+            const bytes = readFileSync(latest.packagePath)
+            res.writeHead(200, {
+              'content-type': 'application/gzip',
+              'content-length': String(bytes.length),
+              'x-rharness-build-id': latest.manifest.buildId,
+            })
+            res.end(bytes)
+            return
+          }
+
+          if (req.method === 'GET' && sub === 'cluster-update/status') {
+            const dc = findDataCenterPeer()
+            let dcLatest: ClusterReleaseManifest | null = readLatestReleaseOnDataCenter(stateDir)?.manifest ?? null
+            if (!isLocalDataCenter() && dc) {
+              const eps = [...new Set([...(dc.endpoints ?? []), dc.url])].filter(Boolean)
+              for (const ep of eps) {
+                try {
+                  const r = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/cluster-update/latest`, {
+                    headers: { 'x-orchestrator-request': '1' },
+                    signal: AbortSignal.timeout(2500),
+                  })
+                  if (r.ok) {
+                    dcLatest = ((await r.json()) as { manifest?: ClusterReleaseManifest }).manifest ?? null
+                    break
+                  }
+                } catch {}
+              }
+            }
+            const peers = getRegisteredNodes().filter(n => n.id !== 'local' && n.status === 'online' && n.url !== 'local')
+            const peerStatuses = await Promise.all(
+              peers.map(async p => {
+                const eps = [...new Set([...(p.endpoints ?? []), p.url])].filter(Boolean)
+                for (const ep of eps) {
+                  try {
+                    const r = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/cluster-update/node-status`, {
+                      headers: { 'x-orchestrator-request': '1' },
+                      signal: AbortSignal.timeout(2500),
+                    })
+                    if (r.ok) {
+                      const d = (await r.json()) as {
+                        buildId: string
+                        shortCommit: string
+                        subject: string
+                        isDataCenter?: boolean
+                        busy?: { busy: boolean; reasons: string[] }
+                        stagedBuildId?: string | null
+                      }
+                      return { id: p.id, name: p.name, reachable: true, ...d }
+                    }
+                  } catch {}
+                }
+                return { id: p.id, name: p.name, reachable: false, buildId: 'unreachable', shortCommit: '?' }
+              }),
+            )
+            sendJson(res, 200, {
+              localBuild: currentBuild,
+              isDataCenter: isLocalDataCenter(),
+              dataCenterName: isLocalDataCenter() ? getDeviceIdentity().deviceName : (dc?.name ?? null),
+              latestRelease: dcLatest,
+              busy: isNodeBusyForUpdate(),
+              stagedUpdate: stagedUpdate
+                ? {
+                    buildId: stagedUpdate.envelope.manifest.buildId,
+                    shortCommit: stagedUpdate.envelope.manifest.shortCommit,
+                    subject: stagedUpdate.envelope.manifest.subject,
+                    status: stagedUpdate.status,
+                    receivedAt: stagedUpdate.receivedAt,
+                  }
+                : null,
+              peerStatuses,
+            })
+            return
+          }
+
+          if (req.method === 'POST' && sub === 'cluster-update/upload') {
+            const body = await readJsonBody(req, 80 * 1024 * 1024)
+            const pkgB64 = String(body.packageB64 ?? '').trim()
+            if (!pkgB64) {
+              sendJson(res, 400, { error: 'packageB64 is required' })
+              return
+            }
+            const pkgBuf = Buffer.from(pkgB64, 'base64')
+            const manifest = saveReleaseOnDataCenter(stateDir, pkgBuf)
+            const notified = await notifyOnlinePeersOfRelease(manifest)
+            // Delay Data Center's own restart slightly (~1.8s) so peers finish pulling `latest.pkg.gz` first
+            let selfOutcome: { upToDate?: boolean; applied?: boolean; waiting?: boolean } = {}
+            if (manifest.buildId === currentBuild.buildId) {
+              selfOutcome = { upToDate: true }
+            } else if (options.onUpdateRestart) {
+              setTimeout(() => { try { stageVerifiedReleaseBuffer(pkgBuf, false) } catch {} }, 1800)
+              selfOutcome = { waiting: true }
+            } else {
+              selfOutcome = stageVerifiedReleaseBuffer(pkgBuf, false)
+            }
+            sendJson(res, 200, { ok: true, manifest, notifiedPeers: notified, selfOutcome })
+            return
+          }
+
+          if (req.method === 'POST' && sub === 'cluster-update/notify') {
+            const body = await readJsonBody(req, 256 * 1024)
+            const manifest = body.manifest as ClusterReleaseManifest | undefined
+            if (!manifest?.buildId || manifest.buildId === currentBuild.buildId) {
+              sendJson(res, 200, { ok: true, upToDate: true, localBuildId: currentBuild.buildId })
+              return
+            }
+            const dc = findDataCenterPeer()
+            if (dc) {
+              void pullAndStageReleaseFromNode(dc)
+            }
+            sendJson(res, 200, { ok: true, pulling: Boolean(dc), targetBuildId: manifest.buildId })
+            return
+          }
+
+          if (req.method === 'POST' && sub === 'cluster-update/publish') {
+            const built = createClusterReleasePackage(repoDir)
+            const pkgB64 = built.packageGz.toString('base64')
+            if (isLocalDataCenter()) {
+              const manifest = saveReleaseOnDataCenter(stateDir, built.packageGz)
+              const notifiedPeers = await notifyOnlinePeersOfRelease(manifest)
+              sendJson(res, 200, {
+                ok: true,
+                storedOn: 'local-datacenter',
+                manifest,
+                packageBytes: built.packageGz.length,
+                notifiedPeers,
+              })
+              return
+            }
+            const dc = findDataCenterPeer()
+            if (!dc) {
+              // No data center online: save locally as fallback and notify any online peers
+              saveReleaseOnDataCenter(stateDir, built.packageGz)
+              const notifiedPeers = await notifyOnlinePeersOfRelease(built.manifest)
+              sendJson(res, 200, {
+                ok: true,
+                storedOn: 'local-fallback',
+                warning: '当前未发现「数据中心」在线节点，已保存在本机并通知在线节点',
+                manifest: built.manifest,
+                packageBytes: built.packageGz.length,
+                notifiedPeers,
+              })
+              return
+            }
+            const eps = [...new Set([...(dc.endpoints ?? []), dc.url])].filter(Boolean)
+            let uploadOut: Record<string, unknown> | undefined
+            let lastErr = '无法连接数据中心节点上传更新包'
+            for (const ep of eps) {
+              try {
+                const upRes = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/cluster-update/upload`, {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json', 'x-orchestrator-request': '1' },
+                  body: JSON.stringify({ packageB64: pkgB64 }),
+                  signal: AbortSignal.timeout(45_000),
+                })
+                const upJson = (await upRes.json()) as Record<string, unknown>
+                if (!upRes.ok) throw new Error(String(upJson.error ?? `HTTP ${upRes.status}`))
+                uploadOut = upJson
+                break
+              } catch (err) {
+                lastErr = err instanceof Error ? err.message : String(err)
+              }
+            }
+            if (!uploadOut) {
+              sendJson(res, 502, { error: lastErr })
+              return
+            }
+            // If this publisher node's running process was started from an older build than disk `lib/`, restart itself too when idle!
+            if (built.manifest.buildId !== currentBuild.buildId) {
+              stageVerifiedReleaseBuffer(built.packageGz, false)
+            }
+            sendJson(res, 200, {
+              ok: true,
+              storedOn: dc.name,
+              manifest: built.manifest,
+              packageBytes: built.packageGz.length,
+              notifiedPeers: Number(uploadOut.notifiedPeers ?? 0),
+            })
+            return
+          }
+
+          if (req.method === 'POST' && sub === 'cluster-update/check') {
+            const body = await readJsonBody(req, 64 * 1024).catch(() => ({} as Record<string, unknown>))
+            if (body.forceApply === true && stagedUpdate) {
+              const out = tryApplyStagedUpdate(true)
+              sendJson(res, 200, { ok: true, ...out, localBuild: currentBuild })
+              return
+            }
+            const pulled = await reconcileClusterUpdateFromDataCenter()
+            sendJson(res, 200, {
+              ok: true,
+              pulled,
+              localBuild: currentBuild,
+              stagedBuildId: stagedUpdate?.envelope.manifest.buildId ?? null,
+              busy: isNodeBusyForUpdate(),
+            })
+            return
+          }
+        }
+
+        if (sub.startsWith('datacenter-backup/')) {
+          const forwardJsonToDataCenter = async <T>(path: string, method: 'GET' | 'POST', payload?: unknown): Promise<T | undefined> => {
+            if (isLocalDataCenter()) return undefined
+            const dc = findDataCenterPeer()
+            if (!dc) return undefined
+            const eps = [...new Set([...(dc.endpoints ?? []), dc.url])].filter(Boolean)
+            for (const ep of eps) {
+              try {
+                const r = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/${path}`, {
+                  method,
+                  headers: {
+                    'x-orchestrator-request': '1',
+                    ...(payload !== undefined ? { 'content-type': 'application/json' } : {}),
+                  },
+                  ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}),
+                  signal: AbortSignal.timeout(45_000),
+                })
+                if (r.ok) return (await r.json()) as T
+              } catch {}
+            }
+            return undefined
+          }
+
+          if (req.method === 'GET' && sub === 'datacenter-backup/status') {
+            if (!isLocalDataCenter() && url.searchParams.get('localOnly') !== '1') {
+              const proxied = await forwardJsonToDataCenter<Record<string, unknown>>('datacenter-backup/status?localOnly=1', 'GET')
+              if (proxied) {
+                sendJson(res, 200, { ...proxied, proxiedFromDataCenter: true, dataCenterName: findDataCenterPeer()?.name ?? null })
+                return
+              }
+            }
+            const preview = buildLiveBackupArchive('manual-export', true)
+            sendJson(res, 200, {
+              isDataCenter: isLocalDataCenter(),
+              dataCenterName: isLocalDataCenter() ? getDeviceIdentity().deviceName : (findDataCenterPeer()?.name ?? null),
+              currentSummary: preview.payload.summary,
+              snapshots: listDataCenterRollingSnapshots(stateDir),
+            })
+            return
+          }
+
+          if (req.method === 'POST' && sub === 'datacenter-backup/snapshot') {
+            if (!isLocalDataCenter() && url.searchParams.get('localOnly') !== '1') {
+              const proxied = await forwardJsonToDataCenter<Record<string, unknown>>('datacenter-backup/snapshot?localOnly=1', 'POST', {})
+              if (proxied) {
+                sendJson(res, 200, proxied)
+                return
+              }
+            }
+            const built = buildLiveBackupArchive('manual-snapshot', true)
+            const snapshot = writeDataCenterRollingSnapshot(stateDir, built.archiveGz, built.payload)
+            sendJson(res, 200, { ok: true, snapshot, snapshots: listDataCenterRollingSnapshots(stateDir) })
+            return
+          }
+
+          if (req.method === 'GET' && sub === 'datacenter-backup/export') {
+            const includeSecrets = url.searchParams.get('secrets') !== '0'
+            const snapshotFile = url.searchParams.get('snapshot')?.trim()
+            if (!isLocalDataCenter() && url.searchParams.get('localOnly') !== '1') {
+              const dc = findDataCenterPeer()
+              if (dc) {
+                const eps = [...new Set([...(dc.endpoints ?? []), dc.url])].filter(Boolean)
+                const qs = new URLSearchParams({ localOnly: '1', secrets: includeSecrets ? '1' : '0', ...(snapshotFile ? { snapshot: snapshotFile } : {}) })
+                for (const ep of eps) {
+                  try {
+                    const r = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/datacenter-backup/export?${qs.toString()}`, {
+                      headers: { 'x-orchestrator-request': '1' },
+                      signal: AbortSignal.timeout(45_000),
+                    })
+                    if (r.ok) {
+                      const buf = Buffer.from(await r.arrayBuffer())
+                      const disp = r.headers.get('content-disposition') ?? `attachment; filename="rharness-backup-${new Date().toISOString().slice(0, 10)}.rhbak.gz"`
+                      res.writeHead(200, {
+                        'content-type': 'application/gzip',
+                        'content-length': String(buf.length),
+                        'content-disposition': disp,
+                      })
+                      res.end(buf)
+                      return
+                    }
+                  } catch {}
+                }
+              }
+            }
+            let bytes: Buffer
+            let downloadName: string
+            if (snapshotFile) {
+              const snap = readDataCenterRollingSnapshotBytes(stateDir, snapshotFile)
+              if (!snap) {
+                sendJson(res, 404, { error: '找不到指定的备份快照文件' })
+                return
+              }
+              bytes = snap
+              downloadName = snapshotFile
+            } else {
+              const built = buildLiveBackupArchive('manual-export', includeSecrets)
+              bytes = built.archiveGz
+              downloadName = `rharness-backup-${built.payload.createdAt.slice(0, 10)}.rhbak.gz`
+            }
+            res.writeHead(200, {
+              'content-type': 'application/gzip',
+              'content-length': String(bytes.length),
+              'content-disposition': `attachment; filename="${downloadName}"`,
+            })
+            res.end(bytes)
+            return
+          }
+
+          if (req.method === 'POST' && sub === 'datacenter-backup/import') {
+            const body = await readJsonBody(req, 80 * 1024 * 1024)
+            const mode: 'merge' | 'replace' = body.mode === 'replace' ? 'replace' : 'merge'
+            if (!isLocalDataCenter() && url.searchParams.get('localOnly') !== '1') {
+              const proxied = await forwardJsonToDataCenter<Record<string, unknown>>('datacenter-backup/import?localOnly=1', 'POST', body)
+              if (proxied) {
+                // Also pull freshly restored state onto this node immediately so the caller sees it right away
+                await pullPersonaStateFromDataCenter()
+                sendJson(res, 200, proxied)
+                return
+              }
+            }
+            let rawArchive: Buffer
+            if (typeof body.snapshotFileName === 'string' && body.snapshotFileName.trim()) {
+              const snap = readDataCenterRollingSnapshotBytes(stateDir, body.snapshotFileName.trim())
+              if (!snap) {
+                sendJson(res, 404, { error: '找不到指定的历史快照文件' })
+                return
+              }
+              rawArchive = snap
+            } else if (typeof body.archiveB64 === 'string' && body.archiveB64.trim()) {
+              rawArchive = Buffer.from(body.archiveB64.trim(), 'base64')
+            } else {
+              sendJson(res, 400, { error: '需要提供备份包文件 (archiveB64) 或历史快照名 (snapshotFileName)' })
+              return
+            }
+            const parsedPayload = parseDataCenterBackupArchive(rawArchive)
+            const restored = restoreBackupPayloadLocally(parsedPayload, mode)
+            sendJson(res, 200, {
+              ok: true,
+              mode,
+              ...restored,
+              snapshots: listDataCenterRollingSnapshots(stateDir),
+            })
+            return
+          }
+        }
+
         // Model Configuration Profiles (Preset 1, 2, 3) & Peak/Off-Peak Time-Slot Scheduler endpoints
         if (req.method === 'GET' && sub === 'model-profiles') {
           sendJson(res, 200, resolveActiveRoleModels().profilesState)
@@ -5793,7 +6445,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     if (req.method === 'GET' && ext === '.js') {
       const candidate = packagePath('lib', url.pathname.slice(1))
       if (existsSync(candidate)) {
-        res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' })
+        res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-store' })
         res.end(readFileSync(candidate))
         return
       }
@@ -5861,6 +6513,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     get runtime() { return runtime },
     host,
     stop: async () => {
+      if (updateDrainTimer) {
+        clearInterval(updateDrainTimer)
+        updateDrainTimer = undefined
+      }
       for (const srv of httpsServers) {
         await new Promise<void>(r => srv.close(() => r()))
       }
@@ -5881,6 +6537,7 @@ if (isMain) {
       daemon: { type: 'boolean' },
       supervisor: { type: 'boolean' },
       stop: { type: 'boolean' },
+      'publish-update': { type: 'boolean' },
     },
     strict: false,
   })
@@ -5892,6 +6549,32 @@ if (isMain) {
   const supervisorPidFile = join(stateDir, 'standalone.supervisor.pid')
   const logFile = join(stateDir, 'standalone.log')
   const lockDir = `${stateDir}.lock`
+
+  if (values['publish-update']) {
+    const targetBase = `http://127.0.0.1:${port}`
+    fetch(`${targetBase}/orchestrator/standalone/cluster-update/publish`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-orchestrator-request': '1',
+        origin: targetBase,
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(60_000),
+    }).then(async res => {
+      const data = (await res.json()) as Record<string, unknown>
+      if (!res.ok) {
+        console.error(`[publish-update] Failed (HTTP ${res.status}):`, data.error ?? data)
+        process.exit(1)
+      }
+      const m = data.manifest as { buildId?: string; subject?: string } | undefined
+      console.log(`[publish-update] Published ${m?.buildId ?? '?'} (${m?.subject ?? ''}) -> stored on ${String(data.storedOn ?? '?')}, notified ${String(data.notifiedPeers ?? 0)} peer(s).`)
+      process.exit(0)
+    }).catch(err => {
+      console.error('[publish-update] Request failed:', err instanceof Error ? err.message : String(err))
+      process.exit(1)
+    })
+  } else {
 
   const killRecordedPid = (file: string) => {
     if (!existsSync(file)) return
@@ -5937,6 +6620,13 @@ if (isMain) {
   }
 
   if (values.supervisor) {
+    // Singleton guard: never spawn a second supervisor for the same `stateDir` (root cause of `superagent.lock` races!)
+    if (existsSync(supervisorPidFile)) {
+      const existingSup = Number(readFileSync(supervisorPidFile, 'utf8').trim())
+      if (existingSup && existingSup !== process.pid && isProcessAlive(existingSup)) {
+        process.exit(0)
+      }
+    }
     writeFileSync(supervisorPidFile, `${process.pid}\n`)
     let stopping = false
     let activeChild: ReturnType<typeof spawn> | undefined
@@ -5968,7 +6658,7 @@ if (isMain) {
 
     const launchWorker = () => {
       if (stopping) return
-      rmSync(lockDir, { recursive: true, force: true })
+      recoverStaleStateLock(stateDir)
       writeSupervisorLog(`Launching worker (host=${host}, port=${port}, stateDir=${stateDir})`)
       const startedAt = Date.now()
       let logFd: number | undefined
@@ -5998,12 +6688,19 @@ if (isMain) {
           rmSync(supervisorPidFile, { force: true })
           process.exit(0)
         }
+        if (code === UPDATE_RESTART_EXIT_CODE) {
+          backoffMs = 2000
+          writeSupervisorLog(`Worker PID ${worker.pid ?? '?'} exited for cluster auto-update (code=${UPDATE_RESTART_EXIT_CODE}); respawning immediately...`)
+          recoverStaleStateLock(stateDir)
+          setTimeout(launchWorker, 250)
+          return
+        }
         const uptimeMs = Date.now() - startedAt
         backoffMs = uptimeMs > 30_000 ? 2000 : Math.min(30_000, backoffMs * 2)
         writeSupervisorLog(
-          `Worker PID ${worker.pid ?? '?'} exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'none'}, uptime=${Math.round(uptimeMs / 1000)}s); cleaning stale lock and restarting in ${backoffMs}ms...`,
+          `Worker PID ${worker.pid ?? '?'} exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'none'}, uptime=${Math.round(uptimeMs / 1000)}s); recovering stale lock if dead and restarting in ${backoffMs}ms...`,
         )
-        rmSync(lockDir, { recursive: true, force: true })
+        recoverStaleStateLock(stateDir)
         setTimeout(launchWorker, backoffMs)
       })
     }
@@ -6036,7 +6733,27 @@ if (isMain) {
       process.exit(1)
     })
 
-    startStandaloneServer({ host, port, stateDir }).then(srv => {
+    let activeSrv: Awaited<ReturnType<typeof startStandaloneServer>> | undefined
+    let updateExiting = false
+    startStandaloneServer({
+      host,
+      port,
+      stateDir,
+      onUpdateRestart: () => {
+        if (updateExiting) return
+        updateExiting = true
+        console.log(`[${new Date().toISOString()}] [AUTO-UPDATE] Staged release ready & node idle; restarting worker (exit ${UPDATE_RESTART_EXIT_CODE})...`)
+        setTimeout(() => {
+          rmSync(pidFile, { force: true })
+          const stopPromise = activeSrv ? activeSrv.stop() : Promise.resolve()
+          stopPromise.then(
+            () => process.exit(UPDATE_RESTART_EXIT_CODE),
+            () => process.exit(UPDATE_RESTART_EXIT_CODE),
+          )
+        }, 150)
+      },
+    }).then(srv => {
+      activeSrv = srv
       writeFileSync(pidFile, `${process.pid}\n`)
       console.log(
         `[${new Date().toISOString()}] dsh-superagent standalone server listening on ${srv.url}${srv.httpsUrl ? ` and ${srv.httpsUrl}` : ''} (PID: ${process.pid}, stateDir: ${srv.stateDir})`,
@@ -6051,5 +6768,6 @@ if (isMain) {
       console.error(`[${new Date().toISOString()}] Failed to start dsh-superagent standalone server:`, err)
       process.exit(1)
     })
+  }
   }
 }

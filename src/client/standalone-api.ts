@@ -434,6 +434,59 @@ export interface SessionProgressCardInfo {
   percent: number
   updatedAt: string
 }
+export interface ServerBuildInfo {
+  buildId: string
+  shortCommit: string
+  subject: string
+  pendingUpdate?: {
+    buildId: string
+    shortCommit: string
+    subject: string
+    status: 'waiting-idle' | 'applying'
+  }
+}
+export interface ClusterUpdateStatusInfo {
+  localBuild: { buildId: string; commit: string; shortCommit: string; subject: string }
+  isDataCenter: boolean
+  dataCenterName: string | null
+  latestRelease: { buildId: string; shortCommit: string; subject: string; builtAt: string; fileCount: number } | null
+  busy: { busy: boolean; reasons: string[] }
+  stagedUpdate: { buildId: string; shortCommit: string; subject: string; status: string; receivedAt: string } | null
+  peerStatuses: {
+    id: string
+    name: string
+    reachable: boolean
+    buildId: string
+    shortCommit: string
+    subject?: string
+    isDataCenter?: boolean
+    busy?: { busy: boolean; reasons: string[] }
+    stagedBuildId?: string | null
+  }[]
+}
+export interface DataCenterSnapshotInfo {
+  fileName: string
+  createdAt: string
+  reason: 'manual-export' | 'auto-daily' | 'pre-import' | 'manual-snapshot'
+  sizeBytes: number
+  sha256: string
+  summary: {
+    residentAddressCount: number
+    memoryCount: number
+    assistantMessageCount: number
+    personaLearningCount: number
+    stickerCount: number
+    stickerFileCount: number
+    includesSecrets: boolean
+  }
+}
+export interface DataCenterBackupStatusInfo {
+  isDataCenter: boolean
+  dataCenterName: string | null
+  proxiedFromDataCenter?: boolean
+  currentSummary: DataCenterSnapshotInfo['summary']
+  snapshots: DataCenterSnapshotInfo[]
+}
 export interface SessionsPayload {
   sessions: SessionSummary[]
   roleModels?: RoleModelsSummary
@@ -453,6 +506,7 @@ export interface SessionsPayload {
   progressCards?: Record<string, SessionProgressCardInfo>
   pendingQuestions?: PendingUserQuestionInfo[]
   pipeline?: PipelineRow[]
+  serverBuild?: ServerBuildInfo
 }
 export async function standaloneFetch<R>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<R> {
   const res = await fetch(`/orchestrator/standalone/${path}`, {

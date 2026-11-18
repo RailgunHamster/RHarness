@@ -336,6 +336,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/worktree-merge.ts` | Inspects a Ticket's isolated Git worktree branch and merges its commits back into the main repository branch |
 | `src/app/worker-nodes.ts` | Distributed LAN Worker Nodes registry, capability-based node selection, remote turn dispatch and P2P Git fast-forward merge |
 | `src/app/device-group.ts` | Decentralized ECDSA P-256 device group identity, multi-address discovery (LAN IP + hostname + Tailscale MagicDNS + Tailscale IP) and one-use invitation URI pairing |
+| `src/app/cluster-update-and-backup.ts` | Data-Center-authoritative cluster auto-update (`git bundle` + `lib/` SHA-256 envelope, dirty-tree protection, drain-before-restart exit code `75`) and Data-Center portable backup, 14-slot rolling snapshots and `merge`/`replace` restore (including sticker binaries) |
 | `src/app/model-profiles.ts` | Named model configuration presets (Profile 1, 2, 3) with per-role N-segment time-of-day scheduling |
 | `src/app/memory-plugin.ts` | First-class Cordis/DSH plugin host and native SQLite Long-Term Memory plugin (`memory_save`, `memory_search`, `memory_list`, `memory_delete` and pinned prompt injection) |
 | `src/app/claw-assistant.ts` | Claw Personal Assistant plugin (`@rharness/plugin-claw-assistant`) and one-way verbatim handoff bridge to the Engineering Eval engine with independent refusal right |
@@ -481,6 +482,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/standalone-events.spec.ts` | Incremental event cursors, live provider text/tool collectors, full-body trace snapshots, privacy, deduplication and session-isolated DSH log fallback |
 | `tests/worktree-merge.spec.ts` | Ticket Git worktree inspection and one-click merge into the main repository branch |
 | `tests/worker-nodes.spec.ts` | Distributed LAN worker node selection, remote ticket turn execution and P2P Git fast-forward merge |
+| `tests/cluster-update-and-backup.spec.ts` | Live-PID lock safety, cryptographic cluster release packaging/verification, dirty-tree protection, two-node Data-Center auto-update distribution and portable backup/snapshot/restore with sticker binaries |
 | `tests/private-pack.spec.ts` | Clean-room public deployment isolation (zero private IPs, domains, paths, seed memories or private plugins when `RHARNESS_PRIVATE_PACK_DIR=none`) and dynamic out-of-tree private pack loading |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 

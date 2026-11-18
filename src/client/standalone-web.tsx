@@ -32,6 +32,8 @@ import {
   type AssistantContextConfigInfo,
   type AssistantMessageInfo,
   type ClawFeedItemInfo,
+  type ClusterUpdateStatusInfo,
+  type DataCenterBackupStatusInfo,
   type DayModeOverrideInfo,
   type DeviceGroupSummary,
   type Lang,
@@ -47,6 +49,7 @@ import {
   type RoleModelScheduleConfigInfo,
   type RoleModelsSummary,
   type RoleTimeSlotRuleInfo,
+  type ServerBuildInfo,
   type SessionProgressCardInfo,
   type SessionSummary,
   type WorkerNodeInfo,
@@ -524,6 +527,162 @@ function WorkerNodesModal({
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState('')
   const [error, setError] = useState('')
+  const [updateStatus, setUpdateStatus] = useState<ClusterUpdateStatusInfo | null>(null)
+  const [backupStatus, setBackupStatus] = useState<DataCenterBackupStatusInfo | null>(null)
+  const [exportWithSecrets, setExportWithSecrets] = useState(true)
+  const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge')
+  const importFileRef = useRef<HTMLInputElement>(null)
+
+  const refreshClusterAndBackup = useCallback(async () => {
+    try {
+      const [u, b] = await Promise.all([
+        standaloneFetch<ClusterUpdateStatusInfo>('cluster-update/status', 'GET').catch(() => null),
+        standaloneFetch<DataCenterBackupStatusInfo>('datacenter-backup/status', 'GET').catch(() => null),
+      ])
+      if (u) setUpdateStatus(u)
+      if (b) setBackupStatus(b)
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    if (!open) return
+    void refreshClusterAndBackup()
+    const t = setInterval(() => { void refreshClusterAndBackup() }, 5000)
+    return () => clearInterval(t)
+  }, [open, refreshClusterAndBackup])
+
+  const publishClusterUpdate = async () => {
+    if (busy) return
+    setBusy(true); setError(''); setFeedback('')
+    try {
+      const res = await standaloneFetch<{
+        ok: boolean
+        storedOn: string
+        notifiedPeers: number
+        manifest: { buildId: string; shortCommit: string; subject: string }
+        warning?: string
+      }>('cluster-update/publish', 'POST', {})
+      setFeedback(
+        res.warning
+          ? `⚠️ ${res.warning}（版本 #${res.manifest.shortCommit}）`
+          : `✅ 已将本机新版 #${res.manifest.shortCommit}（${res.manifest.subject}）上传至数据中心「${res.storedOn}」，并通知 ${res.notifiedPeers} 台在线节点自动拉取更新！`,
+      )
+      await refreshClusterAndBackup()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const checkClusterUpdate = async (forceApply = false) => {
+    if (busy) return
+    setBusy(true); setError(''); setFeedback('')
+    try {
+      const res = await standaloneFetch<{ pulled?: boolean; applied?: boolean; waiting?: boolean }>('cluster-update/check', 'POST', forceApply ? { forceApply: true } : {})
+      setFeedback(
+        forceApply
+          ? '⚡ 已触发本机立即更新重启，1~2 秒后自动恢复…'
+          : res.pulled
+            ? '🔄 已从数据中心拉取到新版本（空闲时立即重启生效，忙碌时等本轮结束自动切换）'
+            : '✅ 当前已是数据中心最新版本',
+      )
+      await refreshClusterAndBackup()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const toggleLocalDataCenterTag = async (hasTag: boolean) => {
+    if (busy) return
+    setBusy(true); setError(''); setFeedback('')
+    try {
+      const res = await standaloneFetch<{ tags: string[]; nodes: WorkerNodeInfo[] }>(
+        'device-group/retag',
+        'POST',
+        hasTag ? { removeTags: ['数据中心'] } : { addTags: ['数据中心'] },
+      )
+      onNodesUpdated(res.nodes)
+      setFeedback(hasTag ? '已移除本机「数据中心」标签' : '✅ 已将本机标记为唯一「数据中心」并签名广播至全组')
+      await refreshClusterAndBackup()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const triggerManualSnapshot = async () => {
+    if (busy) return
+    setBusy(true); setError(''); setFeedback('')
+    try {
+      const res = await standaloneFetch<{ snapshot: { fileName: string } }>('datacenter-backup/snapshot', 'POST', {})
+      setFeedback(`📸 已在数据中心生成快照：${res.snapshot.fileName}`)
+      await refreshClusterAndBackup()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const downloadBackupArchive = (snapshotFile?: string) => {
+    const qs = new URLSearchParams({
+      secrets: exportWithSecrets ? '1' : '0',
+      ...(snapshotFile ? { snapshot: snapshotFile } : {}),
+    })
+    const a = document.createElement('a')
+    a.href = `/orchestrator/standalone/datacenter-backup/export?${qs.toString()}`
+    a.download = snapshotFile ?? `rharness-backup-${new Date().toISOString().slice(0, 10)}.rhbak.gz`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  }
+
+  const importBackupFile = async (file: File) => {
+    if (busy) return
+    setBusy(true); setError(''); setFeedback('')
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer())
+      let binary = ''
+      const chunk = 0x8000
+      for (let i = 0; i < buf.length; i += chunk) {
+        binary += String.fromCharCode(...buf.subarray(i, i + chunk))
+      }
+      const archiveB64 = btoa(binary)
+      const res = await standaloneFetch<{
+        mode: string
+        safetySnapshot: { fileName: string }
+        restoredStickerFiles: number
+      }>('datacenter-backup/import', 'POST', { archiveB64, mode: importMode })
+      setFeedback(`✅ 已${importMode === 'replace' ? '全量覆盖恢复' : '智能合并导入'}备份包（导入前已自动留存后悔快照 ${res.safetySnapshot.fileName}，恢复表情文件 ${res.restoredStickerFiles} 张），并已向全网同步！`)
+      await refreshClusterAndBackup()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+      if (importFileRef.current) importFileRef.current.value = ''
+    }
+  }
+
+  const restoreRollingSnapshot = async (fileName: string) => {
+    if (busy) return
+    setBusy(true); setError(''); setFeedback('')
+    try {
+      const res = await standaloneFetch<{ safetySnapshot: { fileName: string } }>('datacenter-backup/import', 'POST', {
+        snapshotFileName: fileName,
+        mode: importMode,
+      })
+      setFeedback(`↩ 已按「${importMode === 'replace' ? '全量覆盖' : '智能合并'}」恢复历史快照 ${fileName}（原状态已自动存为 ${res.safetySnapshot.fileName}）！`)
+      await refreshClusterAndBackup()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const generateInvite = async () => {
     if (busy) return
@@ -659,10 +818,177 @@ function WorkerNodesModal({
               <span>{lang === 'zh' ? '多路径候选: ' : 'Routes: '}{(node.endpoints?.length ? node.endpoints : [node.url]).join(' → ')}</span>
             </div>
           </div>
-          {node.id !== 'local' && <Button size="sm" variant="outline" disabled={busy} onClick={() => { void removeNode(node.id) }}>
-            {lang === 'zh' ? '移除' : 'Remove'}
-          </Button>}
+          {node.id === 'local' ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => { void toggleLocalDataCenterTag(node.tags.includes('数据中心')) }}
+              data-testid="toggle-local-datacenter-btn"
+            >
+              {node.tags.includes('数据中心') ? (lang === 'zh' ? '移除数据中心标签' : 'Unset Data Center') : (lang === 'zh' ? '设为数据中心' : 'Set as Data Center')}
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => { void removeNode(node.id) }}>
+              {lang === 'zh' ? '移除' : 'Remove'}
+            </Button>
+          )}
         </div>)}
+      </div>
+
+      {/* ---- Cluster Auto-Update Panel ---- */}
+      <div className="dt-form dt-block" data-testid="cluster-update-panel">
+        <div className="dt-live-head">
+          <div>
+            <h3 className="dt-block-title">
+              {lang === 'zh' ? '🚀 全网自动更新（数据中心权威分发 · 忙完平滑重启）' : '🚀 Cluster Auto-Update'}
+              {updateStatus && <Tag tone="info">#{updateStatus.localBuild.shortCommit}</Tag>}
+            </h3>
+            <span className="dt-hint">
+              {lang === 'zh'
+                ? `任意开发机可执行 pnpm release 或点击右侧发布：打包 Git Bundle + 编译产物存至数据中心（${updateStatus?.dataCenterName ?? '未指定'}），在线节点静默下载、等当前对话/工单结束后 1 秒切换，离线节点开机自动追平。`
+                : 'Publishes Git bundle + compiled lib/ to the Data Center; online nodes drain active turns before restarting, offline nodes catch up on boot.'}
+            </span>
+          </div>
+          <div className="dt-row-buttons">
+            <Button size="sm" variant="primary" disabled={busy} onClick={() => { void publishClusterUpdate() }} data-testid="cluster-publish-update-btn">
+              {lang === 'zh' ? '🚀 打包本机并发布全网' : '🚀 Publish to cluster'}
+            </Button>
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => { void checkClusterUpdate(false) }} data-testid="cluster-check-update-btn">
+              {lang === 'zh' ? '🔍 检查更新' : '🔍 Check'}
+            </Button>
+            {updateStatus?.stagedUpdate && (
+              <Button size="sm" variant="outline" disabled={busy} onClick={() => { void checkClusterUpdate(true) }} data-testid="cluster-force-apply-btn">
+                {lang === 'zh' ? '⚡ 立即重启生效' : '⚡ Restart now'}
+              </Button>
+            )}
+          </div>
+        </div>
+        {updateStatus && (
+          <div className="dt-pipeline-list">
+            <div className="dt-msg-receipt" data-active="true">
+              <div className="dt-msg-receipt-main">
+                <Tag tone={updateStatus.latestRelease && updateStatus.latestRelease.buildId !== updateStatus.localBuild.buildId ? 'warning' : 'success'}>
+                  {updateStatus.stagedUpdate
+                    ? (lang === 'zh' ? '⏳ 已就绪待空闲' : '⏳ Waiting idle')
+                    : (lang === 'zh' ? '本机运行中' : 'Local running')}
+                </Tag>
+                <strong className="dt-mono">{updateStatus.localBuild.buildId}</strong>
+                {updateStatus.localBuild.subject && <span>{updateStatus.localBuild.subject}</span>}
+                {updateStatus.busy.busy && <span className="dt-msg-receipt-branch">🔥 {updateStatus.busy.reasons.join('、')}</span>}
+              </div>
+              {updateStatus.latestRelease && (
+                <span className="dt-mono dt-hint">
+                  {lang === 'zh' ? `数据中心最新: ${updateStatus.latestRelease.buildId}` : `Latest: ${updateStatus.latestRelease.buildId}`}
+                </span>
+              )}
+            </div>
+            {updateStatus.peerStatuses.map(p => {
+              const targetId = updateStatus.latestRelease?.buildId ?? updateStatus.localBuild.buildId
+              const synced = p.reachable && p.buildId === targetId
+              return (
+                <div key={p.id} className="dt-msg-receipt" data-active={synced}>
+                  <div className="dt-msg-receipt-main">
+                    <Tag tone={!p.reachable ? 'neutral' : synced ? 'success' : 'warning'}>
+                      {!p.reachable ? (lang === 'zh' ? '不可达' : 'Unreachable') : synced ? (lang === 'zh' ? '已同步' : 'Up to date') : p.stagedBuildId ? (lang === 'zh' ? '待空闲切换' : 'Draining') : (lang === 'zh' ? '待更新' : 'Behind')}
+                    </Tag>
+                    <strong>{p.name}</strong>
+                    <span className="dt-mono dt-msg-receipt-branch">{p.buildId}</span>
+                    {p.isDataCenter && <Tag tone="info">数据中心</Tag>}
+                    {p.busy?.busy && <span className="dt-hint">🔥 {p.busy.reasons.join('、')}</span>}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* ---- Data Center Backup, Import/Export & Rolling Snapshots Panel ---- */}
+      <div className="dt-form dt-block" data-testid="datacenter-backup-panel">
+        <div className="dt-live-head">
+          <div>
+            <h3 className="dt-block-title">
+              {lang === 'zh' ? '💾 数据中心全量备份 · 导入导出 · 自动滚动快照' : '💾 Data Center Backup & Import/Export'}
+              {backupStatus?.dataCenterName && <Tag tone="success">{backupStatus.dataCenterName}</Tag>}
+            </h3>
+            <span className="dt-hint">
+              {backupStatus
+                ? `当前权威库统计：常驻地址 ${backupStatus.currentSummary.residentAddressCount} 条 · 记忆 ${backupStatus.currentSummary.memoryCount} 条 · 助理对话 ${backupStatus.currentSummary.assistantMessageCount} 条 · 相处默契 ${backupStatus.currentSummary.personaLearningCount} 条 · 表情包 ${backupStatus.currentSummary.stickerCount} 张（原图 ${backupStatus.currentSummary.stickerFileCount} 份）。数据中心每 24 小时自动滚动留存最近 14 份快照，任何导入前自动先拍一份后悔快照。`
+                : (lang === 'zh' ? '正在读取数据中心备份状态…' : 'Loading backup status…')}
+            </span>
+          </div>
+          <div className="dt-row-buttons">
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={exportWithSecrets}
+                onChange={e => setExportWithSecrets(e.target.checked)}
+                data-testid="backup-include-secrets-checkbox"
+              />
+              {lang === 'zh' ? '含高德 Key 等密钥' : 'Include API keys'}
+            </label>
+            <Button size="sm" variant="primary" disabled={busy} onClick={() => downloadBackupArchive()} data-testid="backup-export-download-btn">
+              {lang === 'zh' ? '📥 导出下载全量包 (.rhbak.gz)' : '📥 Export (.rhbak.gz)'}
+            </Button>
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => { void triggerManualSnapshot() }} data-testid="backup-manual-snapshot-btn">
+              {lang === 'zh' ? '📸 立即拍快照' : '📸 Snapshot now'}
+            </Button>
+          </div>
+        </div>
+
+        <div className="dt-row-buttons">
+          <select
+            className="dt-select"
+            style={{ width: 280 }}
+            value={importMode}
+            onChange={e => setImportMode(e.target.value as 'merge' | 'replace')}
+            data-testid="backup-import-mode-select"
+          >
+            <option value="merge">{lang === 'zh' ? '导入模式：智能合并（推荐，不丢新增数据）' : 'Mode: Smart Merge (Recommended)'}</option>
+            <option value="replace">{lang === 'zh' ? '导入模式：全量覆盖恢复（换机/灾备回滚）' : 'Mode: Full Replace'}</option>
+          </select>
+          <input
+            ref={importFileRef}
+            type="file"
+            accept=".gz,.rhbak,.json"
+            style={{ display: 'none' }}
+            onChange={e => {
+              const f = e.target.files?.[0]
+              if (f) void importBackupFile(f)
+            }}
+            data-testid="backup-import-file-input"
+          />
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => importFileRef.current?.click()} data-testid="backup-import-btn">
+            {lang === 'zh' ? '📤 选择备份包导入恢复' : '📤 Import archive'}
+          </Button>
+        </div>
+
+        {(backupStatus?.snapshots.length ?? 0) > 0 && (
+          <div className="dt-pipeline-list" data-testid="backup-snapshots-list">
+            {backupStatus!.snapshots.slice(0, 8).map(snap => (
+              <div key={snap.fileName} className="dt-msg-receipt">
+                <div className="dt-msg-receipt-main">
+                  <Tag tone={snap.reason === 'pre-import' ? 'warning' : snap.reason === 'auto-daily' ? 'info' : 'success'}>
+                    {snap.reason === 'auto-daily' ? '每日自动' : snap.reason === 'pre-import' ? '导入前保护' : '手动快照'}
+                  </Tag>
+                  <strong className="dt-mono">{snap.fileName}</strong>
+                  <span className="dt-hint">
+                    · {formatSmartTimestamp(snap.createdAt, lang)} · {Math.max(1, Math.round(snap.sizeBytes / 1024))} KB · 地址 {snap.summary.residentAddressCount} / 记忆 {snap.summary.memoryCount} / 对话 {snap.summary.assistantMessageCount} / 表情 {snap.summary.stickerCount}
+                  </span>
+                </div>
+                <div className="dt-msg-head-actions">
+                  <Button size="sm" variant="ghost" disabled={busy} onClick={() => downloadBackupArchive(snap.fileName)}>
+                    {lang === 'zh' ? '📥 下载' : 'Download'}
+                  </Button>
+                  <Button size="sm" variant="ghost" disabled={busy} onClick={() => { void restoreRollingSnapshot(snap.fileName) }} data-testid={`backup-restore-${snap.fileName}`}>
+                    {lang === 'zh' ? '↩ 恢复此快照' : 'Restore'}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <details className="dt-conversation-settings">
@@ -2236,6 +2562,21 @@ export function StandaloneRoot() {
   const [progressCards, setProgressCards] = useState<Record<string, SessionProgressCardInfo>>({})
   const [pendingQuestions, setPendingQuestions] = useState<PendingUserQuestionInfo[]>([])
   const [pipelineRows, setPipelineRows] = useState<PipelineRow[]>([])
+  const [serverBuild, setServerBuild] = useState<ServerBuildInfo>()
+  const initialBuildIdRef = useRef<string | null>(null)
+  const lastTypingAtRef = useRef<number>(0)
+
+  useEffect(() => {
+    const markTyping = () => { lastTypingAtRef.current = Date.now() }
+    document.addEventListener('keydown', markTyping, true)
+    document.addEventListener('input', markTyping, true)
+    document.addEventListener('compositionstart', markTyping, true)
+    return () => {
+      document.removeEventListener('keydown', markTyping, true)
+      document.removeEventListener('input', markTyping, true)
+      document.removeEventListener('compositionstart', markTyping, true)
+    }
+  }, [])
 
   const handleMetaUpdate = useCallback((meta: {
     roleModels?: RoleModelsSummary
@@ -2255,6 +2596,7 @@ export function StandaloneRoot() {
     progressCards?: Record<string, SessionProgressCardInfo>
     pendingQuestions?: PendingUserQuestionInfo[]
     pipeline?: PipelineRow[]
+    serverBuild?: ServerBuildInfo
   }) => {
     if (meta.roleModels) setRoleModels(meta.roleModels)
     if (meta.modelProfiles) setModelProfiles(meta.modelProfiles)
@@ -2273,6 +2615,12 @@ export function StandaloneRoot() {
     if (meta.progressCards) setProgressCards(meta.progressCards)
     if (meta.pendingQuestions) setPendingQuestions(meta.pendingQuestions)
     if (meta.pipeline) setPipelineRows(meta.pipeline)
+    if (meta.serverBuild) {
+      if (!initialBuildIdRef.current && meta.serverBuild.buildId && !meta.serverBuild.buildId.startsWith('unknown')) {
+        initialBuildIdRef.current = meta.serverBuild.buildId
+      }
+      setServerBuild(meta.serverBuild)
+    }
   }, [])
 
   const refreshAssistantMessages = useCallback(async () => {
@@ -2296,6 +2644,35 @@ export function StandaloneRoot() {
         m => m.handoff && (m.handoff.state === 'evaluating' || m.handoff.ticketState === 'running'),
       ),
   )
+
+  const frontendOutdated = Boolean(
+    initialBuildIdRef.current &&
+      serverBuild?.buildId &&
+      !serverBuild.buildId.startsWith('unknown') &&
+      serverBuild.buildId !== initialBuildIdRef.current,
+  )
+
+  // Idle-auto-reload: when the backend upgrades to a new buildId, reload seamlessly once the user
+  // is not actively typing in an input (<8s) and no live reply stream / nodes modal is open.
+  useEffect(() => {
+    if (!frontendOutdated) return
+    const attemptReloadIfIdle = () => {
+      if (hasActiveAssistantOrHandoffRun || nodesModalOpen) return
+      const active = document.activeElement
+      const inEditable = Boolean(
+        active && (
+          active.tagName === 'INPUT' ||
+          active.tagName === 'TEXTAREA' ||
+          (active as HTMLElement).isContentEditable
+        ),
+      )
+      if (inEditable && Date.now() - lastTypingAtRef.current < 8000) return
+      try { window.location.reload() } catch {}
+    }
+    attemptReloadIfIdle()
+    const timer = setInterval(attemptReloadIfIdle, 2000)
+    return () => clearInterval(timer)
+  }, [frontendOutdated, hasActiveAssistantOrHandoffRun, nodesModalOpen])
 
   useEffect(() => {
     if (viewMode !== 'assistant' || !hasActiveAssistantOrHandoffRun) return
@@ -2427,9 +2804,24 @@ export function StandaloneRoot() {
           {isProfilesPluginEnabled && <Button variant="outline" size="sm" onClick={() => setProfilesModalOpen(true)}>
             {lang === 'zh' ? '配置组' : 'Profiles'}
           </Button>}
-          {isDeviceGroupPluginEnabled && <Button variant="outline" size="sm" onClick={() => setNodesModalOpen(true)}>
+          {isDeviceGroupPluginEnabled && <Button variant="outline" size="sm" onClick={() => setNodesModalOpen(true)} data-testid="open-nodes-modal-btn">
             {lang === 'zh' ? `节点 (${onlineNodeCount})` : `Nodes (${onlineNodeCount})`}
           </Button>}
+          {frontendOutdated && serverBuild && (
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => { try { window.location.reload() } catch {} }}
+              data-testid="frontend-update-ready-btn"
+            >
+              {lang === 'zh' ? `✨ 新版 #${serverBuild.shortCommit} 已就绪（停手自动刷新 / 点此立刷）` : `✨ Update #${serverBuild.shortCommit} ready`}
+            </Button>
+          )}
+          {serverBuild?.pendingUpdate && !frontendOutdated && (
+            <span className="dt-model-pill" data-testid="backend-pending-update-pill">
+              {lang === 'zh' ? `⏳ 后端待空闲更新 #${serverBuild.pendingUpdate.shortCommit}` : `⏳ Draining for #${serverBuild.pendingUpdate.shortCommit}`}
+            </span>
+          )}
           {pendingQuestions.length > 0 && (
             <Button
               variant="primary"

@@ -277,6 +277,7 @@ export function LiveWorkspace({
     progressCards?: Record<string, SessionProgressCardInfo>
     pendingQuestions?: PendingUserQuestionInfo[]
     pipeline?: PipelineRow[]
+    serverBuild?: import('./standalone-api.ts').ServerBuildInfo
   }) => void) | undefined
 }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
@@ -340,6 +341,7 @@ export function LiveWorkspace({
           ...(result.progressCards ? { progressCards: result.progressCards } : {}),
           ...(result.pendingQuestions ? { pendingQuestions: result.pendingQuestions } : {}),
           ...(result.pipeline ? { pipeline: result.pipeline } : {}),
+          ...(result.serverBuild ? { serverBuild: result.serverBuild } : {}),
         })
         setSelected(current => {
           if (manual && result.sessions.some(session => session.id === current)) return current
