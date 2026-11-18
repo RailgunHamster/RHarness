@@ -378,6 +378,9 @@ export function deleteStickerFile(record: StickerRecord): void {
 export function findSticker(records: readonly StickerRecord[], query: string): StickerRecord[] {
   const q = query.trim().toLowerCase()
   if (!q) return []
+  // Models often probe with wildcard-style queries ("*", "all") expecting the full gallery; answer with every active sticker
+  // instead of a confusing 0-match that reads as "the gallery is empty".
+  if (q === '*' || q === 'all' || q === '全部') return records.filter(r => !r.deletedAt)
   return records.filter(r => !r.deletedAt && (r.id === q || r.name.toLowerCase() === q || r.name.toLowerCase().includes(q) || r.tags.some(t => t.toLowerCase() === q || t.toLowerCase().includes(q)) || (r.emotion ?? '').toLowerCase() === q))
 }
 

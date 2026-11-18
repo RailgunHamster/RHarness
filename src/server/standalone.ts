@@ -1983,6 +1983,15 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     // Never pollute the Engineering Eval (`orchestrator-*`) session with personal assistant or memory tools
     if (!isAssistant && !isWorker) return
 
+    // Declared before the assistant-only registrations so persona/ambient and bridge tools are mirrored into the same
+    // registry `tool_catalog_search` / `tool_catalog_describe` enumerate (they were previously invisible there, which
+    // made the assistant conclude its sticker tools had disappeared).
+    const sessionToolRegistry = new Map<string, ReturnType<typeof buildModelUsageTools>[0]>()
+    const registerWithMirror = (spec: ReturnType<typeof buildModelUsageTools>[0]) => {
+      sessionToolRegistry.set(spec.name, spec)
+      agent.ctx.tools?.register(spec)
+    }
+
     if (isAssistant) {
       agent.ctx.systemPrompt?.section({
         name: 'rharness-claw-assistant-persona',
@@ -2005,7 +2014,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         },
       })
       for (const bridgeTool of buildAssistantBridgeTools(() => runtime)) {
-        agent.ctx.tools?.register(bridgeTool)
+        registerWithMirror(bridgeTool)
       }
       for (const pat of buildAssistantPersonaAmbientTools({
         isEnabled: () => isPluginEnabled('dsh-assistant-persona'),
@@ -2033,7 +2042,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           return undefined
         },
       })) {
-        agent.ctx.tools?.register(pat)
+        registerWithMirror(pat)
       }
     }
 
@@ -2158,11 +2167,6 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     }
 
     // Mount absorbed OpenClaw & Community Top Plugins (Model Usage, Lossless DAG, Self-Improving, Web Research, Browser Bridge, Progress Card, Data SQL, Tool Search)
-    const sessionToolRegistry = new Map<string, ReturnType<typeof buildModelUsageTools>[0]>()
-    const registerWithMirror = (spec: ReturnType<typeof buildModelUsageTools>[0]) => {
-      sessionToolRegistry.set(spec.name, spec)
-      agent.ctx.tools?.register(spec)
-    }
     for (const mt of memTools) sessionToolRegistry.set(mt.name, mt)
     for (const pst of personalSkillTools) sessionToolRegistry.set(pst.name, pst)
     for (const cft of clawFeedTools) sessionToolRegistry.set(cft.name, cft)
