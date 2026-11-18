@@ -428,6 +428,24 @@ describe('ambient awareness', () => {
     expect(walking.links.amap).toContain('mode=walk')
     expect(walking.links.baidu).toContain('mode=walking')
 
+    // Campus-with-building-number (`XX（北杨园区）-北区2号楼`, no road/lane number) must prefer POI search over geocode/geo's wrong generic POI hit.
+    const campusFetcher = vi.fn(async (url: string) => {
+      if (url.includes('geocode/geo')) {
+        return new Response(JSON.stringify({ status: '1', geocodes: [{ location: '121.394975,31.169328', formatted_address: '旧园区', city: '上海市', level: '兴趣点' }] }), { status: 200 })
+      }
+      if (url.includes('place/text')) {
+        return new Response(JSON.stringify({ status: '1', pois: [{ name: '创想科技(北杨园区)-北区2号楼', location: '121.438465,31.127039', cityname: '上海市' }] }), { status: 200 })
+      }
+      if (url.includes('direction/walking')) {
+        return new Response(JSON.stringify({ status: '1', route: { paths: [{ distance: '2300', duration: '1860', steps: [{ instruction: '向东步行到达北杨园区' }] }] } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ results: [] }), { status: 200 })
+    }) as unknown as typeof fetch
+    const campusAddr = upsertResidentAddress(defaultAssistantAmbientConfig(), { label: '目标园区', address: '上海市徐汇区创想科技（北杨园区）-北区2号楼', city: shanghai }).config.residentAddresses
+    const campusWalk = await planNavigation({ fromText: '121.42733,31.132642', toText: '目标园区', mode: 'walking', addresses: campusAddr, amapKey: 'test-key', fetcher: campusFetcher })
+    expect(campusWalk.destination).toMatchObject({ longitude: 121.438465, latitude: 31.127039 })
+    expect(campusWalk.distanceKm).toBe(2.3)
+
     // No key: still returns tappable links from saved city coordinates, with an explanatory note.
     const linksOnly = await planNavigation({ toText: '公司', mode: 'driving', addresses: cfg.residentAddresses, fetcher })
     expect(linksOnly.provider).toBe('links')

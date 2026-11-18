@@ -1237,6 +1237,8 @@ export async function reverseGeocodeWithAmap(longitude: number, latitude: number
 }
 
 const resolvedAddressCoordCache = new Map<string, AmbientHomeCity>()
+/** Street/village/lane + number = true postal door address; campus/building names like `XX园区-北区2号楼` go POI-first. */
+const STREET_DOOR_ADDRESS_RE = /(路|街|大道|巷|村|弄|胡同)\s*\d/
 
 /**
  * Resolves the city + coordinates for a resident address being saved: pasted coordinates
@@ -1270,9 +1272,11 @@ export async function resolveAddressCity(addressText: string, input: { amapKey?:
       }
       return val
     }
-    const geo = await geocodeWithAmap(addressText, input.amapKey, fetcher, input.cityHint).catch(() => undefined)
-    if (geo && geo.level && PRECISE_GEOCODE_LEVELS.has(geo.level)) {
-      return cacheAndReturn({ name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' })
+    if (STREET_DOOR_ADDRESS_RE.test(addressText)) {
+      const geo = await geocodeWithAmap(addressText, input.amapKey, fetcher, input.cityHint).catch(() => undefined)
+      if (geo && geo.level && PRECISE_GEOCODE_LEVELS.has(geo.level)) {
+        return cacheAndReturn({ name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' })
+      }
     }
     const places = await searchPlacesWithAmap(addressText, { apiKey: input.amapKey, ...(input.cityHint ? { city: input.cityHint } : {}), fetcher }).catch(() => [])
     const scored = places.map(p => ({ p, score: scorePlaceMatch(addressText, p) })).sort((a, b) => b.score - a.score)
@@ -1280,6 +1284,7 @@ export async function resolveAddressCity(addressText: string, input: { amapKey?:
     if (top && top.score >= 60) {
       return cacheAndReturn({ name: top.p.cityName || input.cityHint?.trim() || top.p.name, longitude: top.p.longitude, latitude: top.p.latitude, timezone: 'Asia/Shanghai' })
     }
+    const geo = await geocodeWithAmap(addressText, input.amapKey, fetcher, input.cityHint).catch(() => undefined)
     if (geo) {
       return cacheAndReturn({ name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' })
     }
@@ -1355,8 +1360,6 @@ interface ResolvedEndpoint {
   candidates?: PlaceCandidate[]
 }
 
-const POSTAL_ADDRESS_RE = /\d+\s*(号|弄|栋|幢|室|层|楼)/
-
 /**
  * End-to-end navigation orchestration shared by the Assistant tool and the Web UI.
  * Endpoint resolution order (this ordering is the fix for drifting destinations):
@@ -1401,8 +1404,7 @@ export async function planNavigation(input: {
     if (matched) return fromSavedAddress(matched)
     const label = (role === 'destination' && input.toLabel) || t || (role === 'origin' ? '起点' : '目的地')
     if (input.amapKey && t) {
-      const looksPostal = POSTAL_ADDRESS_RE.test(t) || /(路|街|大道|巷|村)\s*\d/.test(t)
-      if (looksPostal) {
+      if (STREET_DOOR_ADDRESS_RE.test(t)) {
         const geo = await geocodeWithAmap(t, input.amapKey, fetcher).catch(() => undefined)
         if (geo && geo.level && PRECISE_GEOCODE_LEVELS.has(geo.level)) {
           return { point: { label, longitude: geo.longitude, latitude: geo.latitude, ...(geo.city ? { cityName: geo.city } : {}) }, addressText: t, precision: 'door' }
