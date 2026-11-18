@@ -1672,7 +1672,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         const args = stickerListSchema.parse(raw ?? {})
         const all = deps.getStickers()
         const items = args.query ? findSticker(all, args.query) : activeStickers(all)
-        return { ok: true, count: items.length, stickers: items.map(s => ({ id: s.id, name: s.name, tags: s.tags, emotion: s.emotion, sizeBytes: s.sizeBytes, useCount: s.useCount, createdAt: s.createdAt })) }
+        return { ok: true, count: items.length, stickers: items.map(s => ({ id: s.id, name: s.name, tags: s.tags, ...(s.emotion ? { emotion: s.emotion } : {}), sizeBytes: s.sizeBytes, useCount: s.useCount, createdAt: s.createdAt })) }
       },
     },
     {
@@ -1704,7 +1704,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
           toolName: 'sticker_add_from_message',
           patch: { domain: 'sticker', op: 'add', entryId: saved.entry.id, after: saved.entry },
         })
-        return { ok: true, sticker: { id: saved.entry.id, name: saved.entry.name, tags: saved.entry.tags, emotion: saved.entry.emotion } }
+        return { ok: true, sticker: { id: saved.entry.id, name: saved.entry.name, tags: saved.entry.tags, ...(saved.entry.emotion ? { emotion: saved.entry.emotion } : {}) } }
       },
     },
     {
@@ -1769,13 +1769,16 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         const matches = findSticker(all, args.id_or_name)
         if (matches.length !== 1) return { ok: false, error: matches.length === 0 ? 'Sticker not found' : 'Multiple stickers match', candidates: matches.map(s => ({ id: s.id, name: s.name })) }
         const target = matches[0]!
+        const nextEmotion = args.emotion !== undefined ? args.emotion.trim().slice(0, 20) : undefined
         const updated: StickerRecord = {
           ...target,
           ...(args.name ? { name: args.name.trim().slice(0, 40) } : {}),
           ...(args.tags ? { tags: [...new Set(args.tags.map(t => t.trim()).filter(Boolean))].slice(0, 8) } : {}),
-          ...(args.emotion !== undefined ? { emotion: args.emotion.trim().slice(0, 20) || undefined } : {}),
+          ...(nextEmotion ? { emotion: nextEmotion } : {}),
           updatedAt: new Date().toISOString(),
         }
+        // Explicitly clearing the emotion must remove the key (an `undefined` own property breaks lossless-JSON snapshots).
+        if (args.emotion !== undefined && !nextEmotion) delete updated.emotion
         deps.setStickers(all.map(s => (s.id === target.id ? updated : s)))
         deps.recordPersistenceChange?.({
           domain: 'sticker',
@@ -1785,7 +1788,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
           toolName: 'sticker_update',
           patch: { domain: 'sticker', op: 'update', entryId: target.id, before: target, after: updated },
         })
-        return { ok: true, sticker: { id: updated.id, name: updated.name, tags: updated.tags, emotion: updated.emotion } }
+        return { ok: true, sticker: { id: updated.id, name: updated.name, tags: updated.tags, ...(updated.emotion ? { emotion: updated.emotion } : {}) } }
       },
     },
     {

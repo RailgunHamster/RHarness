@@ -560,6 +560,11 @@ describe('assistant persona/ambient tools', () => {
     expect(stickers).toHaveLength(1)
     const listed = await byName('sticker_list').execute({}, { signal: new AbortController().signal }) as { count: number }
     expect(listed.count).toBe(1)
+    // Regression: the sticker was saved without an emotion, so the tool output must not carry an `undefined`-valued
+    // own key — that fails the harness lossless-JSON snapshot and the assistant then wrongly reports the gallery as empty.
+    const listedRaw = await byName('sticker_list').execute({}, { signal: new AbortController().signal }) as Record<string, unknown>
+    expect(JSON.parse(JSON.stringify(listedRaw))).toEqual(listedRaw)
+    for (const s of listedRaw.stickers as Record<string, unknown>[]) for (const v of Object.values(s)) expect(v !== undefined).toBe(true)
     await byName('persona_learning_add').execute({ content: '闲聊简短一点', kind: 'style' }, { signal: new AbortController().signal })
     expect(learnings).toHaveLength(1)
     await byName('persona_learning_delete').execute({ id_or_text: '简短' }, { signal: new AbortController().signal })
