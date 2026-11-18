@@ -20,7 +20,14 @@ import { key, latestReport, reasonText, threadKey, waitsForPerson } from '../cor
 import { KV } from '../kv.ts'
 import { PANEL_SOURCE, panelTrigger } from '../sources/panel.ts'
 import type { PanelContentPart, StoredPanelContent } from '../sources/panel-images.ts'
-import { MEMORY_BACKUP_RETENTION_MS } from './memory-plugin.ts'
+import { MEMORY_BACKUP_RETENTION_MS, type MemoryEntry } from './memory-plugin.ts'
+import type {
+  AmbientHomeCity,
+  AssistantPersonaConfig,
+  PersonaLearningEntry,
+  ResidentAddress,
+  StickerRecord,
+} from './assistant-persona-and-ambient.ts'
 import type { Runtime } from './runtime.ts'
 import type { RegisteredToolSpec } from './standalone-host.ts'
 
@@ -72,6 +79,115 @@ export interface AssistantReplyToolCall {
   at?: string
 }
 
+export type PersistenceChangeDomain = 'memory' | 'learning' | 'sticker' | 'address' | 'persona'
+
+/**
+ * Item-level reversible delta for every persistent store the Personal Assistant can mutate:
+ * - Tier A (`auto`: `memory` | `learning` | `sticker`): applied immediately (`status: 'applied'`), undoable anytime.
+ * - Tier B (`approval`: `address` | `persona`): staged (`status: 'pending'`) until the user approves
+ *   (`status: 'approved'`, still undoable anytime!) or rejects (`status: 'rejected'`).
+ * Stored permanently on the bot message's `replyMeta.persistenceChanges` inside conversation history.
+ */
+export type PersistenceChangePatch =
+  | { domain: 'memory'; op: 'add' | 'update' | 'delete'; entryId: string; before?: MemoryEntry; after?: MemoryEntry }
+  | { domain: 'learning'; op: 'add' | 'delete'; entryId: string; before?: PersonaLearningEntry; after?: PersonaLearningEntry }
+  | { domain: 'sticker'; op: 'add' | 'update' | 'trash' | 'restore'; entryId: string; before?: StickerRecord; after?: StickerRecord }
+  | {
+      domain: 'address'
+      op: 'upsert'
+      beforeEntry?: ResidentAddress
+      afterInput: { label?: string; address: string; city: AmbientHomeCity; makePrimary?: boolean }
+      appliedEntryId?: string
+      previousHomeCity?: AmbientHomeCity
+    }
+  | { domain: 'address'; op: 'delete'; targetId: string; beforeEntry: ResidentAddress }
+  | { domain: 'address'; op: 'set_city'; beforeCity: AmbientHomeCity; afterCity: AmbientHomeCity }
+  | { domain: 'persona'; before: AssistantPersonaConfig; patchFields: Partial<AssistantPersonaConfig> }
+
+export interface PersistenceChangeRecord {
+  id: string
+  domain: PersistenceChangeDomain
+  mode: 'auto' | 'approval'
+  status: 'applied' | 'pending' | 'approved' | 'rejected' | 'undone'
+  summary: string
+  toolName: string
+  createdAt: string
+  decidedAt?: string
+  undoneAt?: string
+  patch: PersistenceChangePatch
+}
+
+export const PERSISTENCE_DOMAIN_LABEL: Record<PersistenceChangeDomain, string> = {
+  memory: '记忆库',
+  learning: '相处默契',
+  sticker: '表情包',
+  address: '常驻地址',
+  persona: '人设配置',
+}
+
+export function persistenceChangeShortId(id: string): string {
+  const tail = id.split('-').pop() ?? id
+  return tail.slice(-4)
+}
+
+/** Appends a scannable Markdown notice to Feishu replies whenever a turn stages or applies persistent changes. */
+export function formatFeishuPersistenceFooter(changes: readonly PersistenceChangeRecord[]): string {
+  if (changes.length === 0) return ''
+  const lines: string[] = ['', '---']
+  for (const ch of changes) {
+    const code = persistenceChangeShortId(ch.id)
+    const label = PERSISTENCE_DOMAIN_LABEL[ch.domain]
+    if (ch.status === 'pending') {
+      lines.push(`🔒 **待你确认的数据修改** \`#${code}\` · **${label}**：${ch.summary}`)
+      lines.push(`> 回复 \`同意\`（或 \`同意 ${code}\`）立即生效，生效后随时可回复 \`撤回 ${code}\`；回复 \`拒绝\` 取消。`)
+    } else if (ch.status === 'applied') {
+      lines.push(`⚠️ **已修改持久化数据** \`#${code}\` · **${label}**：${ch.summary}`)
+      lines.push(`> 如不合适，回复 \`撤回\`（或 \`撤回 ${code}\`）即可一键恢复。`)
+    }
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Recognises deterministic quick commands in Feishu DM or Web chat (`同意` / `拒绝` / `撤回 [#id]`)
+ * so mobile/Feishu users can approve, reject, or undo persistent changes in 50ms without LLM calls.
+ * Bare commands only match when the latest bot reply actually carries a matching pending/undoable change.
+ */
+export function parsePersistenceQuickCommand(
+  rawText: string,
+  opts: { hasPendingOnLatest: boolean; hasUndoableOnLatest: boolean },
+): { action: 'approve' | 'reject' | 'undo'; shortId?: string } | undefined {
+  const clean = rawText
+    .replace(/^📱\s*\[飞书私聊\]\s*/, '')
+    .trim()
+    .replace(/[。！!？?.]+$/g, '')
+    .trim()
+  if (!clean || clean.length > 24) return undefined
+
+  const approveWithId = /^(?:同意|确认|允许)(?:修改)?\s+#?([a-z0-9]{4,12})$/i.exec(clean)
+    ?? /^(?:同意|确认|允许)#([a-z0-9]{4,12})$/i.exec(clean)
+  if (approveWithId) return { action: 'approve', shortId: approveWithId[1]!.toLowerCase() }
+
+  const rejectWithId = /^(?:拒绝|不同意|取消修改)\s+#?([a-z0-9]{4,12})$/i.exec(clean)
+    ?? /^(?:拒绝|不同意|取消修改)#([a-z0-9]{4,12})$/i.exec(clean)
+  if (rejectWithId) return { action: 'reject', shortId: rejectWithId[1]!.toLowerCase() }
+
+  const undoWithId = /^(?:撤回|撤销)(?:修改)?\s+#?([a-z0-9]{4,12})$/i.exec(clean)
+    ?? /^(?:撤回|撤销)(?:修改)?#([a-z0-9]{4,12})$/i.exec(clean)
+  if (undoWithId) return { action: 'undo', shortId: undoWithId[1]!.toLowerCase() }
+
+  if (opts.hasPendingOnLatest && /^(?:同意|确认|允许|同意修改|确认修改)$/.test(clean)) {
+    return { action: 'approve' }
+  }
+  if (opts.hasPendingOnLatest && /^(?:拒绝|不同意|拒绝修改|取消修改)$/.test(clean)) {
+    return { action: 'reject' }
+  }
+  if (opts.hasUndoableOnLatest && /^(?:撤回|撤销|撤回修改|撤销修改)$/.test(clean)) {
+    return { action: 'undo' }
+  }
+  return undefined
+}
+
 export interface AssistantReplyMeta {
   model: { provider: string; model: string; reasoningEffort?: string }
   matchedSlot?: { label: string; startTime: string; endTime: string; dayType?: 'all' | 'workday' | 'holiday' }
@@ -79,6 +195,8 @@ export interface AssistantReplyMeta {
   durationMs?: number
   toolCalls?: AssistantReplyToolCall[]
   events?: { type: string; data: unknown; at: string }[]
+  /** Persistent data mutations performed (`applied`) or staged (`pending`) during this reply, kept permanently for audit & 1-click undo. */
+  persistenceChanges?: PersistenceChangeRecord[]
 }
 
 export interface AssistantStoredMessage {
@@ -272,6 +390,9 @@ export const ASSISTANT_SYSTEM_PROMPT = [
   '   - Whenever you need the user\'s opinion, preference, or confirmation between choices, call `assistant_ask_user` with `question` and optional `options` (e.g. `["方案 A：...", "方案 B：..."]`) so the Web UI renders an interactive decision card for the user.',
   '5. **Lossless Context DAG & Historical Recall (`lcm_grep` / `lcm_expand`)**:',
   '   - Only the latest raw tail messages are passed directly in your prompt; earlier turns are compressed into the Lossless Context DAG. Whenever the user refers to earlier conversations or details before a window reset, call `lcm_grep` or `lcm_expand` to recover exact details.',
+  '6. **Persistent Data Governance (Two-Tier Audit & Undo)**:',
+  '   - Memory (`memory_*`), persona learnings (`persona_learning_*`), and stickers (`sticker_*`) take effect immediately and automatically attach an undoable warning notice at the bottom of your reply.',
+  '   - Resident addresses (`ambient_save_address`, `ambient_delete_address`, `ambient_set_home_city`) and persona config (`persona_update`) NEVER overwrite the database directly — they return `pendingApproval: true` and attach an interactive confirmation bar at the bottom of your reply. When `pendingApproval: true` is returned, NEVER claim the change has already taken effect; tell the user clearly to click「同意」(or reply `同意` on Feishu) to apply it.',
 ].join('\n')
 
 /**

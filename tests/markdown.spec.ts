@@ -32,6 +32,7 @@ import {
   ingestMessagesIntoLcmDag,
   parseBtwSideQuestion,
 } from '../src/app/lossless-and-learning.ts'
+import { startStandaloneServer } from '../src/server/standalone.ts'
 import {
   executeReadonlyDataSql,
   extractReadableMarkdownFromHtml,
@@ -414,5 +415,109 @@ it('edits a memory as delete-old + add-new with the old version archived in the 
     expect(entries[0]?.content).toBe('工具编辑版')
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+it('executes approve / reject / undo on Assistant persistence-change receipts and preserves permanent audit trail', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rharness-persist-gov-'))
+  const srv = await startStandaloneServer({ port: 0, host: '127.0.0.1', stateDir: dir, liveAgents: false })
+  try {
+    const H = { 'x-orchestrator-request': '1', 'content-type': 'application/json', origin: srv.url }
+    const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
+
+    // Seed initial resident address via REST (UI path)
+    const seedRes = await fetch(`${srv.url}/orchestrator/standalone/assistant/ambient/config`, {
+      method: 'PUT',
+      headers: H,
+      body: JSON.stringify({
+        residentAddresses: [{
+          id: 'addr-seed-1',
+          label: '园区',
+          address: '上海市徐汇区初始园区1号楼',
+          city: shanghai,
+          isPrimary: true,
+          createdAt: '2026-11-18T00:00:00.000Z',
+          updatedAt: '2026-11-18T00:00:00.000Z',
+        }],
+      }),
+    })
+    expect(seedRes.status).toBe(200)
+
+    // Seed a bot reply carrying one pending Tier-B address change + one applied Tier-A persona learning
+    const syncRes = await fetch(`${srv.url}/orchestrator/standalone/assistant/sync`, {
+      method: 'POST',
+      headers: H,
+      body: JSON.stringify({
+        mode: 'replace',
+        messages: [{
+          id: 'bot-gov-1',
+          sender: 'claw-assistant',
+          bot: true,
+          text: '请确认地址修改。',
+          at: '2026-11-18T01:00:00.000Z',
+          replyMeta: {
+            model: { provider: 'dsh', model: 'test' },
+            persistenceChanges: [{
+              id: 'pchg-1000-c9d8',
+              domain: 'address',
+              mode: 'approval',
+              status: 'pending',
+              summary: '园区：初始园区1号楼 → 新园区2号楼',
+              toolName: 'ambient_save_address',
+              createdAt: '2026-11-18T01:00:00.000Z',
+              patch: {
+                domain: 'address',
+                op: 'upsert',
+                afterInput: { label: '园区', address: '上海市徐汇区新园区2号楼', city: shanghai },
+              },
+            }],
+          },
+        }],
+      }),
+    })
+    expect(syncRes.status).toBe(200)
+
+    // Before approval: address is still the original value
+    const beforeState = (await (await fetch(`${srv.url}/orchestrator/standalone/assistant/persona-state`, { headers: H })).json()) as {
+      ambientConfig: { residentAddresses: { address: string }[] }
+    }
+    expect(beforeState.ambientConfig.residentAddresses[0]?.address).toBe('上海市徐汇区初始园区1号楼')
+
+    // Approve via button REST endpoint -> address updates, receipt status becomes `approved`
+    const approveRes = await fetch(`${srv.url}/orchestrator/standalone/assistant/persistence-changes/pchg-1000-c9d8/approve`, {
+      method: 'POST',
+      headers: H,
+      body: '{}',
+    })
+    expect(approveRes.status).toBe(200)
+    const afterApprove = (await (await fetch(`${srv.url}/orchestrator/standalone/assistant/persona-state`, { headers: H })).json()) as {
+      ambientConfig: { residentAddresses: { address: string }[] }
+    }
+    expect(afterApprove.ambientConfig.residentAddresses[0]?.address).toBe('上海市徐汇区新园区2号楼')
+
+    // Undo via deterministic quick command (`撤回 c9d8`) -> reverts to original address AND keeps `undone` audit trail
+    const quickUndo = await fetch(`${srv.url}/orchestrator/standalone/assistant/messages`, {
+      method: 'POST',
+      headers: H,
+      body: JSON.stringify({ text: '撤回 c9d8' }),
+    })
+    expect(quickUndo.status).toBe(200)
+    const quickData = (await quickUndo.json()) as { quickCommand?: boolean }
+    expect(quickData.quickCommand).toBe(true)
+
+    const afterUndo = (await (await fetch(`${srv.url}/orchestrator/standalone/assistant/persona-state`, { headers: H })).json()) as {
+      ambientConfig: { residentAddresses: { address: string }[] }
+    }
+    expect(afterUndo.ambientConfig.residentAddresses[0]?.address).toBe('上海市徐汇区初始园区1号楼')
+
+    const msgsRes = (await (await fetch(`${srv.url}/orchestrator/standalone/assistant/messages`, { headers: H })).json()) as {
+      messages: { id: string; replyMeta?: { persistenceChanges?: { id: string; status: string; undoneAt?: string }[] } }[]
+    }
+    const origBot = msgsRes.messages.find(m => m.id === 'bot-gov-1')
+    expect(origBot?.replyMeta?.persistenceChanges?.[0]?.status).toBe('undone')
+    expect(origBot?.replyMeta?.persistenceChanges?.[0]?.undoneAt).toBeTruthy()
+  } finally {
+    await srv.stop()
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
   }
 })

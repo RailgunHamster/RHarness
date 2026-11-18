@@ -25,18 +25,23 @@ import {
   ASSISTANT_SESSION_ID,
   ASSISTANT_SYSTEM_PROMPT,
   DEFAULT_ASSISTANT_CONTEXT_CONFIG,
+  PERSISTENCE_DOMAIN_LABEL,
   archiveAssistantMessagesToBackupDir,
   buildAssistantBridgeTools,
   buildAssistantSystemPrompt,
   collectPendingQuestions,
+  formatFeishuPersistenceFooter,
   forwardAssistantMessageToEngineering,
   listAndPurgeAssistantChatBackups,
+  parsePersistenceQuickCommand,
+  persistenceChangeShortId,
   resolveHandoffStatus,
   restoreAssistantChatBackupFromDir,
   type AssistantContextConfig,
   type AssistantReplyMeta,
   type AssistantReplyToolCall,
   type AssistantStoredMessage,
+  type PersistenceChangeRecord,
 } from '../app/claw-assistant.ts'
 import {
   broadcastGroupPacketToPeers,
@@ -140,6 +145,7 @@ import {
   savePersonaLearning,
   planNavigation,
   purgeExpiredStickerTrash,
+  removeResidentAddress,
   restoreStickerRecord,
   searchCityCandidates,
   searchPlacesWithAmap,
@@ -149,6 +155,7 @@ import {
   stickerTrashPurgeAt,
   trashStickerRecord,
   trashedStickers,
+  upsertResidentAddress,
   type AssistantAmbientConfig,
   type AssistantPersonaConfig,
   type NewsCache,
@@ -683,14 +690,36 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       if (key) await sendFeishuImageMessage(key)
     } catch {}
   }
+  /** Accumulates persistence changes made/staged during the active `claw-assistant-main` turn, flushed onto `replyMeta.persistenceChanges`. */
+  const inFlightPersistenceChanges: PersistenceChangeRecord[] = []
+  const recordPersistenceChange = (input: Omit<PersistenceChangeRecord, 'id' | 'createdAt'>): PersistenceChangeRecord => {
+    const rec: PersistenceChangeRecord = {
+      ...input,
+      id: `pchg-${Date.now()}-${Math.random().toString(36).slice(2, 6).padEnd(4, '0')}`,
+      createdAt: new Date().toISOString(),
+    }
+    inFlightPersistenceChanges.push(rec)
+    return rec
+  }
+
   const autoLearnPersonaFromUserText = (text: string): void => {
     if (!isPluginEnabled('dsh-assistant-persona')) return
     const cfg = getPersonaConfig()
     if (!cfg.learningEnabled || !text.trim()) return
     const learned = extractPersonaLearningFromUserMessage(text)
     if (learned) {
-      const saved = savePersonaLearning(getPersonaLearnings(), { ...learned, source: 'auto' })
+      const prevList = getPersonaLearnings()
+      const before = prevList.find(e => e.content.toLowerCase() === learned.content.trim().replace(/\s+/g, ' ').slice(0, 240).toLowerCase())
+      const saved = savePersonaLearning(prevList, { ...learned, source: 'auto' })
       setPersonaLearnings(saved.list)
+      recordPersistenceChange({
+        domain: 'learning',
+        mode: 'auto',
+        status: 'applied',
+        summary: `自动记住默契（${saved.entry.kind}）：「${saved.entry.content}」`,
+        toolName: 'persona_auto_learn',
+        patch: { domain: 'learning', op: 'add', entryId: saved.entry.id, ...(before ? { before } : {}), after: saved.entry },
+      })
     }
   }
 
@@ -1447,7 +1476,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       }
     }
     if (withHandoff.bot && (!withHandoff.replyMeta || (withHandoff.replyMeta.durationMs ?? 0) > 300_000)) {
-      const computed = buildAssistantReplyMeta(withHandoff.replyMeta?.turn, undefined, withHandoff.text)
+      const computed: AssistantReplyMeta = {
+        ...buildAssistantReplyMeta(withHandoff.replyMeta?.turn, undefined, withHandoff.text),
+        ...(withHandoff.replyMeta?.persistenceChanges ? { persistenceChanges: withHandoff.replyMeta.persistenceChanges } : {}),
+      }
       const updated = { ...withHandoff, replyMeta: computed }
       // Persist the backfilled replyMeta once so later turns never overwrite historical messages
       const storedList = runtime.store.get(KV.assistant.messages) ?? []
@@ -1591,6 +1623,198 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     )
   }
 
+  /**
+   * Executes `approve` / `reject` / `undo` on a `PersistenceChangeRecord` stored inside
+   * `KV.assistant.messages` (by full `id`, 4-char `shortId`, or `""` for the latest bot reply).
+   * The change record stays permanently in the conversation log with its updated status + timestamp.
+   */
+  const applyPersistenceChangeAction = async (
+    idOrShort: string,
+    action: 'approve' | 'reject' | 'undo',
+  ): Promise<{ ok: boolean; error?: string; acted?: PersistenceChangeRecord[]; replyText?: string }> => {
+    if (!runtime) return { ok: false, error: 'Runtime not ready' }
+    const messages = runtime.store.get(KV.assistant.messages) ?? []
+    const needle = idOrShort.trim().replace(/^#/, '').toLowerCase()
+    const targets: PersistenceChangeRecord[] = []
+
+    if (!needle) {
+      const latestBotWithChanges = [...messages].reverse().find(m => m.bot && (m.replyMeta?.persistenceChanges?.length ?? 0) > 0)
+      for (const ch of latestBotWithChanges?.replyMeta?.persistenceChanges ?? []) {
+        if ((action === 'approve' || action === 'reject') && ch.status === 'pending') targets.push(ch)
+        if (action === 'undo' && (ch.status === 'applied' || ch.status === 'approved')) targets.push(ch)
+      }
+    } else {
+      outer: for (let i = messages.length - 1; i >= 0; i--) {
+        for (const ch of messages[i]!.replyMeta?.persistenceChanges ?? []) {
+          if (ch.id.toLowerCase() === needle || persistenceChangeShortId(ch.id).toLowerCase() === needle) {
+            targets.push(ch)
+            break outer
+          }
+        }
+      }
+    }
+
+    if (targets.length === 0) {
+      return { ok: false, error: needle ? `找不到编号 #${needle} 的变更记录` : '最近一条回复里没有待确认或可撤回的变更' }
+    }
+
+    const nowIso = new Date().toISOString()
+    const acted: PersistenceChangeRecord[] = []
+
+    for (const ch of targets) {
+      if (action === 'approve') {
+        if (ch.mode !== 'approval' || ch.status !== 'pending') {
+          return { ok: false, error: `变更 #${persistenceChangeShortId(ch.id)} 当前状态为「${ch.status}」，无法再次同意` }
+        }
+        const patch = ch.patch
+        if (patch.domain === 'persona') {
+          const liveBefore = getPersonaConfig()
+          setPersonaConfig(normalizeAssistantPersonaConfig({ ...liveBefore, ...patch.patchFields }))
+          ch.patch = { domain: 'persona', before: liveBefore, patchFields: patch.patchFields }
+        } else if (patch.domain === 'address' && patch.op === 'upsert') {
+          const currentCfg = getAmbientConfig()
+          const liveBefore = patch.afterInput.label
+            ? currentCfg.residentAddresses.find(a => a.label === patch.afterInput.label)
+            : undefined
+          const saved = upsertResidentAddress(currentCfg, patch.afterInput)
+          setAmbientConfig(saved.config)
+          if (saved.entry.isPrimary) {
+            try { setWeatherCache(await fetchWeatherForCity(saved.entry.city)) } catch {}
+          }
+          ch.patch = {
+            ...patch,
+            ...(liveBefore ? { beforeEntry: liveBefore } : {}),
+            appliedEntryId: saved.entry.id,
+            previousHomeCity: currentCfg.homeCity,
+          }
+        } else if (patch.domain === 'address' && patch.op === 'delete') {
+          const currentCfg = getAmbientConfig()
+          const liveBefore = currentCfg.residentAddresses.find(a => a.id === patch.targetId) ?? patch.beforeEntry
+          setAmbientConfig(removeResidentAddress(currentCfg, patch.targetId), { removedIds: [patch.targetId] })
+          ch.patch = { ...patch, beforeEntry: liveBefore }
+        } else if (patch.domain === 'address' && patch.op === 'set_city') {
+          const currentCfg = getAmbientConfig()
+          const next = normalizeAssistantAmbientConfig({
+            ...currentCfg,
+            homeCity: patch.afterCity,
+            residentAddresses: currentCfg.residentAddresses.map(a => (a.isPrimary ? { ...a, city: patch.afterCity } : a)),
+          })
+          setAmbientConfig(next)
+          try { setWeatherCache(await fetchWeatherForCity(patch.afterCity)) } catch {}
+          ch.patch = { ...patch, beforeCity: currentCfg.homeCity }
+        }
+        ch.status = 'approved'
+        ch.decidedAt = nowIso
+        acted.push(ch)
+      } else if (action === 'reject') {
+        if (ch.mode !== 'approval' || ch.status !== 'pending') {
+          return { ok: false, error: `变更 #${persistenceChangeShortId(ch.id)} 当前状态为「${ch.status}」，无法拒绝` }
+        }
+        ch.status = 'rejected'
+        ch.decidedAt = nowIso
+        acted.push(ch)
+      } else if (action === 'undo') {
+        if (ch.status !== 'applied' && ch.status !== 'approved') {
+          return { ok: false, error: `变更 #${persistenceChangeShortId(ch.id)} 当前状态为「${ch.status}」，无法撤回` }
+        }
+        const patch = ch.patch
+        if (patch.domain === 'memory') {
+          const current = getMemoryEntries()
+          if (patch.op === 'add') {
+            setMemoryEntries(current.filter(e => e.id !== patch.entryId), 'replace')
+          } else if (patch.op === 'delete' && patch.before) {
+            setMemoryEntries([patch.before, ...current.filter(e => e.id !== patch.before!.id)], 'merge')
+          } else if (patch.op === 'update' && patch.before) {
+            setMemoryEntries([patch.before, ...current.filter(e => e.id !== patch.entryId && e.id !== patch.before!.id)], 'replace')
+          }
+        } else if (patch.domain === 'learning') {
+          const current = getPersonaLearnings()
+          if (patch.op === 'add') {
+            if (patch.before) {
+              setPersonaLearnings(current.map(e => (e.id === patch.entryId ? { ...patch.before!, updatedAt: nowIso } : e)))
+            } else {
+              setPersonaLearnings(current.filter(e => e.id !== patch.entryId), { removedIds: [patch.entryId] })
+            }
+          } else if (patch.op === 'delete' && patch.before) {
+            setPersonaLearnings([...current.filter(e => e.id !== patch.before!.id), { ...patch.before, updatedAt: nowIso }])
+          }
+        } else if (patch.domain === 'sticker') {
+          const all = getStickerRecords()
+          if (patch.op === 'add' || patch.op === 'restore') {
+            setStickerRecords(trashStickerRecord(all, patch.entryId).list)
+          } else if (patch.op === 'trash') {
+            setStickerRecords(restoreStickerRecord(all, patch.entryId).list)
+          } else if (patch.op === 'update' && patch.before) {
+            setStickerRecords(all.map(s => (s.id === patch.entryId ? { ...patch.before!, updatedAt: nowIso } : s)))
+          }
+        } else if (patch.domain === 'persona') {
+          setPersonaConfig(patch.before)
+        } else if (patch.domain === 'address') {
+          const currentCfg = getAmbientConfig()
+          if (patch.op === 'upsert') {
+            if (patch.beforeEntry) {
+              const restoredEntry = { ...patch.beforeEntry, updatedAt: nowIso }
+              const hasPrev = currentCfg.residentAddresses.some(a => a.id === restoredEntry.id)
+              const restoredList = hasPrev
+                ? currentCfg.residentAddresses.map(a => (a.id === restoredEntry.id ? restoredEntry : a))
+                : [...currentCfg.residentAddresses.filter(a => a.id !== patch.appliedEntryId), restoredEntry]
+              setAmbientConfig(normalizeAssistantAmbientConfig({
+                ...currentCfg,
+                ...(patch.previousHomeCity ? { homeCity: patch.previousHomeCity } : {}),
+                residentAddresses: restoredList,
+              }))
+            } else {
+              const dropId = patch.appliedEntryId ?? currentCfg.residentAddresses.find(a => a.label === patch.afterInput.label)?.id
+              if (dropId) setAmbientConfig(removeResidentAddress(currentCfg, dropId), { removedIds: [dropId] })
+            }
+          } else if (patch.op === 'delete') {
+            setAmbientConfig(normalizeAssistantAmbientConfig({
+              ...currentCfg,
+              residentAddresses: [...currentCfg.residentAddresses.filter(a => a.id !== patch.beforeEntry.id), { ...patch.beforeEntry, updatedAt: nowIso }],
+            }))
+          } else if (patch.op === 'set_city') {
+            setAmbientConfig(normalizeAssistantAmbientConfig({
+              ...currentCfg,
+              homeCity: patch.beforeCity,
+              residentAddresses: currentCfg.residentAddresses.map(a => (a.isPrimary ? { ...a, city: patch.beforeCity } : a)),
+            }))
+          }
+        }
+        ch.status = 'undone'
+        ch.undoneAt = nowIso
+        acted.push(ch)
+      }
+    }
+
+    runtime.store.set(KV.assistant.messages, messages)
+    void broadcastAssistantStateToPeers('merge')
+
+    const summaryLines = acted.map(ch => {
+      const code = persistenceChangeShortId(ch.id)
+      const label = PERSISTENCE_DOMAIN_LABEL[ch.domain]
+      if (action === 'approve') return `✅ **已同意并生效** \`#${code}\` · **${label}**：${ch.summary}\n> 如需反悔，随时回复 \`撤回 ${code}\` 或在原对话气泡底点「↩ 撤回」。`
+      if (action === 'reject') return `✕ **已拒绝修改** \`#${code}\` · **${label}**：${ch.summary}（原数据未改动）`
+      return `↩ **已撤回修改** \`#${code}\` · **${label}**：${ch.summary}（已恢复到修改前状态）`
+    })
+    return { ok: true, acted, replyText: summaryLines.join('\n\n') }
+  }
+
+  /** Checks if an inbound user message (Web or Feishu) is a deterministic persistence command (`同意`/`拒绝`/`撤回`). */
+  const tryHandlePersistenceQuickCommand = async (rawText: string): Promise<string | undefined> => {
+    if (!runtime) return undefined
+    const messages = runtime.store.get(KV.assistant.messages) ?? []
+    const latestBot = [...messages].reverse().find(m => m.bot && (m.replyMeta?.persistenceChanges?.length ?? 0) > 0)
+    const latestChanges = latestBot?.replyMeta?.persistenceChanges ?? []
+    const parsed = parsePersistenceQuickCommand(rawText, {
+      hasPendingOnLatest: latestChanges.some(c => c.status === 'pending'),
+      hasUndoableOnLatest: latestChanges.some(c => c.status === 'applied' || c.status === 'approved'),
+    })
+    if (!parsed) return undefined
+    const res = await applyPersistenceChangeAction(parsed.shortId ?? '', parsed.action)
+    if (!res.ok) return `⚠️ ${res.error}`
+    return res.replyText
+  }
+
   const broadcastClawFeedStateToPeers = async (mode: 'merge' | 'replace' = 'merge'): Promise<void> => {
     if (!runtime) return
     const items = runtime.store.get(KV.clawfeed.items) ?? []
@@ -1640,6 +1864,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         } else if (event.type === 'assistant/step' && typeof event.data?.text === 'string' && event.data.text.trim()) {
           activeFeishu.streamCard.update(event.data.text)
         } else if (event.type === 'turn/error') {
+          inFlightPersistenceChanges.length = 0
           const failedTurn = pendingFeishuDmQueue.shift()
           if (failedTurn) {
             void (async () => {
@@ -1662,8 +1887,13 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           .trim()
         if (rawText) {
           const { text, sticker } = attachStickerToBotText(rawText)
+          const turnChanges = inFlightPersistenceChanges.splice(0)
           const list = runtime.store.get(KV.assistant.messages) ?? []
-          const replyMeta = buildAssistantReplyMeta(event.data?.turn, event.data?.model, text)
+          const baseMeta = buildAssistantReplyMeta(event.data?.turn, event.data?.model, text)
+          const replyMeta: AssistantReplyMeta = {
+            ...baseMeta,
+            ...(turnChanges.length > 0 ? { persistenceChanges: turnChanges } : {}),
+          }
           list.push({
             id: `asst-reply-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
             sender: 'claw-assistant',
@@ -1681,9 +1911,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             if (linkedUserMsg?.handoff) {
               startFeishuEngineeringHandoffTracker(resolveHandoffStatus(runtime, linkedUserMsg.handoff))
             }
+            const feishuText = `${text}${formatFeishuPersistenceFooter(turnChanges)}`
             void (async () => {
               try {
-                await pendingFeishu.streamCard.finish(text)
+                await pendingFeishu.streamCard.finish(feishuText)
                 if (sticker) await deliverFeishuSticker(sticker)
               } finally {
                 if (pendingFeishu.reactionId) {
@@ -1757,6 +1988,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         getNewsCache,
         setNewsCache,
         getAmapApiKey,
+        recordPersistenceChange,
         getAssistantMessages: () => (runtime ? (runtime.store.get(KV.assistant.messages) ?? []) : []),
         readStoredImageBytes: async part => {
           const p = part as { image?: { id: string; path: string; mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; bytes: number; name?: string }; data?: string }
@@ -1811,7 +2043,67 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           if (!isPluginEnabled('dsh-memory')) {
             throw new Error('The Long-Term Memory plugin (dsh-memory) is currently disabled')
           }
-          return await t.execute(args, exec)
+          const beforeEntries = isAssistant ? getMemoryEntries() : []
+          const out = await t.execute(args, exec)
+          if (isAssistant && out && typeof out === 'object') {
+            const resObj = out as {
+              saved?: boolean
+              updated?: boolean
+              deleted?: boolean
+              consolidated?: boolean
+              id?: string
+              replacedId?: string
+              memory?: MemoryEntry
+              extractedEntries?: MemoryEntry[]
+            }
+            if (t.name === 'memory_save' && resObj.saved && resObj.memory) {
+              const mem = resObj.memory
+              const prev = beforeEntries.find(e => e.id === mem.id || e.title.trim().toLowerCase() === mem.title.trim().toLowerCase())
+              recordPersistenceChange({
+                domain: 'memory',
+                mode: 'auto',
+                status: 'applied',
+                summary: prev ? `更新记忆「${mem.title}」：${mem.content.slice(0, 60)}` : `新增记忆「${mem.title}」：${mem.content.slice(0, 60)}`,
+                toolName: 'memory_save',
+                patch: { domain: 'memory', op: prev ? 'update' : 'add', entryId: mem.id, ...(prev ? { before: prev } : {}), after: mem },
+              })
+            } else if (t.name === 'memory_update' && resObj.updated && resObj.memory) {
+              const mem = resObj.memory
+              const prev = beforeEntries.find(e => e.id === resObj.replacedId)
+              recordPersistenceChange({
+                domain: 'memory',
+                mode: 'auto',
+                status: 'applied',
+                summary: `编辑记忆「${mem.title}」：${mem.content.slice(0, 60)}`,
+                toolName: 'memory_update',
+                patch: { domain: 'memory', op: 'update', entryId: mem.id, ...(prev ? { before: prev } : {}), after: mem },
+              })
+            } else if (t.name === 'memory_delete' && resObj.deleted && resObj.id) {
+              const prev = beforeEntries.find(e => e.id === resObj.id)
+              if (prev) {
+                recordPersistenceChange({
+                  domain: 'memory',
+                  mode: 'auto',
+                  status: 'applied',
+                  summary: `删除记忆「${prev.title}」`,
+                  toolName: 'memory_delete',
+                  patch: { domain: 'memory', op: 'delete', entryId: prev.id, before: prev },
+                })
+              }
+            } else if (t.name === 'memory_consolidate' && resObj.consolidated && Array.isArray(resObj.extractedEntries)) {
+              for (const mem of resObj.extractedEntries) {
+                recordPersistenceChange({
+                  domain: 'memory',
+                  mode: 'auto',
+                  status: 'applied',
+                  summary: `整理新增记忆「${mem.title}」：${mem.content.slice(0, 50)}`,
+                  toolName: 'memory_consolidate',
+                  patch: { domain: 'memory', op: 'add', entryId: mem.id, after: mem },
+                })
+              }
+            }
+          }
+          return out
         },
       })
     }
@@ -2035,6 +2327,22 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             if (reactionId) void removeFeishuMessageReaction(messageId, reactionId)
             return undefined
           }
+
+          // Deterministic 50ms Feishu commands (`同意` / `拒绝` / `撤回 [#id]`) act directly without LLM calls
+          if (!images?.length) {
+            const quickReply = await tryHandlePersistenceQuickCommand(text)
+            if (quickReply) {
+              const latestList = rt.store.get(KV.assistant.messages) ?? []
+              latestList.push(
+                { id: msgId, sender: 'operator', text: `📱 [飞书私聊] ${text}`, at },
+                { id: `asst-reply-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, sender: 'claw-assistant', bot: true, text: quickReply, at: new Date().toISOString() },
+              )
+              rt.store.set(KV.assistant.messages, latestList)
+              void broadcastAssistantStateToPeers('merge')
+              return quickReply
+            }
+          }
+
           const feishuImageParts = (images ?? []).map(img => ({
             type: 'image' as const,
             mediaType: img.mediaType,
@@ -2076,6 +2384,14 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
               if (!already) {
                 const saved = saveMemoryEntry(currentMems, { ...candidate, pinned: false, source: 'user' })
                 setMemoryEntries(saved.list)
+                recordPersistenceChange({
+                  domain: 'memory',
+                  mode: 'auto',
+                  status: 'applied',
+                  summary: `自动记住「${saved.entry.title}」：${saved.entry.content.slice(0, 60)}`,
+                  toolName: 'memory_auto_extract',
+                  patch: { domain: 'memory', op: 'add', entryId: saved.entry.id, after: saved.entry },
+                })
               }
             }
           }
@@ -2503,7 +2819,24 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             for (const m of existing) byId.set(m.id, m)
             for (const m of incomingMsgs) {
               const prev = byId.get(m.id)
-              byId.set(m.id, prev ? { ...prev, ...m } : m)
+              if (!prev) {
+                byId.set(m.id, m)
+                continue
+              }
+              let mergedMeta = m.replyMeta ?? prev.replyMeta
+              if (prev.replyMeta?.persistenceChanges?.length && m.replyMeta?.persistenceChanges?.length) {
+                const rank = (s: PersistenceChangeRecord['status']): number =>
+                  s === 'undone' ? 4 : s === 'approved' || s === 'rejected' ? 3 : 2
+                const prevById = new Map(prev.replyMeta.persistenceChanges.map(c => [c.id, c]))
+                mergedMeta = {
+                  ...m.replyMeta,
+                  persistenceChanges: m.replyMeta.persistenceChanges.map(c => {
+                    const p = prevById.get(c.id)
+                    return p && rank(p.status) > rank(c.status) ? p : c
+                  }),
+                }
+              }
+              byId.set(m.id, { ...prev, ...m, ...(mergedMeta ? { replyMeta: mergedMeta } : {}) })
             }
             const merged = [...byId.values()].sort((a, b) => a.at.localeCompare(b.at))
             runtime.store.set(KV.assistant.messages, merged)
@@ -2658,6 +2991,20 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           return
         }
 
+        // Approve / reject / undo a persistent data change recorded on an Assistant reply bubble
+        const persistenceActionMatch = /^assistant\/persistence-changes\/([^/]+)\/(approve|reject|undo)$/.exec(sub)
+        if (req.method === 'POST' && persistenceActionMatch) {
+          const changeId = decodeURIComponent(persistenceActionMatch[1]!).trim()
+          const action = persistenceActionMatch[2] as 'approve' | 'reject' | 'undo'
+          const out = await applyPersistenceChangeAction(changeId, action)
+          if (!out.ok) {
+            sendJson(res, 400, { error: out.error ?? '操作失败' })
+            return
+          }
+          sendJson(res, 200, { ok: true, acted: out.acted ?? [], replyText: out.replyText ?? '' })
+          return
+        }
+
         if (req.method === 'DELETE' && sub.startsWith('assistant/messages/')) {
           const msgId = decodeURIComponent(sub.slice('assistant/messages/'.length)).trim()
           const existing = runtime.store.get(KV.assistant.messages) ?? []
@@ -2733,6 +3080,28 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           const content = await storePanelContent(stateDir, parsed.content)
           const msgId = `asst-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
           const at = new Date().toISOString()
+
+          // Deterministic quick commands (`同意` / `拒绝` / `撤回 [#id]`) also work in Web chat without LLM latency
+          if (!content.some(c => c.type === 'image')) {
+            const quickReply = await tryHandlePersistenceQuickCommand(text)
+            if (quickReply) {
+              const latestList = runtime.store.get(KV.assistant.messages) ?? []
+              const userQuickMsg: AssistantStoredMessage = { id: msgId, sender: 'operator', text, content, at }
+              const botQuickMsg: AssistantStoredMessage = {
+                id: `asst-reply-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                sender: 'claw-assistant',
+                bot: true,
+                text: quickReply,
+                at: new Date().toISOString(),
+              }
+              latestList.push(userQuickMsg, botQuickMsg)
+              runtime.store.set(KV.assistant.messages, latestList)
+              void broadcastAssistantStateToPeers('merge')
+              sendJson(res, 200, { sent: true, id: msgId, quickCommand: true })
+              return
+            }
+          }
+
           const list = runtime.store.get(KV.assistant.messages) ?? []
           const userMsg: AssistantStoredMessage = {
             id: msgId,
@@ -2772,6 +3141,14 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
                   source: 'user',
                 })
                 setMemoryEntries(saved.list)
+                recordPersistenceChange({
+                  domain: 'memory',
+                  mode: 'auto',
+                  status: 'applied',
+                  summary: `自动记住「${saved.entry.title}」：${saved.entry.content.slice(0, 60)}`,
+                  toolName: 'memory_auto_extract',
+                  patch: { domain: 'memory', op: 'add', entryId: saved.entry.id, after: saved.entry },
+                })
               }
             }
           }
@@ -3120,7 +3497,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             const from = String(url.searchParams.get('from') ?? '').trim() || undefined
             const to = String(url.searchParams.get('to') ?? '').trim()
             const modeParam = String(url.searchParams.get('mode') ?? 'driving')
-            const mode = modeParam === 'transit' || modeParam === 'walking' ? modeParam : 'driving'
+            const mode = modeParam === 'transit' || modeParam === 'bicycling' || modeParam === 'walking' ? modeParam : 'driving'
             if (!to) { sendJson(res, 400, { error: 'Missing to (destination)' }); return }
             const toLabel = String(url.searchParams.get('toLabel') ?? '').trim() || undefined
             const result = await planNavigation({

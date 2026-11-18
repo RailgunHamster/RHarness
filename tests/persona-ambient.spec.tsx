@@ -55,6 +55,7 @@ import {
 } from '../src/app/assistant-persona-and-ambient.ts'
 import { PersonaAmbientWorkbench, PersonalAssistantSlotView } from '../src/client/ui-slots.tsx'
 import { DATA_CENTER_TAG, createDeviceGroup, ensureDeviceIdentity, isDataCenterNode, retagOwnClaims, verifyAndExtractGroupMembers, verifySignedClaim } from '../src/app/device-group.ts'
+import { formatFeishuPersistenceFooter, parsePersistenceQuickCommand, type PersistenceChangeRecord } from '../src/app/claw-assistant.ts'
 
 declare global { var IS_REACT_ACT_ENVIRONMENT: boolean }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -288,6 +289,57 @@ describe('ambient awareness', () => {
     expect(verifyAndExtractGroupMembers(retagged).every(m => m.tags.includes(DATA_CENTER_TAG))).toBe(true)
   })
 
+  it('blocks the Assistant from rolling back a Web-UI-edited address from stale chat history', async () => {
+    const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
+    let ambientCfg = upsertResidentAddress(
+      defaultAssistantAmbientConfig(),
+      { label: '目标园区', address: '上海市徐汇区创意园北区2号楼', city: shanghai },
+      new Date('2026-11-18T06:15:06.000Z'),
+    ).config
+    const messages: { id: string; bot?: boolean; at: string; text: string }[] = [
+      // Hours earlier the user had experimented with a road-number variant:
+      { id: 'm1', at: '2026-11-17T18:20:33.000Z', text: '测试路100弄北区2号楼，你把这个换上去看看？' },
+      { id: 'm2', bot: true, at: '2026-11-17T18:20:50.000Z', text: '已更新地址。' },
+      // After editing the address in the Web UI at 06:15:06Z, the user only asks for travel time:
+      { id: 'm3', at: '2026-11-18T06:15:22.000Z', text: '再测一次，从家里到目标园区要多久' },
+    ]
+    const tools = buildAssistantPersonaAmbientTools({
+      isEnabled: () => true,
+      getPersonaConfig: () => defaultAssistantPersonaConfig(),
+      setPersonaConfig: () => {},
+      getLearnings: () => [],
+      setLearnings: () => {},
+      getStickers: () => [],
+      setStickers: () => {},
+      getAmbientConfig: () => ambientCfg,
+      setAmbientConfig: next => { ambientCfg = next },
+      getWeatherCache: () => undefined,
+      setWeatherCache: () => {},
+      getNewsCache: () => undefined,
+      setNewsCache: () => {},
+      getAssistantMessages: () => messages,
+      readStoredImageBytes: async () => undefined,
+    })
+    const saveTool = tools.find(t => t.name === 'ambient_save_address')!
+    const deleteTool = tools.find(t => t.name === 'ambient_delete_address')!
+
+    const sig = { signal: new AbortController().signal }
+    // Blocked without overwrite_existing AND blocked even if the model hallucinates overwrite_existing: true!
+    const r1 = (await saveTool.execute({ label: '目标园区', address: '上海市徐汇区测试路100弄北区2号楼' }, sig)) as { ok: boolean }
+    expect(r1.ok).toBe(false)
+    const r2 = (await saveTool.execute({ label: '目标园区', address: '上海市徐汇区测试路100弄北区2号楼', overwrite_existing: true }, sig)) as { ok: boolean }
+    expect(r2.ok).toBe(false)
+    const rDel = (await deleteTool.execute({ id_or_label: '目标园区' }, sig)) as { ok: boolean }
+    expect(rDel.ok).toBe(false)
+    expect(ambientCfg.residentAddresses[0]!.address).toBe('上海市徐汇区创意园北区2号楼')
+
+    // When the user explicitly asks to change it in the latest turn (with pasted coords so no network call is needed), it succeeds.
+    messages.push({ id: 'm4', at: '2026-11-18T07:00:00.000Z', text: '把目标园区地址改成 121.438,31.127' })
+    const r3 = (await saveTool.execute({ label: '目标园区', address: '121.438,31.127', city: '上海', overwrite_existing: true }, sig)) as { ok: boolean }
+    expect(r3.ok).toBe(true)
+    expect(ambientCfg.residentAddresses[0]!.address).toBe('121.438,31.127')
+  })
+
   it('syncs resident addresses & learnings across nodes: union by id, newer wins, deletions stay deleted', () => {
     const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
     const beijing = { name: '北京', latitude: 39.9, longitude: 116.4, timezone: 'Asia/Shanghai' }
@@ -337,6 +389,9 @@ describe('ambient awareness', () => {
       if (url.includes('direction/transit')) {
         return new Response(JSON.stringify({ status: '1', route: { transits: [{ distance: '9800', duration: '2400', segments: [{ walking: { distance: '300' }, bus: { buslines: [{ name: '地铁1号线', departure_stop: { name: '徐家汇' }, arrival_stop: { name: '人民广场' } }] } }] }] } }), { status: 200 })
       }
+      if (url.includes('direction/bicycling')) {
+        return new Response(JSON.stringify({ errcode: 0, errmsg: 'OK', data: { paths: [{ distance: 3200, duration: 780, steps: [{ instruction: '沿非机动车道向东骑行' }, { instruction: '到达终点' }] }] } }), { status: 200 })
+      }
       // Open-Meteo city-candidate fallback (no-key path): no hits in this mock.
       return new Response(JSON.stringify({ results: [] }), { status: 200 })
     }) as unknown as typeof fetch
@@ -354,6 +409,13 @@ describe('ambient awareness', () => {
     const transit = await planNavigation({ fromText: '家', toText: '市中心', mode: 'transit', addresses: cfg.residentAddresses, amapKey: 'test-key', fetcher })
     expect(transit.provider).toBe('amap')
     expect(transit.steps.join(' ')).toContain('地铁1号线')
+
+    const cycling = await planNavigation({ fromText: '家', toText: '公司', mode: 'bicycling', addresses: cfg.residentAddresses, amapKey: 'test-key', fetcher })
+    expect(cycling.provider).toBe('amap')
+    expect(cycling.distanceKm).toBe(3.2)
+    expect(cycling.durationText).toBe('约 13 分钟')
+    expect(cycling.links.amap).toContain('mode=ride')
+    expect(cycling.links.baidu).toContain('mode=riding')
 
     // No key: still returns tappable links from saved city coordinates, with an explanatory note.
     const linksOnly = await planNavigation({ toText: '公司', mode: 'driving', addresses: cfg.residentAddresses, fetcher })
@@ -763,5 +825,116 @@ describe('persona workbench UI', () => {
     expect(rowsAfter).toHaveLength(1)
     expect(rowsAfter[0]!.textContent).toContain('华发路888弄北区2号楼')
     expect(container.querySelector('[data-testid="ambient-editing-hint"]')).toBeNull()
+  })
+
+  it('enforces two-tier persistence governance: address/persona stage for approval, learning/sticker apply with undo, Feishu & Web UI both support approve/reject/undo', async () => {
+    const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
+    let personaCfg = defaultAssistantPersonaConfig()
+    let ambientCfg = upsertResidentAddress(defaultAssistantAmbientConfig(), { label: '园区', address: '上海市徐汇区旧址1号', city: shanghai }, new Date('2026-11-18T01:00:00Z')).config
+    let learnings: PersonaLearningEntry[] = []
+    const recorded: PersistenceChangeRecord[] = []
+    const messages = [{ id: 'u1', at: '2026-11-18T02:00:00Z', text: '把园区改成 121.438,31.127，顺便以后回复简短点' }]
+
+    const tools = buildAssistantPersonaAmbientTools({
+      isEnabled: () => true,
+      getPersonaConfig: () => personaCfg,
+      setPersonaConfig: next => { personaCfg = next },
+      getLearnings: () => learnings,
+      setLearnings: next => { learnings = next },
+      getStickers: () => [],
+      setStickers: () => {},
+      getAmbientConfig: () => ambientCfg,
+      setAmbientConfig: next => { ambientCfg = next },
+      getWeatherCache: () => undefined,
+      setWeatherCache: () => {},
+      getNewsCache: () => undefined,
+      setNewsCache: () => {},
+      getAssistantMessages: () => messages,
+      readStoredImageBytes: async () => undefined,
+      recordPersistenceChange: input => {
+        const rec: PersistenceChangeRecord = { ...input, id: `pchg-1000-ab${recorded.length + 1}0`, createdAt: '2026-11-18T02:00:01Z' }
+        recorded.push(rec)
+        return rec
+      },
+    })
+
+    const sig = { signal: new AbortController().signal }
+    // Tier B: address & persona stage as `pending` WITHOUT mutating the store yet.
+    const addrOut = (await tools.find(t => t.name === 'ambient_save_address')!.execute({ label: '园区', address: '121.438,31.127', city: '上海' }, sig)) as { ok: boolean; pendingApproval?: boolean }
+    expect(addrOut).toMatchObject({ ok: true, pendingApproval: true })
+    expect(ambientCfg.residentAddresses[0]!.address).toBe('上海市徐汇区旧址1号')
+
+    const personaOut = (await tools.find(t => t.name === 'persona_update')!.execute({ verbosity: 'brief' }, sig)) as { ok: boolean; pendingApproval?: boolean }
+    expect(personaOut).toMatchObject({ ok: true, pendingApproval: true })
+    expect(personaCfg.verbosity).toBe('balanced')
+
+    // Tier A: persona learning applies immediately AND records an undoable `applied` receipt.
+    await tools.find(t => t.name === 'persona_learning_add')!.execute({ content: '闲聊保持简短', kind: 'style' }, sig)
+    expect(learnings).toHaveLength(1)
+    expect(recorded.map(r => `${r.domain}:${r.status}`)).toEqual(['address:pending', 'persona:pending', 'learning:applied'])
+
+    // Feishu Markdown footer & quick-command parser
+    const feishuFooter = formatFeishuPersistenceFooter(recorded)
+    expect(feishuFooter).toContain('#ab10')
+    expect(feishuFooter).toContain('待你确认的数据修改')
+    expect(feishuFooter).toContain('#ab30')
+    expect(feishuFooter).toContain('已修改持久化数据')
+
+    expect(parsePersistenceQuickCommand('📱 [飞书私聊] 同意', { hasPendingOnLatest: true, hasUndoableOnLatest: false })).toEqual({ action: 'approve' })
+    expect(parsePersistenceQuickCommand('同意 ab10', { hasPendingOnLatest: false, hasUndoableOnLatest: false })).toEqual({ action: 'approve', shortId: 'ab10' })
+    expect(parsePersistenceQuickCommand('拒绝', { hasPendingOnLatest: true, hasUndoableOnLatest: false })).toEqual({ action: 'reject' })
+    expect(parsePersistenceQuickCommand('撤回 #ab30', { hasPendingOnLatest: false, hasUndoableOnLatest: false })).toEqual({ action: 'undo', shortId: 'ab30' })
+    // Normal conversation is never hijacked when nothing is pending/undoable.
+    expect(parsePersistenceQuickCommand('同意', { hasPendingOnLatest: false, hasUndoableOnLatest: false })).toBeUndefined()
+    expect(parsePersistenceQuickCommand('同意你的分析，接下来看看别的', { hasPendingOnLatest: true, hasUndoableOnLatest: true })).toBeUndefined()
+
+    // Web UI bubble renders both `pending` (✓ 同意 / ✕ 拒绝) and `applied` (↩ 撤回) bars and posts actions.
+    const actionCalls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('persistence-changes') && init?.method === 'POST') {
+        actionCalls.push(u)
+        return new Response(JSON.stringify({ ok: true, acted: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ambient: buildAmbientSnapshot(ambientCfg, undefined) }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+
+    await act(async () => {
+      root.render(
+        <PersonalAssistantSlotView
+          lang="zh"
+          messages={[{
+            id: 'bot-1',
+            sender: 'claw-assistant',
+            bot: true,
+            text: '已提交变更，请在下方确认或撤回。',
+            at: '2026-11-18T02:00:02Z',
+            replyMeta: {
+              model: { provider: 'dsh', model: 'test' },
+              persistenceChanges: [
+                { id: 'pchg-1000-ab10', domain: 'address', mode: 'approval', status: 'pending', summary: '园区：旧址 → 新址', toolName: 'ambient_save_address', createdAt: '2026-11-18T02:00:01Z' },
+                { id: 'pchg-1000-ab30', domain: 'memory', mode: 'auto', status: 'applied', summary: '新增记忆「偏好」', toolName: 'memory_save', createdAt: '2026-11-18T02:00:01Z' },
+              ],
+            },
+          }]}
+          memories={[]}
+          onRefresh={async () => {}}
+          onJumpToEngineeringTicket={() => {}}
+          onSwitchToMemoryTab={() => {}}
+        />,
+      )
+    })
+
+    expect(container.textContent).toContain('待你同意')
+    expect(container.textContent).toContain('已修改')
+    const approveBtn = container.querySelector<HTMLButtonElement>('[data-testid="persistence-approve-pchg-1000-ab10"]')!
+    const undoBtn = container.querySelector<HTMLButtonElement>('[data-testid="persistence-undo-pchg-1000-ab30"]')!
+    expect(approveBtn).not.toBeNull()
+    expect(undoBtn).not.toBeNull()
+
+    await act(async () => { approveBtn.click(); await new Promise(r => setTimeout(r, 20)) })
+    await act(async () => { undoBtn.click(); await new Promise(r => setTimeout(r, 20)) })
+    expect(actionCalls.some(u => u.endsWith('/pchg-1000-ab10/approve'))).toBe(true)
+    expect(actionCalls.some(u => u.endsWith('/pchg-1000-ab30/undo'))).toBe(true)
   })
 })

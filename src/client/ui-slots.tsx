@@ -533,7 +533,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
   const [amapKeyDraft, setAmapKeyDraft] = useState('')
   const [navFrom, setNavFrom] = useTextDraft('persona:nav-from')
   const [navTo, setNavTo] = useTextDraft('persona:nav-to')
-  const [navMode, setNavMode] = useState<'driving' | 'transit' | 'walking'>('driving')
+  const [navMode, setNavMode] = useState<'driving' | 'transit' | 'bicycling' | 'walking'>('driving')
   const [navResult, setNavResult] = useState<NavigationResultInfo | null>(null)
   const [navBusy, setNavBusy] = useState(false)
   const [newLearning, setNewLearning] = useTextDraft('persona:new-learning')
@@ -1007,7 +1007,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
             <div className="dt-persona-grid">
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '起点（默认主要地址）' : 'From'}</span><Input value={navFrom} onChange={e => setNavFrom(e.target.value)} data-testid="nav-from-input" placeholder={(state.ambientConfig.residentAddresses ?? []).map(a => a.label).join(' / ') || (lang === 'zh' ? '家 / 公司 / 任意地址' : 'Home / Office / address')} /></label>
               <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '终点' : 'To'}</span><Input value={navTo} onChange={e => setNavTo(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void queryNavigation() } }} data-testid="nav-to-input" placeholder={lang === 'zh' ? '目的地：地址、地点名或 家/公司' : 'Destination'} /></label>
-              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '出行方式' : 'Mode'}</span><select className="dt-select" value={navMode} onChange={e => setNavMode(e.target.value as 'driving' | 'transit' | 'walking')} data-testid="nav-mode-select"><option value="driving">🚗 驾车（含实时路况）</option><option value="transit">🚇 公交/地铁</option><option value="walking">🚶 步行</option></select></label>
+              <label className="dt-field"><span className="dt-field-head">{lang === 'zh' ? '出行方式' : 'Mode'}</span><select className="dt-select" value={navMode} onChange={e => setNavMode(e.target.value as 'driving' | 'transit' | 'bicycling' | 'walking')} data-testid="nav-mode-select"><option value="driving">🚗 驾车（含实时路况）</option><option value="transit">🚇 公交/地铁</option><option value="bicycling">🚴 骑行</option><option value="walking">🚶 步行</option></select></label>
             </div>
             <div className="dt-row-buttons">
               <Button variant="primary" disabled={navBusy || !navTo.trim()} onClick={() => { void queryNavigation() }} data-testid="nav-query-btn">{navBusy ? (lang === 'zh' ? '规划中…' : 'Planning…') : (lang === 'zh' ? '🧭 查询路线' : '🧭 Plan route')}</Button>
@@ -1145,8 +1145,26 @@ export function PersonalAssistantSlotView(props: {
   const [stickerSaveFor, setStickerSaveFor] = useState<{ messageId: string; imageIndex: number } | null>(null)
   const [stickerSaveName, setStickerSaveName] = useTextDraft('assistant:sticker-save-name')
   const [stickerSaveTags, setStickerSaveTags] = useTextDraft('assistant:sticker-save-tags')
+  const [actingChangeId, setActingChangeId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const displayAmbient = ambientOverride ?? ambient
+
+  const actOnPersistenceChange = async (changeId: string, action: 'approve' | 'reject' | 'undo') => {
+    setActingChangeId(changeId)
+    setError(null)
+    try {
+      await standaloneFetch(`assistant/persistence-changes/${encodeURIComponent(changeId)}/${action}`, 'POST', {})
+      await onRefresh()
+      try {
+        const amb = await standaloneFetch<{ ambient: AmbientSnapshotInfo }>('assistant/ambient', 'GET')
+        setAmbientOverride(amb.ambient)
+      } catch {}
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setActingChangeId(null)
+    }
+  }
 
   const saveImageAsSticker = async () => {
     if (!stickerSaveFor || !stickerSaveName.trim()) return
@@ -1855,6 +1873,84 @@ export function PersonalAssistantSlotView(props: {
                   {isBot && msg.sticker && (
                     <div data-testid={`assistant-sticker-${msg.id}`}>
                       <StickerImage sticker={msg.sticker} lang={lang} />
+                    </div>
+                  )}
+
+                  {isBot && (replyMeta?.persistenceChanges?.length ?? 0) > 0 && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }} data-testid={`assistant-persistence-changes-${msg.id}`}>
+                      {replyMeta!.persistenceChanges!.map(ch => {
+                        const shortCode = (ch.id.split('-').pop() ?? ch.id).slice(-4)
+                        const domainText =
+                          ch.domain === 'memory' ? (lang === 'zh' ? '记忆库' : 'Memory')
+                            : ch.domain === 'learning' ? (lang === 'zh' ? '相处默契' : 'Learning')
+                              : ch.domain === 'sticker' ? (lang === 'zh' ? '表情包' : 'Sticker')
+                                : ch.domain === 'address' ? (lang === 'zh' ? '常驻地址' : 'Address')
+                                  : (lang === 'zh' ? '人设配置' : 'Persona')
+                        const statusTone = ch.status === 'pending' || ch.status === 'applied'
+                          ? 'warning'
+                          : ch.status === 'approved'
+                            ? 'success'
+                            : 'neutral'
+                        const statusLabel =
+                          ch.status === 'pending' ? (lang === 'zh' ? '🔒 待你同意' : '🔒 Approval needed')
+                            : ch.status === 'applied' ? (lang === 'zh' ? '⚠️ 已修改' : '⚠️ Modified')
+                              : ch.status === 'approved' ? (lang === 'zh' ? '✅ 已同意生效' : '✅ Approved')
+                                : ch.status === 'rejected' ? (lang === 'zh' ? '✕ 已拒绝' : '✕ Rejected')
+                                  : (lang === 'zh' ? '↩ 已撤回' : '↩ Undone')
+                        const stamp = ch.undoneAt ?? ch.decidedAt ?? ch.createdAt
+                        const isActing = actingChangeId === ch.id
+                        return (
+                          <div
+                            key={ch.id}
+                            className="dt-msg-receipt"
+                            data-tone={ch.status === 'pending' || ch.status === 'applied' ? 'warning' : undefined}
+                            data-testid={`persistence-change-${ch.id}`}
+                          >
+                            <div className="dt-msg-receipt-main">
+                              <Tag tone={statusTone}>{statusLabel}</Tag>
+                              <strong>{domainText}</strong>
+                              <span className="dt-mono dt-msg-receipt-branch">#{shortCode}</span>
+                              <span>{ch.summary}</span>
+                              <span className="dt-hint">· {formatSmartTimestamp(stamp, lang)}</span>
+                            </div>
+                            <div className="dt-msg-head-actions">
+                              {ch.status === 'pending' && (
+                                <>
+                                  <Button
+                                    size="sm"
+                                    variant="primary"
+                                    disabled={isActing || busy}
+                                    onClick={() => { void actOnPersistenceChange(ch.id, 'approve') }}
+                                    data-testid={`persistence-approve-${ch.id}`}
+                                  >
+                                    {lang === 'zh' ? '✓ 同意' : 'Approve'}
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    disabled={isActing || busy}
+                                    onClick={() => { void actOnPersistenceChange(ch.id, 'reject') }}
+                                    data-testid={`persistence-reject-${ch.id}`}
+                                  >
+                                    {lang === 'zh' ? '✕ 拒绝' : 'Reject'}
+                                  </Button>
+                                </>
+                              )}
+                              {(ch.status === 'applied' || ch.status === 'approved') && (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  disabled={isActing || busy}
+                                  onClick={() => { void actOnPersistenceChange(ch.id, 'undo') }}
+                                  data-testid={`persistence-undo-${ch.id}`}
+                                >
+                                  {lang === 'zh' ? '↩ 撤回' : 'Undo'}
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
                     </div>
                   )}
 

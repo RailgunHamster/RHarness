@@ -240,6 +240,17 @@ export interface AssistantReplyToolCallInfo {
   isError?: boolean
   at?: string
 }
+export interface PersistenceChangeInfo {
+  id: string
+  domain: 'memory' | 'learning' | 'sticker' | 'address' | 'persona'
+  mode: 'auto' | 'approval'
+  status: 'applied' | 'pending' | 'approved' | 'rejected' | 'undone'
+  summary: string
+  toolName: string
+  createdAt: string
+  decidedAt?: string
+  undoneAt?: string
+}
 export interface AssistantReplyMetaInfo {
   model: { provider: string; model: string; reasoningEffort?: string }
   matchedSlot?: { label: string; startTime: string; endTime: string; dayType?: SlotDayTypeInfo }
@@ -247,6 +258,7 @@ export interface AssistantReplyMetaInfo {
   durationMs?: number
   toolCalls?: AssistantReplyToolCallInfo[]
   events?: SessionEvent[]
+  persistenceChanges?: PersistenceChangeInfo[]
 }
 export interface AssistantContextConfigInfo {
   recentMessagesLimit: number
@@ -366,7 +378,7 @@ export interface PersonaAmbientStateInfo {
 }
 export interface NavigationResultInfo {
   provider: 'amap' | 'links'
-  mode: 'driving' | 'transit' | 'walking'
+  mode: 'driving' | 'transit' | 'bicycling' | 'walking'
   origin: { label: string; longitude?: number; latitude?: number; cityName?: string }
   destination: { label: string; longitude?: number; latitude?: number; cityName?: string }
   distanceKm?: number

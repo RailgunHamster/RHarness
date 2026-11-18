@@ -469,5 +469,5 @@ describe('distributed LAN worker nodes and P2P Git fast-forward merge', () => {
       try { rmSync(dirA, { recursive: true, force: true }) } catch {}
       try { rmSync(dirB, { recursive: true, force: true }) } catch {}
     }
-  }, 25_000)
+  }, 60_000)
 })

@@ -18,6 +18,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { z } from 'zod'
+import type { PersistenceChangeRecord } from './claw-assistant.ts'
 import { resolveDayCalendarStatus, type DayModeOverride } from './model-profiles.ts'
 import type { RegisteredToolSpec } from './standalone-host.ts'
 
@@ -844,6 +845,9 @@ export function buildAmbientPromptSection(snapshot: AmbientSnapshot): string {
   for (const addr of snapshot.residentAddresses) {
     lines.push(`- 常驻地址${addr.isPrimary ? '（主要，天气基准）' : ''}「${addr.label}」：${addr.address}（所在城市：${addr.city.name}）。用户聊通勤、外卖、快递、附近生活或出行时按这个地址理解，不要主动复述完整门牌号，除非用户问起。`)
   }
+  if (snapshot.residentAddresses.length > 0) {
+    lines.push('- 重要：上面列出的常驻地址是系统实时权威数据（用户随时会在网页界面直接修改），永远比历史聊天记录里的旧地址更新。严禁根据早期对话擅自调用 `ambient_save_address` / `ambient_delete_address` 覆盖或回滚，只有用户在本轮消息里明确要求新增、修改或删除地址时才可调用。')
+  }
   lines.push('- 用户问「最近有什么新闻/热点」时调用 `news_brief`（可带 topic：科技/AI/财经/综合），不要凭训练记忆编造新闻。')
   return lines.join('\n')
 }
@@ -1055,7 +1059,7 @@ export function getNewsBrief(cache: NewsCache | undefined, topic?: string, limit
 // Navigation (Amap route planning + map deep links, resident-address aware)
 // ============================================================================
 
-export type NavigationMode = 'driving' | 'transit' | 'walking'
+export type NavigationMode = 'driving' | 'transit' | 'bicycling' | 'walking'
 
 export interface NavigationPoint { label: string; longitude?: number; latitude?: number; cityName?: string }
 
@@ -1086,18 +1090,18 @@ export function formatDurationZh(totalMinutes: number): string {
   return rest > 0 ? `约 ${h} 小时 ${rest} 分钟` : `约 ${h} 小时`
 }
 
-const NAV_MODE_LABEL: Record<NavigationMode, string> = { driving: '驾车', transit: '公交/地铁', walking: '步行' }
+const NAV_MODE_LABEL: Record<NavigationMode, string> = { driving: '驾车', transit: '公交/地铁', bicycling: '骑行', walking: '步行' }
 
 export function buildAmapNavigationUrl(origin: NavigationPoint, destination: NavigationPoint, mode: NavigationMode): string | undefined {
   if (origin.longitude === undefined || origin.latitude === undefined || destination.longitude === undefined || destination.latitude === undefined) return undefined
-  const modeParam = mode === 'driving' ? 'car' : mode === 'transit' ? 'bus' : 'walk'
+  const modeParam = mode === 'driving' ? 'car' : mode === 'transit' ? 'bus' : mode === 'bicycling' ? 'ride' : 'walk'
   const from = `${origin.longitude},${origin.latitude},${encodeURIComponent(origin.label)}`
   const to = `${destination.longitude},${destination.latitude},${encodeURIComponent(destination.label)}`
   return `https://uri.amap.com/navigation?from=${from}&to=${to}&mode=${modeParam}&policy=1&src=rharness&coordinate=gaode&callnative=1`
 }
 
 export function buildBaiduNavigationUrl(originText: string | undefined, destinationText: string, mode: NavigationMode, region?: string): string {
-  const modeParam = mode === 'driving' ? 'driving' : mode === 'transit' ? 'transit' : 'walking'
+  const modeParam = mode === 'driving' ? 'driving' : mode === 'transit' ? 'transit' : mode === 'bicycling' ? 'riding' : 'walking'
   const params = new URLSearchParams({
     ...(originText ? { origin: originText } : {}),
     destination: destinationText,
@@ -1269,6 +1273,18 @@ export async function planRouteWithAmap(input: {
       if (line?.name) steps.push(`乘坐 ${line.name}：${line.departure_stop?.name ?? ''} → ${line.arrival_stop?.name ?? ''}`)
     }
     return { distanceKm: Number(best.distance ?? 0) / 1000, durationMin: Number(best.duration ?? 0) / 60, steps: steps.slice(0, 10) }
+  }
+  if (input.mode === 'bicycling') {
+    const res = await fetcher(`https://restapi.amap.com/v4/direction/bicycling?key=${key}&origin=${origin}&destination=${destination}`, { signal: AbortSignal.timeout(12_000) })
+    const data = (await res.json()) as { errcode?: number; errmsg?: string; data?: { paths?: { distance?: number | string; duration?: number | string; steps?: { instruction?: string }[] }[] } }
+    if (data.errcode !== 0) throw new Error(`Amap bicycling failed: ${data.errmsg ?? 'unknown'}`)
+    const best = data.data?.paths?.[0]
+    if (!best) throw new Error('Amap bicycling returned no route')
+    return {
+      distanceKm: Number(best.distance ?? 0) / 1000,
+      durationMin: Number(best.duration ?? 0) / 60,
+      steps: (best.steps ?? []).map(s => s.instruction ?? '').filter(Boolean).slice(0, 8),
+    }
   }
   const kind = input.mode === 'walking' ? 'walking' : 'driving'
   const res = await fetcher(`https://restapi.amap.com/v3/direction/${kind}?key=${key}&origin=${origin}&destination=${destination}&extensions=base`, { signal: AbortSignal.timeout(12_000) })
@@ -1448,11 +1464,67 @@ export interface PersonaAmbientToolDeps {
   setWeatherCache: (next: WeatherCache) => void
   getNewsCache: () => NewsCache | undefined
   setNewsCache: (next: NewsCache) => void
-  /** Reads stored assistant messages (for sticker_add_from_message). Content parts use StoredPanelContent shape. */
-  getAssistantMessages: () => readonly { id: string; bot?: boolean; at: string; content?: readonly unknown[] }[]
+  /** Reads stored assistant messages (for sticker_add_from_message & address-mutation turn-intent guard). */
+  getAssistantMessages: () => readonly { id: string; bot?: boolean; at: string; text?: string; content?: readonly unknown[] }[]
   readStoredImageBytes: (imagePart: unknown) => Promise<Buffer | undefined>
   /** Amap (高德) Web-Service key for navigation; when unset, navigation degrades to map deep links. */
   getAmapApiKey?: () => string | undefined
+  /**
+   * Optional two-tier persistence ledger wired by the Assistant conversation loop:
+   * - Tier A (`learning`, `sticker`): tools apply immediately and log an undoable `applied` receipt.
+   * - Tier B (`address`, `persona`): tools stage a `pending` proposal WITHOUT mutating the store until
+   *   the user clicks「同意」(or replies `同意` on Feishu), and even approved changes stay undoable.
+   */
+  recordPersistenceChange?: (change: Omit<PersistenceChangeRecord, 'id' | 'createdAt'>) => PersistenceChangeRecord
+}
+
+const ADDRESS_MUTATION_INTENT_RE = /(改|换|更新|保存|记住|设成|设为|修改|更正|存成|存为|删|移除|忘掉|地址|坐标|save|update|change|replace|edit|delete|remove)/i
+
+/**
+ * Hard guard preventing the Assistant from silently rolling back a Web-UI-edited
+ * resident address based on stale chat history (e.g. when the user merely asks
+ * "从家里到老婆公司要多久" seconds after editing the address in the UI).
+ * Only user messages from the current turn (plus the immediately preceding user
+ * message when it is ALSO newer than `existingUpdatedAt`, for 2-turn clarifications)
+ * count as evidence of mutation intent; empty message stores pass through.
+ */
+export function hasUserTurnAddressMutationIntent(
+  messages: readonly { bot?: boolean; at: string; text?: string }[],
+  existingUpdatedAt: string,
+  newAddress?: string,
+): boolean {
+  const userMsgs = messages.filter(m => !m.bot && typeof m.text === 'string' && m.text.trim())
+  if (userMsgs.length === 0) return true
+  const latest = userMsgs[userMsgs.length - 1]!
+  const prev = userMsgs.length >= 2 ? userMsgs[userMsgs.length - 2] : undefined
+  const activeTexts = [
+    latest.text!,
+    ...(prev && prev.at >= existingUpdatedAt ? [prev.text!] : []),
+  ].join('\n')
+  if (ADDRESS_MUTATION_INTENT_RE.test(activeTexts)) return true
+  if (newAddress) {
+    const stripped = newAddress
+      .replace(/^[\u4e00-\u9fa5]{2,6}?(省|市|自治区|特别行政区)/, '')
+      .replace(/^[\u4e00-\u9fa5]{2,6}?(市|区|县)/, '')
+      .trim()
+    if (stripped.length >= 3 && activeTexts.includes(stripped.slice(0, 4))) return true
+  }
+  return false
+}
+
+function describePersonaDiff(before: AssistantPersonaConfig, after: AssistantPersonaConfig): string {
+  const parts: string[] = []
+  if (before.presetId !== after.presetId) parts.push(`预设 ${before.presetId} → ${after.presetId}`)
+  if (before.assistantName !== after.assistantName) parts.push(`自称「${before.assistantName}」→「${after.assistantName}」`)
+  if (before.userAddress !== after.userAddress) parts.push(`称呼「${before.userAddress || '默认'}」→「${after.userAddress || '默认'}」`)
+  if (before.verbosity !== after.verbosity) parts.push(`详略 ${before.verbosity} → ${after.verbosity}`)
+  if (before.kaomojiDensity !== after.kaomojiDensity) parts.push(`颜文字 ${before.kaomojiDensity} → ${after.kaomojiDensity}`)
+  if (before.humorLevel !== after.humorLevel) parts.push(`幽默度 ${before.humorLevel} → ${after.humorLevel}`)
+  if (before.stickerFrequency !== after.stickerFrequency) parts.push(`表情频率 ${before.stickerFrequency} → ${after.stickerFrequency}`)
+  if (before.stickerCooldownTurns !== after.stickerCooldownTurns) parts.push(`表情冷却 ${before.stickerCooldownTurns} → ${after.stickerCooldownTurns}`)
+  if (before.learningEnabled !== after.learningEnabled) parts.push(`自动默契 ${after.learningEnabled ? '开启' : '关闭'}`)
+  if (before.customInstructions !== after.customInstructions) parts.push(`自定义指令「${after.customInstructions.slice(0, 40) || '清空'}」`)
+  return parts.length > 0 ? parts.join('，') : '更新人设配置'
 }
 
 export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps): RegisteredToolSpec[] {
@@ -1490,12 +1562,13 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     address: z.string().min(1).describe('Detailed address exactly as the user states it'),
     city: z.string().optional().describe('City the address belongs to; geocoded from the address when omitted'),
     make_primary: z.boolean().optional().describe('Make this the primary address (weather baseline city)'),
+    overwrite_existing: z.boolean().optional().describe('Set true ONLY when the user explicitly asked in their LATEST message to modify/replace an already-saved address. Never set true from earlier chat history — Web UI edits are newer and authoritative.'),
   })
   const ambientDeleteAddressSchema = z.object({ id_or_label: z.string().min(1) })
   const navigationRouteSchema = z.object({
     from: z.string().optional().describe('Origin: a saved address label （家/公司）, a detailed address, or a place name. Defaults to the primary resident address.'),
     to: z.string().min(1).describe('Destination: address label, detailed address, or place name'),
-    mode: z.enum(['driving', 'transit', 'walking']).optional().describe('Travel mode, default driving'),
+    mode: z.enum(['driving', 'transit', 'bicycling', 'walking']).optional().describe('Travel mode (driving / transit / bicycling / walking), default driving'),
   })
   const weatherQuerySchema = z.object({ city: z.string().optional().describe('City name. Defaults to the configured home city.') })
   const newsBriefSchema = z.object({ topic: z.string().optional().describe('综合 / 科技 / AI / 财经. Defaults to 综合.') })
@@ -1509,12 +1582,33 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'persona_update',
-      description: 'Update Personal Assistant persona knobs when the user asks (e.g. "以后简短点", "颜文字多一点", "换个活泼人设"). Takes effect next turn and mirrors in the Web UI workbench.',
+      description: 'Propose updating Personal Assistant persona knobs when the user asks (e.g. "以后简短点", "颜文字多一点", "换个活泼人设"). Stages a confirmation bar at the bottom of your reply — takes effect once the user clicks「同意」(or replies 同意 on Feishu).',
       parameters: z.toJSONSchema(personaUpdateSchema),
       execute: async (raw: unknown) => {
         guard()
         const args = personaUpdateSchema.parse(raw ?? {})
-        const next = normalizeAssistantPersonaConfig({ ...deps.getPersonaConfig(), ...args })
+        const before = deps.getPersonaConfig()
+        const next = normalizeAssistantPersonaConfig({ ...before, ...args })
+        const summary = describePersonaDiff(before, next)
+        if (deps.recordPersistenceChange) {
+          const patchFields = Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)) as Partial<AssistantPersonaConfig>
+          const staged = deps.recordPersistenceChange({
+            domain: 'persona',
+            mode: 'approval',
+            status: 'pending',
+            summary,
+            toolName: 'persona_update',
+            patch: { domain: 'persona', before, patchFields },
+          })
+          return {
+            ok: true,
+            pendingApproval: true,
+            changeId: staged.id,
+            summary,
+            proposedConfig: next,
+            message: 'Staged for user approval at the bottom of your reply — ask the user to click「同意」(or reply `同意` on Feishu) to apply; do NOT claim it has already taken effect.',
+          }
+        }
         deps.setPersonaConfig(next)
         return { ok: true, config: next }
       },
@@ -1552,6 +1646,14 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         }
         if (!saved) return { ok: false, error: 'No usable image found in the referenced/recent user message. Ask the user to send the image again, or upload it in the Web UI sticker gallery.' }
         deps.setStickers(saved.list)
+        deps.recordPersistenceChange?.({
+          domain: 'sticker',
+          mode: 'auto',
+          status: 'applied',
+          summary: `新增表情「${saved.entry.name}」${saved.entry.tags.length ? `（#${saved.entry.tags.join(' #')}）` : ''}`,
+          toolName: 'sticker_add_from_message',
+          patch: { domain: 'sticker', op: 'add', entryId: saved.entry.id, after: saved.entry },
+        })
         return { ok: true, sticker: { id: saved.entry.id, name: saved.entry.name, tags: saved.entry.tags, emotion: saved.entry.emotion } }
       },
     },
@@ -1569,6 +1671,14 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         const target = matches[0]!
         const trashed = trashStickerRecord(all, target.id)
         deps.setStickers(trashed.list)
+        deps.recordPersistenceChange?.({
+          domain: 'sticker',
+          mode: 'auto',
+          status: 'applied',
+          summary: `移入回收站「${target.name}」`,
+          toolName: 'sticker_delete',
+          patch: { domain: 'sticker', op: 'trash', entryId: target.id, before: target, ...(trashed.entry ? { after: trashed.entry } : {}) },
+        })
         return { ok: true, trashed: { id: target.id, name: target.name }, restorableUntil: stickerTrashPurgeAt(trashed.entry ?? target), note: 'Sticker moved to the 1-day trash; call sticker_restore within 24h to undo, after which it is permanently deleted.' }
       },
     },
@@ -1584,9 +1694,18 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         const matches = trashedStickers(all).filter(s => s.id === q || s.name.toLowerCase() === q || s.name.toLowerCase().includes(q) || s.tags.some(t => t.toLowerCase().includes(q)))
         if (matches.length === 0) return { ok: false, error: `No trashed sticker matches: ${args.id_or_name} (trash only keeps stickers for 1 day)` }
         if (matches.length > 1) return { ok: false, error: 'Multiple trashed stickers match; ask the user to pick one', candidates: matches.map(s => ({ id: s.id, name: s.name })) }
-        const restored = restoreStickerRecord(all, matches[0]!.id)
+        const target = matches[0]!
+        const restored = restoreStickerRecord(all, target.id)
         deps.setStickers(restored.list)
-        return { ok: true, restored: { id: matches[0]!.id, name: matches[0]!.name } }
+        deps.recordPersistenceChange?.({
+          domain: 'sticker',
+          mode: 'auto',
+          status: 'applied',
+          summary: `从回收站恢复「${target.name}」`,
+          toolName: 'sticker_restore',
+          patch: { domain: 'sticker', op: 'restore', entryId: target.id, before: target, ...(restored.entry ? { after: restored.entry } : {}) },
+        })
+        return { ok: true, restored: { id: target.id, name: target.name } }
       },
     },
     {
@@ -1608,6 +1727,14 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
           updatedAt: new Date().toISOString(),
         }
         deps.setStickers(all.map(s => (s.id === target.id ? updated : s)))
+        deps.recordPersistenceChange?.({
+          domain: 'sticker',
+          mode: 'auto',
+          status: 'applied',
+          summary: target.name !== updated.name ? `重命名「${target.name}」→「${updated.name}」` : `更新表情「${updated.name}」标签/情绪`,
+          toolName: 'sticker_update',
+          patch: { domain: 'sticker', op: 'update', entryId: target.id, before: target, after: updated },
+        })
         return { ok: true, sticker: { id: updated.id, name: updated.name, tags: updated.tags, emotion: updated.emotion } }
       },
     },
@@ -1619,13 +1746,23 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'persona_learning_add',
-      description: 'Explicitly teach the assistant a style/address/preference learning that auto-applies (e.g. "记住：闲聊时简短一点"). Mirrors in the Web UI learned-knowledge manager.',
+      description: 'Explicitly teach the assistant a style/address/preference learning that auto-applies (e.g. "记住：闲聊时简短一点"). Mirrors in the Web UI learned-knowledge manager and attaches an undoable notice to the reply.',
       parameters: z.toJSONSchema(learningAddSchema),
       execute: async (raw: unknown) => {
         guard()
         const args = learningAddSchema.parse(raw ?? {})
-        const saved = savePersonaLearning(deps.getLearnings(), { content: args.content, ...(args.kind ? { kind: args.kind } : {}), source: 'agent' })
+        const existingList = deps.getLearnings()
+        const beforeEntry = existingList.find(e => e.content.toLowerCase() === args.content.trim().replace(/\s+/g, ' ').slice(0, 240).toLowerCase())
+        const saved = savePersonaLearning(existingList, { content: args.content, ...(args.kind ? { kind: args.kind } : {}), source: 'agent' })
         deps.setLearnings(saved.list)
+        deps.recordPersistenceChange?.({
+          domain: 'learning',
+          mode: 'auto',
+          status: 'applied',
+          summary: `${beforeEntry ? '更新默契' : '新增默契'}（${saved.entry.kind}）：「${saved.entry.content}」`,
+          toolName: 'persona_learning_add',
+          patch: { domain: 'learning', op: 'add', entryId: saved.entry.id, ...(beforeEntry ? { before: beforeEntry } : {}), after: saved.entry },
+        })
         return { ok: true, entry: saved.entry }
       },
     },
@@ -1641,8 +1778,17 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         const matches = all.filter(e => e.id === q || e.content.toLowerCase().includes(q))
         if (matches.length === 0) return { ok: false, error: 'Learning not found' }
         if (matches.length > 1) return { ok: false, error: 'Multiple learnings match', candidates: matches.map(e => ({ id: e.id, content: e.content })) }
-        deps.setLearnings(all.filter(e => e.id !== matches[0]!.id))
-        return { ok: true, deleted: matches[0] }
+        const removed = matches[0]!
+        deps.setLearnings(all.filter(e => e.id !== removed.id))
+        deps.recordPersistenceChange?.({
+          domain: 'learning',
+          mode: 'auto',
+          status: 'applied',
+          summary: `删除默契：「${removed.content}」`,
+          toolName: 'persona_learning_delete',
+          patch: { domain: 'learning', op: 'delete', entryId: removed.id, before: removed },
+        })
+        return { ok: true, deleted: removed }
       },
     },
     {
@@ -1653,7 +1799,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'ambient_set_home_city',
-      description: 'Change the resident/home city used for weather and ambient context (geocoded via Open-Meteo, detailed addresses degrade to their city automatically, weather refreshed immediately). If resident addresses exist, this updates the primary address\'s city. Use when the user says "把常驻城市改成上海". Mirrors in Web UI.',
+      description: 'Propose changing the resident/home city used for weather and ambient context. Stages a confirmation bar at the bottom of your reply — takes effect once the user clicks「同意」(or replies 同意 on Feishu).',
       parameters: z.toJSONSchema(ambientSetCitySchema),
       execute: async (raw: unknown) => {
         guard()
@@ -1661,6 +1807,25 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         const city = await geocodeCity(args.city)
         if (!city) return { ok: false, error: `No city matched "${args.city}" even after degrading the query to district/city level; ask the user for a shorter city or district name.` }
         const current = deps.getAmbientConfig()
+        if (deps.recordPersistenceChange) {
+          const summary = `常驻天气城市：「${current.homeCity.name}」→「${city.name}」`
+          const staged = deps.recordPersistenceChange({
+            domain: 'address',
+            mode: 'approval',
+            status: 'pending',
+            summary,
+            toolName: 'ambient_set_home_city',
+            patch: { domain: 'address', op: 'set_city', beforeCity: current.homeCity, afterCity: city },
+          })
+          return {
+            ok: true,
+            pendingApproval: true,
+            changeId: staged.id,
+            summary,
+            proposedCity: city,
+            message: 'Staged for user approval at the bottom of your reply — ask the user to click「同意」(or reply `同意` on Feishu) to apply; do NOT claim it has already taken effect.',
+          }
+        }
         const next = normalizeAssistantAmbientConfig({
           ...current,
           homeCity: city,
@@ -1678,17 +1843,66 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'ambient_save_address',
-      description: 'Save one of the user\'s resident addresses (multiple allowed: 家/公司/老家…). `address` is the detailed free-form address, or a pasted "longitude,latitude" coordinate pair for zero-error positioning. Re-saving with the same label REPLACES that address. `city` is optional — when omitted it is resolved from the address itself (Amap POI/door-level when keyed, else city level). The first address (or make_primary=true) becomes the primary whose city drives weather. Use when the user says "记住我家地址是…/我公司在…".',
+      description: 'Propose saving or updating one of the user\'s resident addresses (家/公司/老家…). `address` is the detailed free-form address, or a pasted "longitude,latitude" coordinate pair. CRITICAL: stored residentAddresses are authoritative (edited via Web UI) — NEVER replay edits from earlier chat history; only call when the user asks in THIS turn. Stages a confirmation bar at the bottom of your reply — nothing is written until the user clicks「同意」(or replies 同意 on Feishu).',
       parameters: z.toJSONSchema(ambientSaveAddressSchema),
       execute: async (raw: unknown) => {
         guard()
         const args = ambientSaveAddressSchema.parse(raw ?? {})
+        const currentCfg = deps.getAmbientConfig()
+        const trimmedAddress = args.address.trim()
+        const trimmedLabel = args.label?.trim()
+        const existingByLabel = trimmedLabel
+          ? currentCfg.residentAddresses.find(a => a.label === trimmedLabel)
+          : currentCfg.residentAddresses.find(a => a.address === trimmedAddress)
+        if (existingByLabel && existingByLabel.address !== trimmedAddress) {
+          const turnHasIntent = hasUserTurnAddressMutationIntent(deps.getAssistantMessages(), existingByLabel.updatedAt, trimmedAddress)
+          const needsFlag = !deps.recordPersistenceChange && !args.overwrite_existing
+          if (!turnHasIntent || needsFlag) {
+            return {
+              ok: false,
+              existing: existingByLabel,
+              error: `Refused to overwrite saved address "${existingByLabel.label}" ("${existingByLabel.address}", updated ${existingByLabel.updatedAt}). Stored resident addresses are authoritative (edited via Web UI) and newer than old chat history. Use the stored address as-is unless the user explicitly asked in THIS turn to change it.`,
+            }
+          }
+        }
         const city = await resolveAddressCity(args.address, {
           ...(deps.getAmapApiKey?.() ? { amapKey: deps.getAmapApiKey() } : {}),
           ...(args.city?.trim() ? { cityHint: args.city.trim() } : {}),
         })
         if (!city) return { ok: false, error: `No city matched for address "${args.address}"; ask the user which city it is in.` }
-        const saved = upsertResidentAddress(deps.getAmbientConfig(), {
+        const label = trimmedLabel || existingByLabel?.label || '常驻地址'
+        if (deps.recordPersistenceChange) {
+          const summary = existingByLabel
+            ? `${label}：「${existingByLabel.address}」→「${trimmedAddress}」（${city.name}）`
+            : `新增「${label}」：${trimmedAddress}（${city.name}）`
+          const staged = deps.recordPersistenceChange({
+            domain: 'address',
+            mode: 'approval',
+            status: 'pending',
+            summary,
+            toolName: 'ambient_save_address',
+            patch: {
+              domain: 'address',
+              op: 'upsert',
+              ...(existingByLabel ? { beforeEntry: existingByLabel } : {}),
+              afterInput: {
+                address: trimmedAddress,
+                label,
+                city,
+                ...(args.make_primary ? { makePrimary: true } : {}),
+              },
+            },
+          })
+          return {
+            ok: true,
+            pendingApproval: true,
+            changeId: staged.id,
+            summary,
+            proposedAddress: { label, address: trimmedAddress, city },
+            message: 'Staged for user approval at the bottom of your reply — ask the user to click「同意」(or reply `同意` on Feishu) to apply; do NOT claim it has already taken effect.',
+          }
+        }
+        const saved = upsertResidentAddress(currentCfg, {
           address: args.address,
           ...(args.label ? { label: args.label } : {}),
           city,
@@ -1703,7 +1917,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'ambient_delete_address',
-      description: 'Delete a saved resident address by ID or unambiguous label/address fragment (see ambient_get). Deleting the primary promotes the next address and re-bases the weather city.',
+      description: 'Propose deleting a saved resident address by ID or unambiguous label/address fragment ONLY when the user explicitly asks in their latest message to delete/forget it. Stages a confirmation bar — nothing is deleted until the user clicks「同意」(or replies 同意 on Feishu).',
       parameters: z.toJSONSchema(ambientDeleteAddressSchema),
       execute: async (raw: unknown) => {
         guard()
@@ -1713,9 +1927,31 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
         const matches = cfg.residentAddresses.filter(a => a.id === q || a.label.toLowerCase() === q || a.address.toLowerCase().includes(q))
         if (matches.length === 0) return { ok: false, error: `No resident address matches: ${args.id_or_label}` }
         if (matches.length > 1) return { ok: false, error: 'Multiple addresses match; ask the user to pick one', candidates: matches.map(a => ({ id: a.id, label: a.label, address: a.address })) }
-        const next = removeResidentAddress(cfg, matches[0]!.id)
+        const target = matches[0]!
+        if (!hasUserTurnAddressMutationIntent(deps.getAssistantMessages(), target.updatedAt)) {
+          return { ok: false, error: `Refused to delete saved address "${target.label}": the user's latest message did not ask to delete or modify an address.` }
+        }
+        if (deps.recordPersistenceChange) {
+          const summary = `删除「${target.label}」：${target.address}`
+          const staged = deps.recordPersistenceChange({
+            domain: 'address',
+            mode: 'approval',
+            status: 'pending',
+            summary,
+            toolName: 'ambient_delete_address',
+            patch: { domain: 'address', op: 'delete', targetId: target.id, beforeEntry: target },
+          })
+          return {
+            ok: true,
+            pendingApproval: true,
+            changeId: staged.id,
+            summary,
+            message: 'Deletion staged for user approval at the bottom of your reply — ask the user to click「同意」(or reply `同意` on Feishu) to confirm.',
+          }
+        }
+        const next = removeResidentAddress(cfg, target.id)
         deps.setAmbientConfig(next)
-        return { ok: true, deleted: { id: matches[0]!.id, label: matches[0]!.label }, addresses: next.residentAddresses, homeCity: next.homeCity }
+        return { ok: true, deleted: { id: target.id, label: target.label }, addresses: next.residentAddresses, homeCity: next.homeCity }
       },
     },
     {

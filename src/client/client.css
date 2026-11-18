@@ -123,6 +123,7 @@
 .dt-msg-head-actions { display: inline-flex; align-items: center; gap: 6px; }
 .dt-msg-receipt { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; margin-top: 4px; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-module-platform); font-size: 12px; line-height: 18px; }
 .dt-msg-receipt[data-active='true'] { border-color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-button-ghost-active-fill); }
+.dt-msg-receipt[data-tone='warning'] { border-color: #d97706; background: rgba(245, 158, 11, 0.09); }
 .dt-msg-receipt-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
 .dt-msg-receipt-title { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-primary); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dt-msg-receipt-state { color: var(--dsw-alias-label-secondary); font-weight: 500; }
