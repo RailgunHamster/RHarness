@@ -1115,11 +1115,35 @@ export function buildBaiduNavigationUrl(originText: string | undefined, destinat
 
 interface AmapGeocodeHit { longitude: number; latitude: number; formattedAddress: string; city?: string; level?: string }
 
-export async function geocodeWithAmap(address: string, apiKey: string, fetcher: FetchFn = fetch): Promise<AmapGeocodeHit | undefined> {
-  const res = await fetcher(`https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(apiKey)}&address=${encodeURIComponent(address)}`, { signal: AbortSignal.timeout(10_000) })
-  if (!res.ok) return undefined
-  const data = (await res.json()) as { status?: string; geocodes?: { location?: string; formatted_address?: string; city?: string | string[]; level?: string }[] }
-  if (data.status !== '1') return undefined
+/** Retries live Amap requests when a personal-key 3-QPS burst triggers `CUQPS_HAS_EXCEEDED_THE_LIMIT` (`10021`); mock fetchers run with zero delay. */
+async function amapFetchJson<T extends { status?: string; info?: string; infocode?: string; errcode?: number; errmsg?: string }>(
+  url: string,
+  fetcher: FetchFn,
+): Promise<T | undefined> {
+  const maxAttempts = fetcher === fetch ? 3 : 1
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const res = await fetcher(url, { signal: AbortSignal.timeout(12_000) })
+    if (!res.ok) return undefined
+    const data = (await res.json()) as T
+    const qpsExceeded = data.infocode === '10021'
+      || Boolean(data.info?.includes('CUQPS'))
+      || Boolean(data.errmsg?.includes('CUQPS'))
+    if (qpsExceeded && attempt + 1 < maxAttempts) {
+      await new Promise(r => setTimeout(r, 380 * (attempt + 1)))
+      continue
+    }
+    return data
+  }
+  return undefined
+}
+
+export async function geocodeWithAmap(address: string, apiKey: string, fetcher: FetchFn = fetch, cityHint?: string): Promise<AmapGeocodeHit | undefined> {
+  const cityParam = cityHint?.trim() ? `&city=${encodeURIComponent(cityHint.trim())}` : ''
+  const data = await amapFetchJson<{ status?: string; geocodes?: { location?: string; formatted_address?: string; city?: string | string[]; level?: string }[] }>(
+    `https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(apiKey)}&address=${encodeURIComponent(address)}${cityParam}`,
+    fetcher,
+  )
+  if (!data || data.status !== '1') return undefined
   const hit = data.geocodes?.[0]
   const [lon, lat] = (hit?.location ?? '').split(',').map(Number)
   if (!hit || !Number.isFinite(lon) || !Number.isFinite(lat)) return undefined
@@ -1153,10 +1177,11 @@ export async function searchPlacesWithAmap(keyword: string, input: { apiKey: str
     extensions: 'base',
     ...(input.city ? { city: input.city, citylimit: 'false' } : {}),
   })
-  const res = await fetcher(`https://restapi.amap.com/v3/place/text?${params.toString()}`, { signal: AbortSignal.timeout(10_000) })
-  if (!res.ok) return []
-  const data = (await res.json()) as { status?: string; pois?: { name?: string; address?: string | string[]; location?: string; cityname?: string; adname?: string }[] }
-  if (data.status !== '1') return []
+  const data = await amapFetchJson<{ status?: string; pois?: { name?: string; address?: string | string[]; location?: string; cityname?: string; adname?: string }[] }>(
+    `https://restapi.amap.com/v3/place/text?${params.toString()}`,
+    fetcher,
+  )
+  if (!data || data.status !== '1') return []
   const out: PlaceCandidate[] = []
   for (const poi of data.pois ?? []) {
     const [lon, lat] = (poi.location ?? '').split(',').map(Number)
@@ -1211,6 +1236,8 @@ export async function reverseGeocodeWithAmap(longitude: number, latitude: number
   }
 }
 
+const resolvedAddressCoordCache = new Map<string, AmbientHomeCity>()
+
 /**
  * Resolves the city + coordinates for a resident address being saved: pasted coordinates
  * win (zero error), then precise Amap geocoding / decisive POI match, then the plain
@@ -1228,18 +1255,33 @@ export async function resolveAddressCity(addressText: string, input: { amapKey?:
     return { name: cityName || '坐标点', longitude: coord.longitude, latitude: coord.latitude, timezone: 'Asia/Shanghai' }
   }
   if (input.amapKey) {
-    const geo = await geocodeWithAmap(input.cityHint?.trim() || addressText, input.amapKey, fetcher).catch(() => undefined)
+    const cacheKey = `${addressText.trim()}::${input.cityHint?.trim() ?? ''}`
+    if (fetcher === fetch) {
+      const cached = resolvedAddressCoordCache.get(cacheKey)
+      if (cached) return cached
+    }
+    const cacheAndReturn = (val: AmbientHomeCity): AmbientHomeCity => {
+      if (fetcher === fetch) {
+        if (resolvedAddressCoordCache.size >= 128) {
+          const oldest = resolvedAddressCoordCache.keys().next().value
+          if (oldest !== undefined) resolvedAddressCoordCache.delete(oldest)
+        }
+        resolvedAddressCoordCache.set(cacheKey, val)
+      }
+      return val
+    }
+    const geo = await geocodeWithAmap(addressText, input.amapKey, fetcher, input.cityHint).catch(() => undefined)
     if (geo && geo.level && PRECISE_GEOCODE_LEVELS.has(geo.level)) {
-      return { name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' }
+      return cacheAndReturn({ name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' })
     }
     const places = await searchPlacesWithAmap(addressText, { apiKey: input.amapKey, ...(input.cityHint ? { city: input.cityHint } : {}), fetcher }).catch(() => [])
     const scored = places.map(p => ({ p, score: scorePlaceMatch(addressText, p) })).sort((a, b) => b.score - a.score)
     const top = scored[0]
     if (top && top.score >= 60) {
-      return { name: top.p.cityName || input.cityHint?.trim() || top.p.name, longitude: top.p.longitude, latitude: top.p.latitude, timezone: 'Asia/Shanghai' }
+      return cacheAndReturn({ name: top.p.cityName || input.cityHint?.trim() || top.p.name, longitude: top.p.longitude, latitude: top.p.latitude, timezone: 'Asia/Shanghai' })
     }
     if (geo) {
-      return { name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' }
+      return cacheAndReturn({ name: geo.city || input.cityHint?.trim() || geo.formattedAddress, longitude: geo.longitude, latitude: geo.latitude, timezone: 'Asia/Shanghai' })
     }
   }
   return geocodeCity(input.cityHint?.trim() || addressText, fetcher)
@@ -1260,9 +1302,11 @@ export async function planRouteWithAmap(input: {
   const key = encodeURIComponent(input.apiKey)
   if (input.mode === 'transit') {
     const city = encodeURIComponent((input.originCity ?? '').replace(/市$/, '') || '上海')
-    const res = await fetcher(`https://restapi.amap.com/v3/direction/transit/integrated?key=${key}&origin=${origin}&destination=${destination}&city=${city}&extensions=base`, { signal: AbortSignal.timeout(12_000) })
-    const data = (await res.json()) as { status?: string; info?: string; route?: { transits?: { distance?: string; duration?: string; segments?: { bus?: { buslines?: { name?: string; departure_stop?: { name?: string }; arrival_stop?: { name?: string } }[] }; walking?: { distance?: string } }[] }[] } }
-    if (data.status !== '1') throw new Error(`Amap transit failed: ${data.info ?? 'unknown'}`)
+    const data = await amapFetchJson<{ status?: string; info?: string; route?: { transits?: { distance?: string; duration?: string; segments?: { bus?: { buslines?: { name?: string; departure_stop?: { name?: string }; arrival_stop?: { name?: string } }[] }; walking?: { distance?: string } }[] }[] } }>(
+      `https://restapi.amap.com/v3/direction/transit/integrated?key=${key}&origin=${origin}&destination=${destination}&city=${city}&extensions=base`,
+      fetcher,
+    )
+    if (!data || data.status !== '1') throw new Error(`Amap transit failed: ${data?.info ?? 'unknown'}`)
     const best = data.route?.transits?.[0]
     if (!best) throw new Error('Amap transit returned no route')
     const steps: string[] = []
@@ -1275,9 +1319,11 @@ export async function planRouteWithAmap(input: {
     return { distanceKm: Number(best.distance ?? 0) / 1000, durationMin: Number(best.duration ?? 0) / 60, steps: steps.slice(0, 10) }
   }
   if (input.mode === 'bicycling') {
-    const res = await fetcher(`https://restapi.amap.com/v4/direction/bicycling?key=${key}&origin=${origin}&destination=${destination}`, { signal: AbortSignal.timeout(12_000) })
-    const data = (await res.json()) as { errcode?: number; errmsg?: string; data?: { paths?: { distance?: number | string; duration?: number | string; steps?: { instruction?: string }[] }[] } }
-    if (data.errcode !== 0) throw new Error(`Amap bicycling failed: ${data.errmsg ?? 'unknown'}`)
+    const data = await amapFetchJson<{ errcode?: number; errmsg?: string; data?: { paths?: { distance?: number | string; duration?: number | string; steps?: { instruction?: string }[] }[] } }>(
+      `https://restapi.amap.com/v4/direction/bicycling?key=${key}&origin=${origin}&destination=${destination}`,
+      fetcher,
+    )
+    if (!data || data.errcode !== 0) throw new Error(`Amap bicycling failed: ${data?.errmsg ?? 'unknown'}`)
     const best = data.data?.paths?.[0]
     if (!best) throw new Error('Amap bicycling returned no route')
     return {
@@ -1287,9 +1333,11 @@ export async function planRouteWithAmap(input: {
     }
   }
   const kind = input.mode === 'walking' ? 'walking' : 'driving'
-  const res = await fetcher(`https://restapi.amap.com/v3/direction/${kind}?key=${key}&origin=${origin}&destination=${destination}&extensions=base`, { signal: AbortSignal.timeout(12_000) })
-  const data = (await res.json()) as { status?: string; info?: string; route?: { paths?: { distance?: string; duration?: string; steps?: { instruction?: string }[] }[] } }
-  if (data.status !== '1') throw new Error(`Amap ${kind} failed: ${data.info ?? 'unknown'}`)
+  const data = await amapFetchJson<{ status?: string; info?: string; route?: { paths?: { distance?: string; duration?: string; steps?: { instruction?: string }[] }[] } }>(
+    `https://restapi.amap.com/v3/direction/${kind}?key=${key}&origin=${origin}&destination=${destination}&extensions=base`,
+    fetcher,
+  )
+  if (!data || data.status !== '1') throw new Error(`Amap ${kind} failed: ${data?.info ?? 'unknown'}`)
   const best = data.route?.paths?.[0]
   if (!best) throw new Error(`Amap ${kind} returned no route`)
   return {
@@ -1568,7 +1616,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
   const navigationRouteSchema = z.object({
     from: z.string().optional().describe('Origin: a saved address label （家/公司）, a detailed address, or a place name. Defaults to the primary resident address.'),
     to: z.string().min(1).describe('Destination: address label, detailed address, or place name'),
-    mode: z.enum(['driving', 'transit', 'bicycling', 'walking']).optional().describe('Travel mode (driving / transit / bicycling / walking), default driving'),
+    mode: z.enum(['driving', 'transit', 'bicycling', 'walking']).optional().describe('Travel mode: "driving"（驾车，含实时路况，默认）| "transit"（公交/地铁）| "bicycling"（骑行/单车）| "walking"（步行）'),
   })
   const weatherQuerySchema = z.object({ city: z.string().optional().describe('City name. Defaults to the configured home city.') })
   const newsBriefSchema = z.object({ topic: z.string().optional().describe('综合 / 科技 / AI / 财经. Defaults to 综合.') })
@@ -1956,7 +2004,7 @@ export function buildAssistantPersonaAmbientTools(deps: PersonaAmbientToolDeps):
     },
     {
       name: 'navigation_route',
-      description: 'Plan a route and (when an Amap key is configured) report distance, duration (traffic-aware for driving) and step summary; always returns Amap/Baidu navigation deep links. Origin defaults to the primary resident address; endpoints may be saved labels （家/公司）, detailed addresses, place names (resolved via Amap POI search), or "longitude,latitude" coordinates. IMPORTANT: when the result has needsConfirmation=true, several places matched — list the candidates and ask the user which one; NEVER silently pick one or claim a location is precise when precision is "imprecise". After the user picks, call again with to set to that candidate\'s "longitude,latitude". Use for "我回家要多久", "去X怎么走", "导航去X".',
+      description: 'Plan a route across all 4 modes — driving（驾车，含实时路况）, transit（公交/地铁）, bicycling（骑行/骑车）, and walking（步行/走过去）— reporting exact distance, duration, step-by-step instructions, and tappable Amap/Baidu navigation deep links. Origin defaults to the primary resident address; endpoints may be saved labels （家/公司）, detailed addresses, place names (Amap POI search), or "longitude,latitude" coordinates. IMPORTANT: when needsConfirmation=true, list the candidates and ask the user which one; NEVER silently pick one or claim precision when precision is "imprecise". Use for "回家要多久", "走过去多久/步行导航", "骑车怎么走", "坐地铁怎么去".',
       parameters: z.toJSONSchema(navigationRouteSchema),
       execute: async (raw: unknown) => {
         guard()

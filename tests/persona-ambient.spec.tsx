@@ -55,7 +55,7 @@ import {
 } from '../src/app/assistant-persona-and-ambient.ts'
 import { PersonaAmbientWorkbench, PersonalAssistantSlotView } from '../src/client/ui-slots.tsx'
 import { DATA_CENTER_TAG, createDeviceGroup, ensureDeviceIdentity, isDataCenterNode, retagOwnClaims, verifyAndExtractGroupMembers, verifySignedClaim } from '../src/app/device-group.ts'
-import { formatFeishuPersistenceFooter, parsePersistenceQuickCommand, type PersistenceChangeRecord } from '../src/app/claw-assistant.ts'
+import { buildPersistenceDecisionNotesPrompt, formatFeishuPersistenceFooter, parsePersistenceQuickCommand, type PersistenceChangeRecord } from '../src/app/claw-assistant.ts'
 
 declare global { var IS_REACT_ACT_ENVIRONMENT: boolean }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -392,6 +392,9 @@ describe('ambient awareness', () => {
       if (url.includes('direction/bicycling')) {
         return new Response(JSON.stringify({ errcode: 0, errmsg: 'OK', data: { paths: [{ distance: 3200, duration: 780, steps: [{ instruction: '沿非机动车道向东骑行' }, { instruction: '到达终点' }] }] } }), { status: 200 })
       }
+      if (url.includes('direction/walking')) {
+        return new Response(JSON.stringify({ status: '1', route: { paths: [{ distance: '1900', duration: '1500', steps: [{ instruction: '沿华发路向东步行' }, { instruction: '到达终点' }] }] } }), { status: 200 })
+      }
       // Open-Meteo city-candidate fallback (no-key path): no hits in this mock.
       return new Response(JSON.stringify({ results: [] }), { status: 200 })
     }) as unknown as typeof fetch
@@ -416,6 +419,14 @@ describe('ambient awareness', () => {
     expect(cycling.durationText).toBe('约 13 分钟')
     expect(cycling.links.amap).toContain('mode=ride')
     expect(cycling.links.baidu).toContain('mode=riding')
+
+    const walking = await planNavigation({ fromText: '家', toText: '公司', mode: 'walking', addresses: cfg.residentAddresses, amapKey: 'test-key', fetcher })
+    expect(walking.provider).toBe('amap')
+    expect(walking.distanceKm).toBe(1.9)
+    expect(walking.durationText).toBe('约 25 分钟')
+    expect(walking.steps[0]).toContain('步行')
+    expect(walking.links.amap).toContain('mode=walk')
+    expect(walking.links.baidu).toContain('mode=walking')
 
     // No key: still returns tappable links from saved city coordinates, with an explanatory note.
     const linksOnly = await planNavigation({ toText: '公司', mode: 'driving', addresses: cfg.residentAddresses, fetcher })
@@ -881,20 +892,41 @@ describe('persona workbench UI', () => {
     expect(feishuFooter).toContain('已修改持久化数据')
 
     expect(parsePersistenceQuickCommand('📱 [飞书私聊] 同意', { hasPendingOnLatest: true, hasUndoableOnLatest: false })).toEqual({ action: 'approve' })
+    expect(parsePersistenceQuickCommand('同意：北杨园区才是新址', { hasPendingOnLatest: true, hasUndoableOnLatest: false })).toEqual({ action: 'approve', note: '北杨园区才是新址' })
     expect(parsePersistenceQuickCommand('同意 ab10', { hasPendingOnLatest: false, hasUndoableOnLatest: false })).toEqual({ action: 'approve', shortId: 'ab10' })
+    expect(parsePersistenceQuickCommand('拒绝 #ab10 不是北区是南区3号楼', { hasPendingOnLatest: false, hasUndoableOnLatest: false })).toEqual({ action: 'reject', shortId: 'ab10', note: '不是北区是南区3号楼' })
     expect(parsePersistenceQuickCommand('拒绝', { hasPendingOnLatest: true, hasUndoableOnLatest: false })).toEqual({ action: 'reject' })
-    expect(parsePersistenceQuickCommand('撤回 #ab30', { hasPendingOnLatest: false, hasUndoableOnLatest: false })).toEqual({ action: 'undo', shortId: 'ab30' })
+    expect(parsePersistenceQuickCommand('撤回 #ab30：记反了', { hasPendingOnLatest: false, hasUndoableOnLatest: false })).toEqual({ action: 'undo', shortId: 'ab30', note: '记反了' })
     // Normal conversation is never hijacked when nothing is pending/undoable.
     expect(parsePersistenceQuickCommand('同意', { hasPendingOnLatest: false, hasUndoableOnLatest: false })).toBeUndefined()
     expect(parsePersistenceQuickCommand('同意你的分析，接下来看看别的', { hasPendingOnLatest: true, hasUndoableOnLatest: true })).toBeUndefined()
 
-    // Web UI bubble renders both `pending` (✓ 同意 / ✕ 拒绝) and `applied` (↩ 撤回) bars and posts actions.
-    const actionCalls: string[] = []
+    const notesPrompt = buildPersistenceDecisionNotesPrompt([{
+      id: 'b0',
+      sender: 'claw-assistant',
+      bot: true,
+      text: 'x',
+      at: '2026-11-18T02:00:00Z',
+      replyMeta: {
+        model: { provider: 'dsh', model: 'test' },
+        persistenceChanges: [{ ...recorded[0]!, status: 'rejected', decisionNote: '应该是南区3号楼' }],
+      },
+    }])
+    expect(notesPrompt).toContain('应该是南区3号楼')
+
+    // Web UI bubble: inline optional reason on pending, permanent note badge on decided, and Edit button ONLY on latest user msg.
+    const actionCalls: { url: string; body: Record<string, unknown> }[] = []
+    const editResendCalls: { url: string; body: Record<string, unknown> }[] = []
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      const parsedBody = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {}
       if (u.includes('persistence-changes') && init?.method === 'POST') {
-        actionCalls.push(u)
+        actionCalls.push({ url: u, body: parsedBody })
         return new Response(JSON.stringify({ ok: true, acted: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (u.includes('/edit-resend') && init?.method === 'POST') {
+        editResendCalls.push({ url: u, body: parsedBody })
+        return new Response(JSON.stringify({ edited: true, message: { id: 'u-edited', sender: 'operator', text: String(parsedBody.text ?? ''), at: '2026-11-18T02:05:00Z' }, messages: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
       return new Response(JSON.stringify({ ambient: buildAmbientSnapshot(ambientCfg, undefined) }), { status: 200, headers: { 'content-type': 'application/json' } })
     }))
@@ -903,20 +935,26 @@ describe('persona workbench UI', () => {
       root.render(
         <PersonalAssistantSlotView
           lang="zh"
-          messages={[{
-            id: 'bot-1',
-            sender: 'claw-assistant',
-            bot: true,
-            text: '已提交变更，请在下方确认或撤回。',
-            at: '2026-11-18T02:00:02Z',
-            replyMeta: {
-              model: { provider: 'dsh', model: 'test' },
-              persistenceChanges: [
-                { id: 'pchg-1000-ab10', domain: 'address', mode: 'approval', status: 'pending', summary: '园区：旧址 → 新址', toolName: 'ambient_save_address', createdAt: '2026-11-18T02:00:01Z' },
-                { id: 'pchg-1000-ab30', domain: 'memory', mode: 'auto', status: 'applied', summary: '新增记忆「偏好」', toolName: 'memory_save', createdAt: '2026-11-18T02:00:01Z' },
-              ],
+          messages={[
+            { id: 'u-old', sender: 'operator', text: '旧问题', at: '2026-11-18T01:50:00Z' },
+            { id: 'bot-old', sender: 'claw-assistant', bot: true, text: '旧回答', at: '2026-11-18T01:50:05Z' },
+            { id: 'u-latest', sender: 'operator', text: '最近一条我的提问', at: '2026-11-18T02:00:00Z' },
+            {
+              id: 'bot-1',
+              sender: 'claw-assistant',
+              bot: true,
+              text: '已提交变更，请在下方确认或撤回。',
+              at: '2026-11-18T02:00:02Z',
+              replyMeta: {
+                model: { provider: 'dsh', model: 'test' },
+                persistenceChanges: [
+                  { id: 'pchg-1000-ab10', domain: 'address', mode: 'approval', status: 'pending', summary: '园区：旧址 → 新址', toolName: 'ambient_save_address', createdAt: '2026-11-18T02:00:01Z' },
+                  { id: 'pchg-1000-ab30', domain: 'memory', mode: 'auto', status: 'applied', summary: '新增记忆「偏好」', toolName: 'memory_save', createdAt: '2026-11-18T02:00:01Z' },
+                  { id: 'pchg-1000-ab40', domain: 'persona', mode: 'approval', status: 'rejected', summary: '详略 balanced → brief', decisionNote: '还是保持适中好', toolName: 'persona_update', createdAt: '2026-11-18T02:00:01Z', decidedAt: '2026-11-18T02:01:00Z' },
+                ],
+              },
             },
-          }]}
+          ]}
           memories={[]}
           onRefresh={async () => {}}
           onJumpToEngineeringTicket={() => {}}
@@ -927,14 +965,36 @@ describe('persona workbench UI', () => {
 
     expect(container.textContent).toContain('待你同意')
     expect(container.textContent).toContain('已修改')
+    expect(container.querySelector('[data-testid="persistence-note-pchg-1000-ab40"]')!.textContent).toContain('还是保持适中好')
+
+    // Optional note: fill reason on approve, leave blank on undo.
+    const noteInput = container.querySelector<HTMLInputElement>('[data-testid="persistence-note-input-pchg-1000-ab10"]')!
     const approveBtn = container.querySelector<HTMLButtonElement>('[data-testid="persistence-approve-pchg-1000-ab10"]')!
     const undoBtn = container.querySelector<HTMLButtonElement>('[data-testid="persistence-undo-pchg-1000-ab30"]')!
-    expect(approveBtn).not.toBeNull()
-    expect(undoBtn).not.toBeNull()
-
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+      setter.call(noteInput, '确认是北杨园区')
+      noteInput.dispatchEvent(new Event('input', { bubbles: true }))
+    })
     await act(async () => { approveBtn.click(); await new Promise(r => setTimeout(r, 20)) })
     await act(async () => { undoBtn.click(); await new Promise(r => setTimeout(r, 20)) })
-    expect(actionCalls.some(u => u.endsWith('/pchg-1000-ab10/approve'))).toBe(true)
-    expect(actionCalls.some(u => u.endsWith('/pchg-1000-ab30/undo'))).toBe(true)
+    expect(actionCalls.find(c => c.url.endsWith('/pchg-1000-ab10/approve'))?.body).toEqual({ note: '确认是北杨园区' })
+    expect(actionCalls.find(c => c.url.endsWith('/pchg-1000-ab30/undo'))?.body).toEqual({})
+
+    // Edit & resend ONLY appears on `u-latest`, never on `u-old` or bot messages.
+    expect(container.querySelector('[data-testid="assistant-edit-msg-u-old"]')).toBeNull()
+    expect(container.querySelector('[data-testid="assistant-edit-msg-bot-1"]')).toBeNull()
+    const editLatestBtn = container.querySelector<HTMLButtonElement>('[data-testid="assistant-edit-msg-u-latest"]')!
+    expect(editLatestBtn).not.toBeNull()
+    await act(async () => { editLatestBtn.click() })
+    const editArea = container.querySelector<HTMLTextAreaElement>('[data-testid="assistant-edit-textarea-u-latest"]')!
+    expect(editArea.value).toBe('最近一条我的提问')
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!
+      setter.call(editArea, '改完后的新提问：步行过去要多久？')
+      editArea.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="assistant-edit-submit-u-latest"]')!.click(); await new Promise(r => setTimeout(r, 20)) })
+    expect(editResendCalls).toEqual([{ url: expect.stringContaining('/assistant/messages/u-latest/edit-resend'), body: { text: '改完后的新提问：步行过去要多久？' } }])
   })
 })

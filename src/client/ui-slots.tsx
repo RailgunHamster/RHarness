@@ -1146,14 +1146,28 @@ export function PersonalAssistantSlotView(props: {
   const [stickerSaveName, setStickerSaveName] = useTextDraft('assistant:sticker-save-name')
   const [stickerSaveTags, setStickerSaveTags] = useTextDraft('assistant:sticker-save-tags')
   const [actingChangeId, setActingChangeId] = useState<string | null>(null)
+  const [decisionNotes, setDecisionNotes] = useState<Record<string, string>>({})
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null)
+  const [editingMsgDraft, setEditingMsgDraft] = useState('')
   const [error, setError] = useState<string | null>(null)
   const displayAmbient = ambientOverride ?? ambient
 
   const actOnPersistenceChange = async (changeId: string, action: 'approve' | 'reject' | 'undo') => {
     setActingChangeId(changeId)
     setError(null)
+    const note = (decisionNotes[changeId] ?? '').trim()
     try {
-      await standaloneFetch(`assistant/persistence-changes/${encodeURIComponent(changeId)}/${action}`, 'POST', {})
+      await standaloneFetch(
+        `assistant/persistence-changes/${encodeURIComponent(changeId)}/${action}`,
+        'POST',
+        note ? { note } : {},
+      )
+      setDecisionNotes(curr => {
+        if (!(changeId in curr)) return curr
+        const next = { ...curr }
+        delete next[changeId]
+        return next
+      })
       await onRefresh()
       try {
         const amb = await standaloneFetch<{ ambient: AmbientSnapshotInfo }>('assistant/ambient', 'GET')
@@ -1163,6 +1177,42 @@ export function PersonalAssistantSlotView(props: {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setActingChangeId(null)
+    }
+  }
+
+  const startEditingLatestUserMessage = (msg: AssistantMessageInfo) => {
+    setEditingMsgId(msg.id)
+    setEditingMsgDraft(msg.text.replace(/^📱\s*\[飞书私聊\]\s*/, ''))
+    setError(null)
+  }
+
+  const cancelEditingLatestUserMessage = () => {
+    setEditingMsgId(null)
+    setEditingMsgDraft('')
+  }
+
+  const submitEditAndResend = async () => {
+    if (!editingMsgId || !editingMsgDraft.trim() || busy) return
+    const targetId = editingMsgId
+    const nextText = editingMsgDraft.trim()
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await standaloneFetch<{
+        edited: boolean
+        message: AssistantMessageInfo
+        chatBackups?: AssistantChatBackupInfo[]
+      }>(`assistant/messages/${encodeURIComponent(targetId)}/edit-resend`, 'POST', { text: nextText })
+      if (res.chatBackups) onChatBackupsUpdated?.(res.chatBackups)
+      setEditingMsgId(null)
+      setEditingMsgDraft('')
+      setFollow(true)
+      setPendingTurnSinceMs(Date.now())
+      await onRefresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -1488,6 +1538,7 @@ export function PersonalAssistantSlotView(props: {
 
   const pinnedMemories = memories.filter(m => m.pinned)
   const locked = busy || readingImages
+  const latestEditableUserMsgId = [...messages].reverse().find(m => !m.bot)?.id
   const displayMessages =
     optimisticUserMsg && !messages.some(m => m.id === optimisticUserMsg.id)
       ? [...messages, optimisticUserMsg]
@@ -1843,6 +1894,18 @@ export function PersonalAssistantSlotView(props: {
                             : (lang === 'zh' ? '查看原始回复与细节' : 'Raw reply & details')}
                         </Button>
                       )}
+                      {!isBot && msg.id === latestEditableUserMsgId && editingMsgId !== msg.id && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          onClick={() => startEditingLatestUserMessage(msg)}
+                          title={lang === 'zh' ? '修改最近一条提问：删掉原提问与后续回复，并用修改后的问题重新提问' : 'Edit & resend latest message'}
+                          data-testid={`assistant-edit-msg-${msg.id}`}
+                        >
+                          {lang === 'zh' ? '✏️ 编辑' : '✏️ Edit'}
+                        </Button>
+                      )}
                       {!isBot && !handoff && (
                         <Button
                           size="sm"
@@ -1868,7 +1931,49 @@ export function PersonalAssistantSlotView(props: {
                     </div>
                   </div>
 
-                  <MarkdownLite text={msg.text} />
+                  {!isBot && editingMsgId === msg.id ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }} data-testid={`assistant-edit-form-${msg.id}`}>
+                      <textarea
+                        className="dt-textarea"
+                        rows={3}
+                        value={editingMsgDraft}
+                        onChange={e => setEditingMsgDraft(e.target.value)}
+                        onKeyDown={e => {
+                          if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                            e.preventDefault()
+                            void submitEditAndResend()
+                          } else if (e.key === 'Escape') {
+                            e.preventDefault()
+                            cancelEditingLatestUserMessage()
+                          }
+                        }}
+                        disabled={busy}
+                        data-testid={`assistant-edit-textarea-${msg.id}`}
+                      />
+                      <div className="dt-row-buttons">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          disabled={busy || !editingMsgDraft.trim()}
+                          onClick={() => { void submitEditAndResend() }}
+                          data-testid={`assistant-edit-submit-${msg.id}`}
+                        >
+                          {busy ? (lang === 'zh' ? '重发中…' : 'Resending…') : (lang === 'zh' ? '重新发送（删掉原提问与回复）' : 'Delete old & resend')}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          onClick={cancelEditingLatestUserMessage}
+                          data-testid={`assistant-edit-cancel-${msg.id}`}
+                        >
+                          {lang === 'zh' ? '取消' : 'Cancel'}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <MarkdownLite text={msg.text} />
+                  )}
 
                   {isBot && msg.sticker && (
                     <div data-testid={`assistant-sticker-${msg.id}`}>
@@ -1911,11 +2016,24 @@ export function PersonalAssistantSlotView(props: {
                               <strong>{domainText}</strong>
                               <span className="dt-mono dt-msg-receipt-branch">#{shortCode}</span>
                               <span>{ch.summary}</span>
+                              {(ch.undoNote ?? ch.decisionNote) && (
+                                <span className="dt-msg-receipt-branch" data-testid={`persistence-note-${ch.id}`}>
+                                  💬 {lang === 'zh' ? '备注：' : 'Note: '}{ch.undoNote ?? ch.decisionNote}
+                                </span>
+                              )}
                               <span className="dt-hint">· {formatSmartTimestamp(stamp, lang)}</span>
                             </div>
                             <div className="dt-msg-head-actions">
                               {ch.status === 'pending' && (
                                 <>
+                                  <Input
+                                    value={decisionNotes[ch.id] ?? ''}
+                                    onChange={e => setDecisionNotes(curr => ({ ...curr, [ch.id]: e.target.value }))}
+                                    placeholder={lang === 'zh' ? '可选：说一句原因（可留空）' : 'Optional reason'}
+                                    style={{ width: 200 }}
+                                    disabled={isActing || busy}
+                                    data-testid={`persistence-note-input-${ch.id}`}
+                                  />
                                   <Button
                                     size="sm"
                                     variant="primary"

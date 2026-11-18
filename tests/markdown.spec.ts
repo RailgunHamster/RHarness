@@ -483,11 +483,11 @@ it('executes approve / reject / undo on Assistant persistence-change receipts an
     }
     expect(beforeState.ambientConfig.residentAddresses[0]?.address).toBe('上海市徐汇区初始园区1号楼')
 
-    // Approve via button REST endpoint -> address updates, receipt status becomes `approved`
+    // Approve via button REST endpoint with an optional reason -> address updates, decisionNote saved
     const approveRes = await fetch(`${srv.url}/orchestrator/standalone/assistant/persistence-changes/pchg-1000-c9d8/approve`, {
       method: 'POST',
       headers: H,
-      body: '{}',
+      body: JSON.stringify({ note: '这才是新搬去的楼栋' }),
     })
     expect(approveRes.status).toBe(200)
     const afterApprove = (await (await fetch(`${srv.url}/orchestrator/standalone/assistant/persona-state`, { headers: H })).json()) as {
@@ -495,11 +495,11 @@ it('executes approve / reject / undo on Assistant persistence-change receipts an
     }
     expect(afterApprove.ambientConfig.residentAddresses[0]?.address).toBe('上海市徐汇区新园区2号楼')
 
-    // Undo via deterministic quick command (`撤回 c9d8`) -> reverts to original address AND keeps `undone` audit trail
+    // Undo via deterministic quick command with optional reason (`撤回 c9d8：先用旧楼栋测一天`)
     const quickUndo = await fetch(`${srv.url}/orchestrator/standalone/assistant/messages`, {
       method: 'POST',
       headers: H,
-      body: JSON.stringify({ text: '撤回 c9d8' }),
+      body: JSON.stringify({ text: '撤回 c9d8：先用旧楼栋测一天' }),
     })
     expect(quickUndo.status).toBe(200)
     const quickData = (await quickUndo.json()) as { quickCommand?: boolean }
@@ -511,11 +511,51 @@ it('executes approve / reject / undo on Assistant persistence-change receipts an
     expect(afterUndo.ambientConfig.residentAddresses[0]?.address).toBe('上海市徐汇区初始园区1号楼')
 
     const msgsRes = (await (await fetch(`${srv.url}/orchestrator/standalone/assistant/messages`, { headers: H })).json()) as {
-      messages: { id: string; replyMeta?: { persistenceChanges?: { id: string; status: string; undoneAt?: string }[] } }[]
+      messages: { id: string; bot?: boolean; text: string; replyMeta?: { persistenceChanges?: { id: string; status: string; decisionNote?: string; undoNote?: string; undoneAt?: string }[] } }[]
     }
     const origBot = msgsRes.messages.find(m => m.id === 'bot-gov-1')
     expect(origBot?.replyMeta?.persistenceChanges?.[0]?.status).toBe('undone')
+    expect(origBot?.replyMeta?.persistenceChanges?.[0]?.decisionNote).toBe('这才是新搬去的楼栋')
+    expect(origBot?.replyMeta?.persistenceChanges?.[0]?.undoNote).toBe('先用旧楼栋测一天')
     expect(origBot?.replyMeta?.persistenceChanges?.[0]?.undoneAt).toBeTruthy()
+
+    // Edit & resend: seed an earlier turn + a latest turn, verify older user msg is rejected (400) and latest user msg deletes old Q&A + appends edited question
+    await fetch(`${srv.url}/orchestrator/standalone/assistant/sync`, {
+      method: 'POST',
+      headers: H,
+      body: JSON.stringify({
+        mode: 'replace',
+        messages: [
+          { id: 'u-1', sender: 'operator', text: '第一条问题', at: '2026-11-18T03:00:00.000Z' },
+          { id: 'b-1', sender: 'claw-assistant', bot: true, text: '第一条回答', at: '2026-11-18T03:00:05.000Z' },
+          { id: 'u-2', sender: 'operator', text: '写错的第二条问题', at: '2026-11-18T03:01:00.000Z' },
+          { id: 'b-2', sender: 'claw-assistant', bot: true, text: '基于错问题的回答', at: '2026-11-18T03:01:05.000Z' },
+        ],
+      }),
+    })
+    const editOld = await fetch(`${srv.url}/orchestrator/standalone/assistant/messages/u-1/edit-resend`, {
+      method: 'POST',
+      headers: H,
+      body: JSON.stringify({ text: '试图改旧问题' }),
+    })
+    expect(editOld.status).toBe(400)
+
+    const editLatest = await fetch(`${srv.url}/orchestrator/standalone/assistant/messages/u-2/edit-resend`, {
+      method: 'POST',
+      headers: H,
+      body: JSON.stringify({ text: '改对后的第二条问题：步行怎么走？' }),
+    })
+    expect(editLatest.status).toBe(200)
+    const editData = (await editLatest.json()) as {
+      edited: boolean
+      removedIds: string[]
+      messages: { id: string; text: string; bot?: boolean }[]
+      chatBackups: { count: number }[]
+    }
+    expect(editData.edited).toBe(true)
+    expect(editData.removedIds).toEqual(['u-2', 'b-2'])
+    expect(editData.messages.map(m => m.text)).toEqual(['第一条问题', '第一条回答', '改对后的第二条问题：步行怎么走？'])
+    expect(editData.chatBackups.length).toBeGreaterThanOrEqual(1)
   } finally {
     await srv.stop()
     try { rmSync(dir, { recursive: true, force: true }) } catch {}

@@ -29,6 +29,7 @@ import {
   archiveAssistantMessagesToBackupDir,
   buildAssistantBridgeTools,
   buildAssistantSystemPrompt,
+  buildPersistenceDecisionNotesPrompt,
   collectPendingQuestions,
   formatFeishuPersistenceFooter,
   forwardAssistantMessageToEngineering,
@@ -1631,8 +1632,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   const applyPersistenceChangeAction = async (
     idOrShort: string,
     action: 'approve' | 'reject' | 'undo',
+    note?: string,
   ): Promise<{ ok: boolean; error?: string; acted?: PersistenceChangeRecord[]; replyText?: string }> => {
     if (!runtime) return { ok: false, error: 'Runtime not ready' }
+    const cleanNote = typeof note === 'string' && note.trim() ? note.trim().slice(0, 200) : undefined
     const messages = runtime.store.get(KV.assistant.messages) ?? []
     const needle = idOrShort.trim().replace(/^#/, '').toLowerCase()
     const targets: PersistenceChangeRecord[] = []
@@ -1705,6 +1708,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         }
         ch.status = 'approved'
         ch.decidedAt = nowIso
+        if (cleanNote) ch.decisionNote = cleanNote
         acted.push(ch)
       } else if (action === 'reject') {
         if (ch.mode !== 'approval' || ch.status !== 'pending') {
@@ -1712,6 +1716,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         }
         ch.status = 'rejected'
         ch.decidedAt = nowIso
+        if (cleanNote) ch.decisionNote = cleanNote
         acted.push(ch)
       } else if (action === 'undo') {
         if (ch.status !== 'applied' && ch.status !== 'approved') {
@@ -1782,6 +1787,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         }
         ch.status = 'undone'
         ch.undoneAt = nowIso
+        if (cleanNote) ch.undoNote = cleanNote
         acted.push(ch)
       }
     }
@@ -1789,12 +1795,13 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     runtime.store.set(KV.assistant.messages, messages)
     void broadcastAssistantStateToPeers('merge')
 
+    const noteSuffix = cleanNote ? `（备注：${cleanNote}）` : ''
     const summaryLines = acted.map(ch => {
       const code = persistenceChangeShortId(ch.id)
       const label = PERSISTENCE_DOMAIN_LABEL[ch.domain]
-      if (action === 'approve') return `✅ **已同意并生效** \`#${code}\` · **${label}**：${ch.summary}\n> 如需反悔，随时回复 \`撤回 ${code}\` 或在原对话气泡底点「↩ 撤回」。`
-      if (action === 'reject') return `✕ **已拒绝修改** \`#${code}\` · **${label}**：${ch.summary}（原数据未改动）`
-      return `↩ **已撤回修改** \`#${code}\` · **${label}**：${ch.summary}（已恢复到修改前状态）`
+      if (action === 'approve') return `✅ **已同意并生效** \`#${code}\` · **${label}**：${ch.summary}${noteSuffix}\n> 如需反悔，随时回复 \`撤回 ${code}\` 或在原对话气泡底点「↩ 撤回」。`
+      if (action === 'reject') return `✕ **已拒绝修改** \`#${code}\` · **${label}**：${ch.summary}${noteSuffix}（原数据未改动）`
+      return `↩ **已撤回修改** \`#${code}\` · **${label}**：${ch.summary}${noteSuffix}（已恢复到修改前状态）`
     })
     return { ok: true, acted, replyText: summaryLines.join('\n\n') }
   }
@@ -1810,7 +1817,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       hasUndoableOnLatest: latestChanges.some(c => c.status === 'applied' || c.status === 'approved'),
     })
     if (!parsed) return undefined
-    const res = await applyPersistenceChangeAction(parsed.shortId ?? '', parsed.action)
+    const res = await applyPersistenceChangeAction(parsed.shortId ?? '', parsed.action, parsed.note)
     if (!res.ok) return `⚠️ ${res.error}`
     return res.replyText
   }
@@ -1962,11 +1969,15 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       agent.ctx.systemPrompt?.section({
         name: 'rharness-assistant-persona-ambient',
         text: () => {
-          if (!isPluginEnabled('dsh-assistant-persona')) return ''
+          const decisionNotes = runtime
+            ? buildPersistenceDecisionNotesPrompt(runtime.store.get(KV.assistant.messages) ?? [])
+            : ''
+          if (!isPluginEnabled('dsh-assistant-persona')) return decisionNotes
           return [
             buildPersonaPromptSection(getPersonaConfig(), getPersonaLearnings(), activeStickers(getStickerRecords())),
             '',
             buildAmbientPromptSection(getAmbientSnapshot()),
+            ...(decisionNotes ? ['', decisionNotes] : []),
           ].join('\n')
         },
       })
@@ -2991,17 +3002,164 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           return
         }
 
-        // Approve / reject / undo a persistent data change recorded on an Assistant reply bubble
+        // Approve / reject / undo a persistent data change recorded on an Assistant reply bubble (optional `{ note }`)
         const persistenceActionMatch = /^assistant\/persistence-changes\/([^/]+)\/(approve|reject|undo)$/.exec(sub)
         if (req.method === 'POST' && persistenceActionMatch) {
           const changeId = decodeURIComponent(persistenceActionMatch[1]!).trim()
           const action = persistenceActionMatch[2] as 'approve' | 'reject' | 'undo'
-          const out = await applyPersistenceChangeAction(changeId, action)
+          const body = await readJsonBody(req, 16 * 1024).catch(() => ({} as Record<string, unknown>))
+          const note = typeof body.note === 'string' ? body.note : undefined
+          const out = await applyPersistenceChangeAction(changeId, action, note)
           if (!out.ok) {
             sendJson(res, 400, { error: out.error ?? '操作失败' })
             return
           }
           sendJson(res, 200, { ok: true, acted: out.acted ?? [], replyText: out.replyText ?? '' })
+          return
+        }
+
+        // Edit & resend ONLY the latest user message: deletes the original question + its reply(ies)
+        // (archiving to the 30-day vault, pruning session memory, and rolling back any auto-applied
+        // Tier-A changes from the discarded reply) and dispatches the edited question as a fresh turn.
+        const editResendMatch = /^assistant\/messages\/([^/]+)\/edit-resend$/.exec(sub)
+        if (req.method === 'POST' && editResendMatch) {
+          const targetId = decodeURIComponent(editResendMatch[1]!).trim()
+          const body = await readJsonBody(req, PANEL_MESSAGE_BODY_BYTES)
+          const newText = String(body.text ?? '').trim()
+          if (!newText) {
+            sendJson(res, 400, { error: '编辑后的问题不能为空' })
+            return
+          }
+          const existing = runtime.store.get(KV.assistant.messages) ?? []
+          let latestUserIdx = -1
+          for (let i = existing.length - 1; i >= 0; i--) {
+            if (!existing[i]!.bot) { latestUserIdx = i; break }
+          }
+          if (latestUserIdx < 0 || existing[latestUserIdx]!.id !== targetId) {
+            sendJson(res, 400, { error: '只能编辑最近一条你发出的消息' })
+            return
+          }
+          const oldUserMsg = existing[latestUserIdx]!
+          const discarded = existing.slice(latestUserIdx)
+          // Roll back any Tier-A (`applied`) persistence changes created by the discarded reply turn
+          for (const dm of discarded) {
+            for (const ch of dm.replyMeta?.persistenceChanges ?? []) {
+              if (ch.status === 'applied') {
+                await applyPersistenceChangeAction(ch.id, 'undo', '编辑重发原问题自动回滚')
+              }
+            }
+          }
+          archiveAssistantMessagesToBackupDir(stateDir, discarded, 'single-delete')
+          const kept = (runtime.store.get(KV.assistant.messages) ?? []).slice(0, latestUserIdx)
+          if (kept.length === 0) {
+            await host.clearSession(ASSISTANT_SESSION_ID)
+          } else {
+            const discardedIds = new Set(discarded.map(m => m.id))
+            const discardedTurns = new Set(discarded.map(m => m.replyMeta?.turn).filter((t): t is number => t !== undefined))
+            const discardedBotTexts = new Set(discarded.filter(m => m.bot && m.text.trim()).map(m => m.text.trim()))
+            host.pruneSessionEvents(ASSISTANT_SESSION_ID, ev => {
+              const d = (ev.data ?? {}) as { id?: string; turn?: number; message?: { content?: { text?: string }[] } }
+              if (ev.type === 'user/message' && d.id && discardedIds.has(d.id)) return true
+              if (d.turn !== undefined && discardedTurns.has(d.turn)) return true
+              if (ev.type === 'assistant/message') {
+                const txt = (d.message?.content ?? []).map(p => p.text ?? '').join('').trim()
+                if (txt && discardedBotTexts.has(txt)) return true
+              }
+              return false
+            })
+          }
+
+          const preservedImages = (oldUserMsg.content ?? []).filter(c => c.type === 'image')
+          const newContent = [{ type: 'text' as const, text: newText }, ...preservedImages]
+          const msgId = `asst-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+          const at = new Date().toISOString()
+          const userMsg: AssistantStoredMessage = {
+            id: msgId,
+            sender: oldUserMsg.sender,
+            text: newText,
+            content: newContent,
+            at,
+          }
+          const nextList = [...kept, userMsg]
+          runtime.store.set(KV.assistant.messages, nextList)
+          void broadcastAssistantStateToPeers('replace')
+
+          autoLearnPersonaFromUserText(newText)
+          if (isPluginEnabled('dsh-self-improving') && newText) {
+            const corr = detectUserCorrectionFromMessage(newText, ASSISTANT_SESSION_ID)
+            if (corr) {
+              const rec = recordLearningEvent(getLearnings(), corr)
+              setLearnings(rec.list)
+            }
+          }
+          if (isPluginEnabled('dsh-memory') && newText) {
+            const candidate = extractDurableMemoryFromUserMessage(newText)
+            if (candidate) {
+              const currentMems = getMemoryEntries()
+              const already = currentMems.some(
+                e =>
+                  e.title.toLowerCase() === candidate.title.toLowerCase() ||
+                  e.content.includes(candidate.content) ||
+                  candidate.content.includes(e.content),
+              )
+              if (!already) {
+                const saved = saveMemoryEntry(currentMems, { ...candidate, pinned: false, source: 'user' })
+                setMemoryEntries(saved.list)
+                recordPersistenceChange({
+                  domain: 'memory',
+                  mode: 'auto',
+                  status: 'applied',
+                  summary: `自动记住「${saved.entry.title}」：${saved.entry.content.slice(0, 60)}`,
+                  toolName: 'memory_auto_extract',
+                  patch: { domain: 'memory', op: 'add', entryId: saved.entry.id, after: saved.entry },
+                })
+              }
+            }
+          }
+
+          const sc = host.ctx.get('sessionController')
+          if (sc) {
+            await sc.create({ sessionId: ASSISTANT_SESSION_ID as never, workspaceId: process.cwd() as never })
+            await sc.rename({ sessionId: ASSISTANT_SESSION_ID as never, title: 'Claw 个人助理' })
+            const resolved = await sc.resolveAgent(ASSISTANT_SESSION_ID as never)
+            if ('agent' in resolved && resolved.agent) {
+              const agentContent: unknown[] = [{ type: 'text', text: `[message_id: ${msgId}]\n${newText}` }]
+              for (const part of newContent) {
+                if (part.type === 'image') {
+                  agentContent.push({
+                    type: 'image',
+                    path: part.image.path,
+                    mediaType: part.image.mediaType,
+                    ...(part.image.name ? { name: part.image.name } : {}),
+                  })
+                }
+              }
+              resolved.agent.followup({
+                id: msgId,
+                role: 'user',
+                content: agentContent,
+                source: { kind: 'user' },
+              } as never)
+            }
+          }
+
+          const refreshed = await Promise.all(
+            nextList.map(async m => {
+              const enriched = enrichAssistantMessage(m)
+              return {
+                ...enriched,
+                ...(enriched.content ? { content: await panelWireContent(enriched.content) } : {}),
+              }
+            }),
+          )
+          const wireContent = await panelWireContent(newContent)
+          sendJson(res, 200, {
+            edited: true,
+            removedIds: discarded.map(m => m.id),
+            message: { ...userMsg, content: wireContent },
+            messages: refreshed,
+            chatBackups: listAndPurgeAssistantChatBackups(stateDir),
+          })
           return
         }
 

@@ -249,7 +249,9 @@ export interface PersistenceChangeInfo {
   toolName: string
   createdAt: string
   decidedAt?: string
+  decisionNote?: string
   undoneAt?: string
+  undoNote?: string
 }
 export interface AssistantReplyMetaInfo {
   model: { provider: string; model: string; reasoningEffort?: string }

@@ -113,7 +113,11 @@ export interface PersistenceChangeRecord {
   toolName: string
   createdAt: string
   decidedAt?: string
+  /** Optional user-supplied reason when approving or rejecting (`同意：…` / `拒绝：…` or Web inline input). */
+  decisionNote?: string
   undoneAt?: string
+  /** Optional user-supplied reason when undoing (`撤回：…`). */
+  undoNote?: string
   patch: PersistenceChangePatch
 }
 
@@ -139,53 +143,94 @@ export function formatFeishuPersistenceFooter(changes: readonly PersistenceChang
     const label = PERSISTENCE_DOMAIN_LABEL[ch.domain]
     if (ch.status === 'pending') {
       lines.push(`🔒 **待你确认的数据修改** \`#${code}\` · **${label}**：${ch.summary}`)
-      lines.push(`> 回复 \`同意\`（或 \`同意 ${code}\`）立即生效，生效后随时可回复 \`撤回 ${code}\`；回复 \`拒绝\` 取消。`)
+      lines.push(`> 回复 \`同意\` 或 \`拒绝\`（可附原因，如 \`同意：就按这个\` / \`拒绝：楼栋不对\`，也可留空）；生效后随时可回复 \`撤回 ${code}\`。`)
     } else if (ch.status === 'applied') {
       lines.push(`⚠️ **已修改持久化数据** \`#${code}\` · **${label}**：${ch.summary}`)
-      lines.push(`> 如不合适，回复 \`撤回\`（或 \`撤回 ${code}\`）即可一键恢复。`)
+      lines.push(`> 如不合适，回复 \`撤回\`（或 \`撤回 ${code} 原因\`，原因可留空）即可一键恢复。`)
     }
   }
   return lines.join('\n')
 }
 
 /**
- * Recognises deterministic quick commands in Feishu DM or Web chat (`同意` / `拒绝` / `撤回 [#id]`)
- * so mobile/Feishu users can approve, reject, or undo persistent changes in 50ms without LLM calls.
- * Bare commands only match when the latest bot reply actually carries a matching pending/undoable change.
+ * Recognises deterministic quick commands in Feishu DM or Web chat (`同意` / `拒绝` / `撤回 [#id] [原因]`)
+ * so mobile/Feishu users can approve, reject, or undo persistent changes in 50ms without LLM calls,
+ * optionally attaching a one-line reason (or leaving it blank).
+ * Bare commands without `#id` only match when the latest bot reply carries a matching pending/undoable change.
  */
 export function parsePersistenceQuickCommand(
   rawText: string,
   opts: { hasPendingOnLatest: boolean; hasUndoableOnLatest: boolean },
-): { action: 'approve' | 'reject' | 'undo'; shortId?: string } | undefined {
-  const clean = rawText
+): { action: 'approve' | 'reject' | 'undo'; shortId?: string; note?: string } | undefined {
+  const rawClean = rawText
     .replace(/^📱\s*\[飞书私聊\]\s*/, '')
     .trim()
-    .replace(/[。！!？?.]+$/g, '')
-    .trim()
-  if (!clean || clean.length > 24) return undefined
-
-  const approveWithId = /^(?:同意|确认|允许)(?:修改)?\s+#?([a-z0-9]{4,12})$/i.exec(clean)
-    ?? /^(?:同意|确认|允许)#([a-z0-9]{4,12})$/i.exec(clean)
-  if (approveWithId) return { action: 'approve', shortId: approveWithId[1]!.toLowerCase() }
-
-  const rejectWithId = /^(?:拒绝|不同意|取消修改)\s+#?([a-z0-9]{4,12})$/i.exec(clean)
-    ?? /^(?:拒绝|不同意|取消修改)#([a-z0-9]{4,12})$/i.exec(clean)
-  if (rejectWithId) return { action: 'reject', shortId: rejectWithId[1]!.toLowerCase() }
-
-  const undoWithId = /^(?:撤回|撤销)(?:修改)?\s+#?([a-z0-9]{4,12})$/i.exec(clean)
-    ?? /^(?:撤回|撤销)(?:修改)?#([a-z0-9]{4,12})$/i.exec(clean)
-  if (undoWithId) return { action: 'undo', shortId: undoWithId[1]!.toLowerCase() }
-
-  if (opts.hasPendingOnLatest && /^(?:同意|确认|允许|同意修改|确认修改)$/.test(clean)) {
-    return { action: 'approve' }
+  if (!rawClean || rawClean.length > 200 || rawClean.includes('\n')) return undefined
+  const clean = rawClean.replace(/[。！!？?.]+$/g, '').trim()
+  if (!clean) return undefined
+  const trimNote = (s: string | undefined): string | undefined => {
+    const n = (s ?? '').replace(/^[:：,，—\-]\s*/, '').trim()
+    return n ? n.slice(0, 160) : undefined
   }
-  if (opts.hasPendingOnLatest && /^(?:拒绝|不同意|拒绝修改|取消修改)$/.test(clean)) {
-    return { action: 'reject' }
+
+  // 1. Commands with an explicit `#code` (or 4-char alphanumeric shortId after space) + optional reason
+  const withIdPatterns: { action: 'approve' | 'reject' | 'undo'; re: RegExp }[] = [
+    { action: 'approve', re: /^(?:同意|确认|允许)(?:修改)?(?:\s+#([a-z0-9-]{4,32})|#([a-z0-9-]{4,32})|\s+([a-z0-9]{4}))(?=$|[\s:：,，—\-])(.*)$/i },
+    { action: 'reject', re: /^(?:拒绝|不同意|取消修改)(?:\s+#([a-z0-9-]{4,32})|#([a-z0-9-]{4,32})|\s+([a-z0-9]{4}))(?=$|[\s:：,，—\-])(.*)$/i },
+    { action: 'undo', re: /^(?:撤回|撤销)(?:修改)?(?:\s+#([a-z0-9-]{4,32})|#([a-z0-9-]{4,32})|\s+([a-z0-9]{4}))(?=$|[\s:：,，—\-])(.*)$/i },
+  ]
+  for (const { action, re } of withIdPatterns) {
+    const m = re.exec(rawClean)
+    if (m) {
+      const shortId = (m[1] ?? m[2] ?? m[3] ?? '').toLowerCase()
+      const note = trimNote(m[4])
+      return { action, shortId, ...(note ? { note } : {}) }
+    }
   }
-  if (opts.hasUndoableOnLatest && /^(?:撤回|撤销|撤回修改|撤销修改)$/.test(clean)) {
-    return { action: 'undo' }
+
+  // 2. Bare commands (or bare + `：` / space + reason) targeting the latest bot reply
+  if (opts.hasPendingOnLatest) {
+    if (/^(?:同意|确认|允许|同意修改|确认修改)$/.test(clean)) return { action: 'approve' }
+    const mApproveNote = /^(?:同意|确认|允许|同意修改|确认修改)(?:\s*[:：,，—\-]\s*|\s+)(.+)$/.exec(rawClean)
+    if (mApproveNote) {
+      const note = trimNote(mApproveNote[1])
+      return { action: 'approve', ...(note ? { note } : {}) }
+    }
+    if (/^(?:拒绝|不同意|拒绝修改|取消修改)$/.test(clean)) return { action: 'reject' }
+    const mRejectNote = /^(?:拒绝|不同意|拒绝修改|取消修改)(?:\s*[:：,，—\-]\s*|\s+)(.+)$/.exec(rawClean)
+    if (mRejectNote) {
+      const note = trimNote(mRejectNote[1])
+      return { action: 'reject', ...(note ? { note } : {}) }
+    }
+  }
+  if (opts.hasUndoableOnLatest) {
+    if (/^(?:撤回|撤销|撤回修改|撤销修改)$/.test(clean)) return { action: 'undo' }
+    const mUndoNote = /^(?:撤回|撤销|撤回修改|撤销修改)(?:\s*[:：,，—\-]\s*|\s+)(.+)$/.exec(rawClean)
+    if (mUndoNote) {
+      const note = trimNote(mUndoNote[1])
+      return { action: 'undo', ...(note ? { note } : {}) }
+    }
   }
   return undefined
+}
+
+/** Summarises recent user approval/rejection/undo notes so the Assistant respects why a change was rejected or adjusted. */
+export function buildPersistenceDecisionNotesPrompt(messages: readonly AssistantStoredMessage[]): string {
+  const recent: string[] = []
+  for (let i = messages.length - 1; i >= 0 && recent.length < 5; i--) {
+    const changes = messages[i]!.replyMeta?.persistenceChanges
+    if (!changes?.length) continue
+    for (const ch of changes) {
+      const note = ch.undoNote ?? ch.decisionNote
+      if (!note && ch.status !== 'rejected') continue
+      const label = PERSISTENCE_DOMAIN_LABEL[ch.domain]
+      const statusWord = ch.status === 'approved' ? '已同意' : ch.status === 'rejected' ? '已拒绝' : ch.status === 'undone' ? '已撤回' : ch.status
+      recent.push(`- [${statusWord}] ${label}（${ch.summary}）${note ? ` — 用户备注：「${note}」` : ''}`)
+      if (recent.length >= 5) break
+    }
+  }
+  if (recent.length === 0) return ''
+  return ['## Recent User Persistence Decisions & Notes (respect these reasons)', ...recent].join('\n')
 }
 
 export interface AssistantReplyMeta {
