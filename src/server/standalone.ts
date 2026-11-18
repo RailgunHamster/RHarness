@@ -703,7 +703,11 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     if (!sticker) return { text: parsed.cleanText }
     const cfg = getPersonaConfig()
     const recentBotFlags = (runtime.store.get(KV.assistant.messages) ?? []).filter(m => m.bot).slice(-6).map(m => Boolean(m.sticker))
-    if (!stickerAllowedByPolicy(cfg, recentBotFlags)) return { text: parsed.cleanText }
+    // Cooldown/frequency curbs casual-chat spam, but must not eat a sticker the user explicitly asked for
+    // ("再来一张" right after a previous sticker should still send).
+    const lastUserText = [...(runtime.store.get(KV.assistant.messages) ?? [])].reverse().find(m => !m.bot)?.text ?? ''
+    const explicitUserRequest = /(表情|贴纸|sticker|再来一?[张个]|来一?[张个]|发一?[张个]|丢一?[张个])/i.test(lastUserText)
+    if (!explicitUserRequest && !stickerAllowedByPolicy(cfg, recentBotFlags)) return { text: parsed.cleanText }
     const used: StickerRecord = { ...sticker, useCount: sticker.useCount + 1, lastUsedAt: new Date().toISOString() }
     setStickerRecords(records.map(r => (r.id === used.id ? used : r)))
     return { text: parsed.cleanText, sticker: used }
