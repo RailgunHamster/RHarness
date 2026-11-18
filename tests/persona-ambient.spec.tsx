@@ -54,6 +54,7 @@ import {
   type StickerRecord,
 } from '../src/app/assistant-persona-and-ambient.ts'
 import { PersonaAmbientWorkbench, PersonalAssistantSlotView } from '../src/client/ui-slots.tsx'
+import { DATA_CENTER_TAG, createDeviceGroup, ensureDeviceIdentity, isDataCenterNode, retagOwnClaims, verifyAndExtractGroupMembers, verifySignedClaim } from '../src/app/device-group.ts'
 
 declare global { var IS_REACT_ACT_ENVIRONMENT: boolean }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -270,6 +271,21 @@ describe('ambient awareness', () => {
     const section = buildAmbientPromptSection(snapshot)
     expect(section).toContain('上海市徐汇区梅陇十一村46号401')
     expect(section).toContain('主要')
+  })
+
+  it('identifies the data-center node by its dedicated tag only (never by name or role tags)', () => {
+    expect(DATA_CENTER_TAG).toBe('数据中心')
+    expect(isDataCenterNode(['eval-hub', 'always-on', '数据中心'])).toBe(true)
+    expect(isDataCenterNode(['eval-hub', 'always-on'])).toBe(false)
+    expect(isDataCenterNode(['worker', 'workstation', 'windows'])).toBe(false)
+    expect(isDataCenterNode([])).toBe(false)
+    // Retagging re-signs the node's own claims so peers verify & adopt the new tags.
+    const identity = ensureDeviceIdentity(undefined, 0)
+    const packet = createDeviceGroup(identity, '测试设备组')
+    expect(verifyAndExtractGroupMembers(packet).some(m => m.tags.includes(DATA_CENTER_TAG))).toBe(false)
+    const retagged = retagOwnClaims(packet, identity, [...identity.tags, DATA_CENTER_TAG])
+    expect(verifySignedClaim(retagged.root).tags).toContain(DATA_CENTER_TAG)
+    expect(verifyAndExtractGroupMembers(retagged).every(m => m.tags.includes(DATA_CENTER_TAG))).toBe(true)
   })
 
   it('syncs resident addresses & learnings across nodes: union by id, newer wins, deletions stay deleted', () => {

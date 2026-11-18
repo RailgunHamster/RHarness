@@ -44,8 +44,11 @@ import {
   createDeviceGroup,
   createGroupInvitation,
   createJoinRequest,
+  DATA_CENTER_TAG,
   ensureDeviceIdentity,
   groupMembersToWorkerNodes,
+  isDataCenterNode,
+  retagOwnClaims,
   parseInvitationUri,
   redeemGroupInvitation,
   verifyAndExtractGroupMembers,
@@ -592,14 +595,14 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   const setPersonaConfig = (next: AssistantPersonaConfig, opts?: { sync?: boolean }): void => {
     if (!runtime) return
     runtime.store.set(KV.persona.config, normalizeAssistantPersonaConfig(next))
-    if (opts?.sync !== false) void broadcastPersonaAmbientStateToPeers()
+    if (opts?.sync !== false) syncPersonaAfterMutation()
   }
   const getPersonaLearnings = (): PersonaLearningEntry[] => (runtime ? (runtime.store.get(KV.persona.learnings) ?? []) : [])
   const setPersonaLearnings = (next: PersonaLearningEntry[], opts?: { sync?: boolean; removedIds?: string[] }): void => {
     if (!runtime) return
     const removedIds = opts?.removedIds ?? getPersonaLearnings().filter(e => !next.some(n => n.id === e.id)).map(e => e.id)
     runtime.store.set(KV.persona.learnings, next)
-    if (opts?.sync !== false) void broadcastPersonaAmbientStateToPeers({ removedLearningIds: removedIds })
+    if (opts?.sync !== false) syncPersonaAfterMutation({ removedLearningIds: removedIds })
   }
   const setStickerRecords = (next: StickerRecord[]): void => { if (runtime) runtime.store.set(KV.persona.stickers, next) }
   // Reading stickers lazily purges trash entries past the 1-day retention (files deleted, change persisted).
@@ -619,7 +622,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     const removedIds = opts?.removedIds
       ?? getAmbientConfig().residentAddresses.filter(a => !normalized.residentAddresses.some(n => n.id === a.id)).map(a => a.id)
     runtime.store.set(KV.ambient.config, normalized)
-    if (opts?.sync !== false) void broadcastPersonaAmbientStateToPeers({ removedAddressIds: removedIds })
+    if (opts?.sync !== false) syncPersonaAfterMutation({ removedAddressIds: removedIds })
   }
   /** Amap key: env `RHARNESS_AMAP_KEY` wins; otherwise the UI-stored key. Never sent back to clients. */
   const getAmapApiKey = (): string | undefined => {
@@ -692,46 +695,131 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   }
 
   /**
-   * Persona/ambient state (resident addresses, persona config, learnings, stored Amap key)
-   * follows the user across nodes like memories/chat do — it must never be trapped on
-   * whichever node happened to serve the page. Sticker image files stay node-local for now.
+   * Persona/ambient state (resident addresses, persona config, learnings, stored Amap key) has ONE
+   * authoritative home: the node tagged `数据中心` (data center). Other nodes keep a
+   * local cache — mutations push up to the data center, it broadcasts applied changes to every
+   * cache, and a periodic pull reconciles anything edited while it was unreachable (offline
+   * edits merge by id / newer `updatedAt`; deletions ride along as tombstones until acked).
+   * With no data-center node in the group a node simply stays standalone-local. Sticker files remain node-local.
    */
-  const broadcastPersonaAmbientStateToPeers = async (opts?: {
+  const isLocalDataCenter = (): boolean => {
+    if (!runtime) return false
+    return isDataCenterNode(getDeviceIdentity().tags)
+  }
+  const findDataCenterPeer = () => getRegisteredNodes()
+    .filter(n => n.id !== 'local' && n.status === 'online' && n.url !== 'local')
+    .find(n => isDataCenterNode(n.tags))
+  const getPersonaSyncMeta = (): { dirty?: boolean; removedAddressIds?: string[]; removedLearningIds?: string[]; lastDataCenterSyncAt?: string } =>
+    (runtime?.store.get(KV.persona.syncMeta) ?? {})
+  const setPersonaSyncMeta = (patch: Partial<ReturnType<typeof getPersonaSyncMeta>>): void => {
+    if (runtime) runtime.store.set(KV.persona.syncMeta, { ...getPersonaSyncMeta(), ...patch })
+  }
+  type PersonaSyncOpts = {
     removedAddressIds?: string[]
     removedLearningIds?: string[]
     /** Explicit Amap-key override ('' clears peers); defaults to the stored key when one exists. */
     amapApiKey?: string
-  }): Promise<void> => {
+  }
+  const personaStatePayload = (opts?: PersonaSyncOpts): Record<string, unknown> => {
+    const storedAmapKey = runtime?.store.get(KV.ambient.amap)?.apiKey?.trim()
+    return {
+      personaConfig: getPersonaConfig(),
+      learnings: getPersonaLearnings(),
+      ambientConfig: getAmbientConfig(),
+      ...(opts?.removedAddressIds?.length ? { removedAddressIds: opts.removedAddressIds } : {}),
+      ...(opts?.removedLearningIds?.length ? { removedLearningIds: opts.removedLearningIds } : {}),
+      ...(storedAmapKey ? { amapApiKey: storedAmapKey } : {}),
+      ...(opts?.amapApiKey !== undefined ? { amapApiKey: opts.amapApiKey } : {}),
+    }
+  }
+  const postPersonaStateToNode = async (node: { endpoints?: string[]; url: string }, opts?: PersonaSyncOpts): Promise<boolean> => {
+    const endpoints = [...new Set([...(node.endpoints ?? []), node.url])].filter(Boolean)
+    for (const ep of endpoints) {
+      try {
+        const res = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/assistant/persona-sync`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-orchestrator-request': '1' },
+          body: JSON.stringify(personaStatePayload(opts)),
+          signal: AbortSignal.timeout(4000),
+        })
+        if (res.ok) return true
+      } catch {}
+    }
+    return false
+  }
+  /** Data center → every peer cache. */
+  const broadcastPersonaAmbientStateToPeers = async (opts?: PersonaSyncOpts): Promise<void> => {
     if (!runtime) return
-    const storedAmapKey = runtime.store.get(KV.ambient.amap)?.apiKey?.trim()
     const peers = getRegisteredNodes().filter(n => n.id !== 'local' && n.status === 'online' && n.url !== 'local')
-    await Promise.allSettled(
-      peers.map(async peer => {
-        const endpoints = [...new Set([...(peer.endpoints ?? []), peer.url])].filter(Boolean)
-        for (const ep of endpoints) {
-          try {
-            const res = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/assistant/persona-sync`, {
-              method: 'POST',
-              headers: {
-                'content-type': 'application/json',
-                'x-orchestrator-request': '1',
-              },
-              body: JSON.stringify({
-                personaConfig: getPersonaConfig(),
-                learnings: getPersonaLearnings(),
-                ambientConfig: getAmbientConfig(),
-                ...(opts?.removedAddressIds?.length ? { removedAddressIds: opts.removedAddressIds } : {}),
-                ...(opts?.removedLearningIds?.length ? { removedLearningIds: opts.removedLearningIds } : {}),
-                ...(storedAmapKey ? { amapApiKey: storedAmapKey } : {}),
-                ...(opts?.amapApiKey !== undefined ? { amapApiKey: opts.amapApiKey } : {}),
-              }),
-              signal: AbortSignal.timeout(4000),
-            })
-            if (res.ok) break
-          } catch {}
-        }
-      }),
-    )
+    await Promise.allSettled(peers.map(peer => postPersonaStateToNode(peer, opts)))
+  }
+  /** Non-data-center → data-center push. Failures (or no data center yet) keep the change dirty + tombstones pending. */
+  const pushPersonaStateToDataCenter = async (opts?: PersonaSyncOpts): Promise<void> => {
+    try {
+      if (!runtime || isLocalDataCenter()) return
+      const meta = getPersonaSyncMeta()
+      const removedAddressIds = [...new Set([...(meta.removedAddressIds ?? []), ...(opts?.removedAddressIds ?? [])])]
+      const removedLearningIds = [...new Set([...(meta.removedLearningIds ?? []), ...(opts?.removedLearningIds ?? [])])]
+      const hub = findDataCenterPeer()
+      if (!hub) {
+        setPersonaSyncMeta({ dirty: true, removedAddressIds, removedLearningIds })
+        return
+      }
+      const ok = await postPersonaStateToNode(hub, { ...opts, removedAddressIds, removedLearningIds })
+      setPersonaSyncMeta(ok
+        ? { dirty: false, removedAddressIds: [], removedLearningIds: [], lastDataCenterSyncAt: new Date().toISOString() }
+        : { dirty: true, removedAddressIds, removedLearningIds })
+    } catch { /* store may already be closed during shutdown/tests */ }
+  }
+  /** Every persona/ambient mutation funnels through here: the data center broadcasts, others push up. */
+  const syncPersonaAfterMutation = (opts?: PersonaSyncOpts): void => {
+    if (!runtime) return
+    if (isLocalDataCenter()) void broadcastPersonaAmbientStateToPeers(opts)
+    else void pushPersonaStateToDataCenter(opts)
+  }
+  /**
+   * Non-data-center reconciliation: adopt the data center's authoritative state; if local offline
+   * edits are pending (`dirty`), merge them over its state (local scalars win, entries unioned,
+   * tombstones honoured) and push the merged result back up as the new truth.
+   */
+  const pullPersonaStateFromDataCenter = async (): Promise<void> => {
+    try {
+      if (!runtime || isLocalDataCenter()) return
+      const hub = findDataCenterPeer()
+      if (!hub) return
+      const endpoints = [...new Set([...(hub.endpoints ?? []), hub.url])].filter(Boolean)
+      let remote: Record<string, unknown> | undefined
+      for (const ep of endpoints) {
+        try {
+          const res = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/assistant/persona-sync`, {
+            headers: { 'x-orchestrator-request': '1' },
+            signal: AbortSignal.timeout(4000),
+          })
+          if (res.ok) { remote = (await res.json()) as Record<string, unknown>; break }
+        } catch {}
+      }
+      if (!remote) return
+      const remoteAmbient = normalizeAssistantAmbientConfig(remote.ambientConfig ?? defaultAssistantAmbientConfig())
+      const remoteLearnings = Array.isArray(remote.learnings) ? (remote.learnings as PersonaLearningEntry[]) : []
+      const meta = getPersonaSyncMeta()
+      if (meta.dirty) {
+        setAmbientConfig(mergeAmbientConfigForSync(remoteAmbient, getAmbientConfig(), meta.removedAddressIds ?? []), { sync: false })
+        runtime.store.set(KV.persona.learnings, mergePersonaLearningsForSync(remoteLearnings, getPersonaLearnings(), meta.removedLearningIds ?? []))
+        await pushPersonaStateToDataCenter()
+        void refreshAmbientCachesInBackground()
+        return
+      }
+      if (remote.personaConfig && typeof remote.personaConfig === 'object') {
+        setPersonaConfig(remote.personaConfig as AssistantPersonaConfig, { sync: false })
+      }
+      runtime.store.set(KV.persona.learnings, mergePersonaLearningsForSync(getPersonaLearnings(), remoteLearnings))
+      setAmbientConfig(mergeAmbientConfigForSync(getAmbientConfig(), remoteAmbient), { sync: false })
+      if (typeof remote.amapApiKey === 'string' && remote.amapApiKey.trim()) {
+        runtime.store.set(KV.ambient.amap, { apiKey: remote.amapApiKey.trim() })
+      }
+      setPersonaSyncMeta({ lastDataCenterSyncAt: new Date().toISOString() })
+      void refreshAmbientCachesInBackground()
+    } catch { /* store may already be closed during shutdown/tests */ }
   }
 
   const broadcastMemoriesStateToPeers = async (mode: 'merge' | 'replace' = 'merge'): Promise<void> => {
@@ -1860,7 +1948,12 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   runtime = new Runtime(host.ctx, machine, () => { void restartRuntime() })
   // Warm ambient caches shortly after boot, then keep weather/news fresh in the background
   setTimeout(() => { void refreshAmbientCachesInBackground() }, 3000)
-  const ambientRefreshTimer = setInterval(() => { void refreshAmbientCachesInBackground() }, 15 * 60 * 1000)
+  // Non-hub nodes reconcile persona/ambient state with the hub (boot + periodic pull).
+  setTimeout(() => { void pullPersonaStateFromDataCenter() }, 6000)
+  const ambientRefreshTimer = setInterval(() => {
+    void refreshAmbientCachesInBackground()
+    void pullPersonaStateFromDataCenter()
+  }, 15 * 60 * 1000)
   ambientRefreshTimer.unref?.()
 
   const runEphemeralBtwSideQuestion = async (question: string): Promise<string> => {
@@ -2442,7 +2535,23 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           if (typeof body.amapApiKey === 'string') {
             runtime.store.set(KV.ambient.amap, { apiKey: body.amapApiKey.trim() })
           }
+          // The data center is the single source of truth: whatever it just accepted is fanned
+          // out to every other node's cache so all devices converge on the same state (deletion
+          // tombstones are forwarded, or merged caches would resurrect the deleted entries).
+          if (isLocalDataCenter()) {
+            void broadcastPersonaAmbientStateToPeers({
+              ...(removedAddressIds.length ? { removedAddressIds } : {}),
+              ...(removedLearningIds.length ? { removedLearningIds } : {}),
+              ...(typeof body.amapApiKey === 'string' ? { amapApiKey: body.amapApiKey.trim() } : {}),
+            })
+          }
           sendJson(res, 200, { ok: true })
+          return
+        }
+
+        // Data-center read side of persona-sync: other nodes pull the authoritative state to reconcile.
+        if (req.method === 'GET' && sub === 'assistant/persona-sync') {
+          sendJson(res, 200, personaStatePayload())
           return
         }
 
@@ -2792,6 +2901,12 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             ambientConfig: getAmbientConfig(),
             ambient: getAmbientSnapshot(),
             news: getNewsBriefPayload(),
+            sync: {
+              dataCenter: isLocalDataCenter(),
+              ...(isLocalDataCenter() ? {} : { dataCenterName: findDataCenterPeer()?.name ?? null }),
+              dirty: Boolean(getPersonaSyncMeta().dirty),
+              ...(getPersonaSyncMeta().lastDataCenterSyncAt ? { lastDataCenterSyncAt: getPersonaSyncMeta().lastDataCenterSyncAt } : {}),
+            },
           })
           const getNewsBriefPayload = () => {
             const cache = getNewsCache()
@@ -2989,7 +3104,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           if ((req.method === 'PUT' || req.method === 'DELETE') && sub === 'assistant/ambient/amap-key') {
             if (req.method === 'DELETE') {
               if (runtime) runtime.store.set(KV.ambient.amap, { apiKey: '' })
-              void broadcastPersonaAmbientStateToPeers({ amapApiKey: '' })
+              syncPersonaAfterMutation({ amapApiKey: '' })
               sendJson(res, 200, { amapConfigured: Boolean(process.env.RHARNESS_AMAP_KEY?.trim()) })
               return
             }
@@ -2997,7 +3112,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
             if (!apiKey) { sendJson(res, 400, { error: 'apiKey is required' }); return }
             if (runtime) runtime.store.set(KV.ambient.amap, { apiKey })
-            void broadcastPersonaAmbientStateToPeers()
+            syncPersonaAfterMutation()
             sendJson(res, 200, { amapConfigured: true })
             return
           }
@@ -4421,6 +4536,45 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           const packet = createDeviceGroup(identity, groupName)
           runtime.store.set(KV.deviceGroup.packet, packet)
           sendJson(res, 200, { packet, members: verifyAndExtractGroupMembers(packet), nodes: getRegisteredNodes() })
+          return
+        }
+
+        // Retag this node in place: update identity tags, re-sign own group claims, broadcast
+        // the refreshed packet. `数据中心` is exclusive — refuse a second data center while
+        // another member still carries the tag (remove it there first, then add it here).
+        if (req.method === 'POST' && sub === 'device-group/retag') {
+          const body = await readJsonBody(req, 1024 * 1024)
+          const identity = getDeviceIdentity()
+          let tags: string[]
+          if (Array.isArray(body.tags)) {
+            tags = body.tags.map(t => String(t).trim()).filter(Boolean)
+          } else {
+            const add = Array.isArray(body.addTags) ? body.addTags.map(t => String(t).trim()).filter(Boolean) : []
+            const remove = new Set(Array.isArray(body.removeTags) ? body.removeTags.map(t => String(t).trim()) : [])
+            tags = [...identity.tags.filter(t => !remove.has(t)), ...add]
+          }
+          tags = [...new Set(tags)]
+          if (tags.includes(DATA_CENTER_TAG) && !identity.tags.includes(DATA_CENTER_TAG)) {
+            const packet0 = runtime.store.get(KV.deviceGroup.packet)
+            const holder = packet0
+              ? verifyAndExtractGroupMembers(packet0).find(m => m.deviceId !== identity.deviceId && m.tags.includes(DATA_CENTER_TAG))
+              : undefined
+            if (holder) {
+              sendJson(res, 409, { error: `「${holder.deviceName}」已经是数据中心了；先在那台上移除「${DATA_CENTER_TAG}」标签，再给本机添加。` })
+              return
+            }
+          }
+          identity.tags = tags
+          runtime.store.set(KV.deviceGroup.identity, identity)
+          let packet = runtime.store.get(KV.deviceGroup.packet)
+          if (packet) {
+            packet = retagOwnClaims(packet, identity, tags)
+            runtime.store.set(KV.deviceGroup.packet, packet)
+            const updatedNodes = groupMembersToWorkerNodes(identity.deviceId, packet, runtime.store.get(KV.nodes.registry) ?? [])
+            runtime.store.set(KV.nodes.registry, updatedNodes)
+            void broadcastGroupPacketToPeers(identity.deviceId, packet)
+          }
+          sendJson(res, 200, { tags, nodes: getRegisteredNodes() })
           return
         }
 

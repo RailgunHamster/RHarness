@@ -284,6 +284,33 @@ export function detectLocalEndpoints(port: number): string[] {
 }
 
 /**
+ * The node tagged `数据中心` (data center) is the single authoritative home for
+ * user-centric data (persona/ambient state). Membership is decided ONLY by this
+ * dedicated identity tag — never by machine names or by other role tags — and the
+ * same rule is used by peers to find the data center and by the node itself.
+ */
+export const DATA_CENTER_TAG = '数据中心'
+
+export function isDataCenterNode(tags: readonly string[] = []): boolean {
+  return tags.includes(DATA_CENTER_TAG)
+}
+
+/**
+ * Re-issue this node's own group claims with new tags (claims are issuer-signed, so only
+ * self-issued claims — deviceId matches AND issuer is itself — can be re-signed locally;
+ * anyone else's claims pass through untouched). The caller persists + broadcasts the packet.
+ */
+export function retagOwnClaims(packet: DeviceGroupPacket, identity: DeviceIdentityRecord, tags: string[]): DeviceGroupPacket {
+  const retag = (signed: SignedGroupClaim): SignedGroupClaim => {
+    let claim: GroupClaim
+    try { claim = verifySignedClaim(signed) } catch { return signed }
+    if (claim.deviceId !== identity.deviceId || claim.issuerPublicKeyB64 !== identity.publicKeyB64) return signed
+    return signClaim({ ...claim, tags, issuedAt: new Date().toISOString() }, identity.privateKeyPem)
+  }
+  return { ...packet, root: retag(packet.root), members: packet.members.map(retag), updatedAt: new Date().toISOString() }
+}
+
+/**
  * Builds the complete ordered list of candidate `http://<address>:<port>` URLs for any node,
  * combining its stored `endpoints`, `lanIps`, `hostname`, `tailscaleDnsName`, `tailscaleIps`,
  * and any live Tailscale peer discovery matching its hostname or DNS name.
