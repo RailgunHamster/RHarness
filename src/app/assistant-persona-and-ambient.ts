@@ -464,7 +464,9 @@ export function buildPersonaPromptSection(
   }
   if (config.stickerFrequency !== 'off' && stickers.length > 0) {
     const catalog = stickers.slice(0, 30).map(s => `${s.name}{${[...s.tags, ...(s.emotion ? [s.emotion] : [])].join('/') || '日常'}}`).join('、')
-    lines.push(`- 表情包：闲聊氛围合适时，可在回复末尾单独追加一个标记 \`[sticker:表情名或标签]\`，系统会把它渲染成真实表情图片并执行频率冷却；严肃话题、报错、工程汇报时不要发表情包。当前图库：${catalog}`)
+    lines.push(
+      `- 表情包：闲聊氛围合适时，在回复正文之后另起一行、原样输出标记 \`[sticker:表情名或ID]\`（例如 \`[sticker:摸刺猬]\`），系统会把它渲染成真实表情图片并执行频率冷却。标记必须独占一行、放在回复最末尾、不要包进代码块或 JSON。严格禁止把 sticker_list 等工具的 JSON 输出粘贴进回复正文——那只是给你自己看的查询结果，用户看到的是渲染后的图片。严肃话题、报错、工程汇报时不要发表情包。当前图库（共 ${stickers.length} 张，前 30 张）：${catalog}`,
+    )
   } else if (config.stickerFrequency !== 'off') {
     lines.push('- 表情包：图库目前为空，不要编造 `[sticker:...]` 标记；用户上传后即可使用。')
   }

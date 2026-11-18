@@ -86,12 +86,14 @@ describe('persona config & prompt', () => {
     const saved = saveStickerFromBuffer([], { data: PNG_BYTES, name: '摸鱼', tags: ['开心'] })
     const section = buildPersonaPromptSection(defaultAssistantPersonaConfig(), [], saved.list)
     expect(section).toContain('禁止 AI 腔黑名单')
-    expect(section).toContain('[sticker:表情名或标签]')
+    expect(section).toContain('[sticker:表情名或ID]')
+    expect(section).toContain('严格禁止把 sticker_list 等工具的 JSON 输出粘贴进回复正文')
+    expect(section).toContain('共 1 张')
     expect(section).toContain('摸鱼{开心}')
     expect(section).toContain('(｡•̀ᴗ-)')
     const off = buildPersonaPromptSection({ ...defaultAssistantPersonaConfig(), kaomojiDensity: 'off', stickerFrequency: 'off' }, [], saved.list)
     expect(off).toContain('颜文字：关闭')
-    expect(off).not.toContain('[sticker:表情名或标签]')
+    expect(off).not.toContain('[sticker:表情名或ID]')
   })
 
   it('only injects enabled learnings into the prompt summary within budget', () => {
