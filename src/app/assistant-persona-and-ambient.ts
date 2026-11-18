@@ -626,6 +626,70 @@ export function setPrimaryResidentAddress(config: AssistantAmbientConfig, id: st
   })
 }
 
+// ============================================================================
+// Cross-node sync (resident addresses / learnings follow the user, not a node)
+// ============================================================================
+
+/**
+ * Merge two resident-address lists for cross-node sync: union by `id`, the entry with the
+ * newer `updatedAt` wins, and `removedIds` (deleted on the sender) are dropped so deletions
+ * propagate instead of resurrecting. Ordering keeps the local order, then appends new
+ * incoming entries; the primary flag survives on the newest primary (normalization
+ * afterwards guarantees exactly one primary).
+ */
+export function mergeResidentAddressesForSync(
+  local: readonly ResidentAddress[],
+  incoming: readonly ResidentAddress[],
+  removedIds: readonly string[] = [],
+): ResidentAddress[] {
+  const removed = new Set(removedIds)
+  const byId = new Map<string, ResidentAddress>()
+  for (const a of local) if (!removed.has(a.id)) byId.set(a.id, a)
+  for (const a of incoming) {
+    if (removed.has(a.id)) continue
+    const prev = byId.get(a.id)
+    if (!prev || a.updatedAt >= prev.updatedAt) byId.set(a.id, a)
+  }
+  let merged = [...byId.values()]
+  const primaries = merged.filter(a => a.isPrimary)
+  if (primaries.length > 1) {
+    const winner = primaries.reduce((best, a) => (a.updatedAt > best.updatedAt ? a : best))
+    merged = merged.map(a => (a.isPrimary === (a.id === winner.id) ? a : { ...a, isPrimary: a.id === winner.id }))
+  }
+  return merged.slice(0, MAX_RESIDENT_ADDRESSES)
+}
+
+/** Merge a synced ambient config into the local one (addresses unioned, scalars last-writer-wins). */
+export function mergeAmbientConfigForSync(
+  local: AssistantAmbientConfig,
+  incoming: AssistantAmbientConfig,
+  removedAddressIds: readonly string[] = [],
+): AssistantAmbientConfig {
+  return normalizeAssistantAmbientConfig({
+    ...incoming,
+    residentAddresses: mergeResidentAddressesForSync(local.residentAddresses, incoming.residentAddresses, removedAddressIds),
+  })
+}
+
+/** Merge synced persona learnings: union by `id` (newer `updatedAt` wins), deletions via `removedIds`. */
+export function mergePersonaLearningsForSync(
+  local: readonly PersonaLearningEntry[],
+  incoming: readonly PersonaLearningEntry[],
+  removedIds: readonly string[] = [],
+): PersonaLearningEntry[] {
+  const removed = new Set(removedIds)
+  const byId = new Map<string, PersonaLearningEntry>()
+  for (const e of local) if (!removed.has(e.id)) byId.set(e.id, e)
+  for (const e of incoming) {
+    if (removed.has(e.id)) continue
+    const prev = byId.get(e.id)
+    if (!prev || e.updatedAt >= prev.updatedAt) byId.set(e.id, e)
+  }
+  return [...byId.values()]
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .slice(-PERSONA_LEARNING_MAX_ENTRIES)
+}
+
 export interface WeatherCache {
   cityName: string
   fetchedAt: string

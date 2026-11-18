@@ -128,6 +128,8 @@ import {
   geocodeCity,
   isNewsCacheFresh,
   isWeatherCacheFresh,
+  mergeAmbientConfigForSync,
+  mergePersonaLearningsForSync,
   normalizeAssistantAmbientConfig,
   normalizeAssistantPersonaConfig,
   parseStickerMarker,
@@ -587,12 +589,18 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     if (!runtime) return defaultAssistantPersonaConfig()
     return normalizeAssistantPersonaConfig(runtime.store.get(KV.persona.config) ?? defaultAssistantPersonaConfig())
   }
-  const setPersonaConfig = (next: AssistantPersonaConfig): void => {
+  const setPersonaConfig = (next: AssistantPersonaConfig, opts?: { sync?: boolean }): void => {
     if (!runtime) return
     runtime.store.set(KV.persona.config, normalizeAssistantPersonaConfig(next))
+    if (opts?.sync !== false) void broadcastPersonaAmbientStateToPeers()
   }
   const getPersonaLearnings = (): PersonaLearningEntry[] => (runtime ? (runtime.store.get(KV.persona.learnings) ?? []) : [])
-  const setPersonaLearnings = (next: PersonaLearningEntry[]): void => { if (runtime) runtime.store.set(KV.persona.learnings, next) }
+  const setPersonaLearnings = (next: PersonaLearningEntry[], opts?: { sync?: boolean; removedIds?: string[] }): void => {
+    if (!runtime) return
+    const removedIds = opts?.removedIds ?? getPersonaLearnings().filter(e => !next.some(n => n.id === e.id)).map(e => e.id)
+    runtime.store.set(KV.persona.learnings, next)
+    if (opts?.sync !== false) void broadcastPersonaAmbientStateToPeers({ removedLearningIds: removedIds })
+  }
   const setStickerRecords = (next: StickerRecord[]): void => { if (runtime) runtime.store.set(KV.persona.stickers, next) }
   // Reading stickers lazily purges trash entries past the 1-day retention (files deleted, change persisted).
   const getStickerRecords = (): StickerRecord[] => {
@@ -605,9 +613,13 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     if (!runtime) return defaultAssistantAmbientConfig()
     return normalizeAssistantAmbientConfig(runtime.store.get(KV.ambient.config) ?? defaultAssistantAmbientConfig())
   }
-  const setAmbientConfig = (next: AssistantAmbientConfig): void => {
+  const setAmbientConfig = (next: AssistantAmbientConfig, opts?: { sync?: boolean; removedIds?: string[] }): void => {
     if (!runtime) return
-    runtime.store.set(KV.ambient.config, normalizeAssistantAmbientConfig(next))
+    const normalized = normalizeAssistantAmbientConfig(next)
+    const removedIds = opts?.removedIds
+      ?? getAmbientConfig().residentAddresses.filter(a => !normalized.residentAddresses.some(n => n.id === a.id)).map(a => a.id)
+    runtime.store.set(KV.ambient.config, normalized)
+    if (opts?.sync !== false) void broadcastPersonaAmbientStateToPeers({ removedAddressIds: removedIds })
   }
   /** Amap key: env `RHARNESS_AMAP_KEY` wins; otherwise the UI-stored key. Never sent back to clients. */
   const getAmapApiKey = (): string | undefined => {
@@ -677,6 +689,49 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       const saved = savePersonaLearning(getPersonaLearnings(), { ...learned, source: 'auto' })
       setPersonaLearnings(saved.list)
     }
+  }
+
+  /**
+   * Persona/ambient state (resident addresses, persona config, learnings, stored Amap key)
+   * follows the user across nodes like memories/chat do — it must never be trapped on
+   * whichever node happened to serve the page. Sticker image files stay node-local for now.
+   */
+  const broadcastPersonaAmbientStateToPeers = async (opts?: {
+    removedAddressIds?: string[]
+    removedLearningIds?: string[]
+    /** Explicit Amap-key override ('' clears peers); defaults to the stored key when one exists. */
+    amapApiKey?: string
+  }): Promise<void> => {
+    if (!runtime) return
+    const storedAmapKey = runtime.store.get(KV.ambient.amap)?.apiKey?.trim()
+    const peers = getRegisteredNodes().filter(n => n.id !== 'local' && n.status === 'online' && n.url !== 'local')
+    await Promise.allSettled(
+      peers.map(async peer => {
+        const endpoints = [...new Set([...(peer.endpoints ?? []), peer.url])].filter(Boolean)
+        for (const ep of endpoints) {
+          try {
+            const res = await fetch(`${ep.replace(/\/+$/, '')}/orchestrator/standalone/assistant/persona-sync`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-orchestrator-request': '1',
+              },
+              body: JSON.stringify({
+                personaConfig: getPersonaConfig(),
+                learnings: getPersonaLearnings(),
+                ambientConfig: getAmbientConfig(),
+                ...(opts?.removedAddressIds?.length ? { removedAddressIds: opts.removedAddressIds } : {}),
+                ...(opts?.removedLearningIds?.length ? { removedLearningIds: opts.removedLearningIds } : {}),
+                ...(storedAmapKey ? { amapApiKey: storedAmapKey } : {}),
+                ...(opts?.amapApiKey !== undefined ? { amapApiKey: opts.amapApiKey } : {}),
+              }),
+              signal: AbortSignal.timeout(4000),
+            })
+            if (res.ok) break
+          } catch {}
+        }
+      }),
+    )
   }
 
   const broadcastMemoriesStateToPeers = async (mode: 'merge' | 'replace' = 'merge'): Promise<void> => {
@@ -2036,6 +2091,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         sub === 'clawfeed/ingest' ||
         sub === 'clawfeed/sync' ||
         sub === 'assistant/sync' ||
+        sub === 'assistant/persona-sync' ||
         sub === 'memories/sync' ||
         sub === 'memories/milestones' ||
         sub.startsWith('rhtoolkit/') ||
@@ -2358,6 +2414,33 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             }
             const merged = [...byId.values()].sort((a, b) => a.at.localeCompare(b.at))
             runtime.store.set(KV.assistant.messages, merged)
+          }
+          sendJson(res, 200, { ok: true })
+          return
+        }
+
+        // Cross-node sync for Persona/Ambient (`dsh-assistant-persona`): resident addresses, persona
+        // config & learnings live on every node, so the phone (hub node) and the desktop (workstation)
+        // always show the same 常驻地址 no matter which node served the edit.
+        if (req.method === 'POST' && sub === 'assistant/persona-sync') {
+          const body = await readJsonBody(req, 2 * 1024 * 1024)
+          const removedAddressIds = Array.isArray(body.removedAddressIds) ? body.removedAddressIds.filter((x: unknown) => typeof x === 'string') as string[] : []
+          const removedLearningIds = Array.isArray(body.removedLearningIds) ? body.removedLearningIds.filter((x: unknown) => typeof x === 'string') as string[] : []
+          if (body.personaConfig && typeof body.personaConfig === 'object') {
+            setPersonaConfig(body.personaConfig as AssistantPersonaConfig, { sync: false })
+          }
+          if (Array.isArray(body.learnings)) {
+            runtime.store.set(KV.persona.learnings, mergePersonaLearningsForSync(getPersonaLearnings(), body.learnings as PersonaLearningEntry[], removedLearningIds))
+          }
+          if (body.ambientConfig && typeof body.ambientConfig === 'object') {
+            setAmbientConfig(
+              mergeAmbientConfigForSync(getAmbientConfig(), normalizeAssistantAmbientConfig(body.ambientConfig), removedAddressIds),
+              { sync: false },
+            )
+            void refreshAmbientCachesInBackground()
+          }
+          if (typeof body.amapApiKey === 'string') {
+            runtime.store.set(KV.ambient.amap, { apiKey: body.amapApiKey.trim() })
           }
           sendJson(res, 200, { ok: true })
           return
@@ -2906,6 +2989,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           if ((req.method === 'PUT' || req.method === 'DELETE') && sub === 'assistant/ambient/amap-key') {
             if (req.method === 'DELETE') {
               if (runtime) runtime.store.set(KV.ambient.amap, { apiKey: '' })
+              void broadcastPersonaAmbientStateToPeers({ amapApiKey: '' })
               sendJson(res, 200, { amapConfigured: Boolean(process.env.RHARNESS_AMAP_KEY?.trim()) })
               return
             }
@@ -2913,6 +2997,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
             if (!apiKey) { sendJson(res, 400, { error: 'apiKey is required' }); return }
             if (runtime) runtime.store.set(KV.ambient.amap, { apiKey })
+            void broadcastPersonaAmbientStateToPeers()
             sendJson(res, 200, { amapConfigured: true })
             return
           }

@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildAmbientPromptSection,
   buildAmbientSnapshot,
+  mergeAmbientConfigForSync,
+  mergePersonaLearningsForSync,
   normalizeAssistantAmbientConfig,
   removeResidentAddress,
   setPrimaryResidentAddress,
@@ -268,6 +270,36 @@ describe('ambient awareness', () => {
     const section = buildAmbientPromptSection(snapshot)
     expect(section).toContain('上海市徐汇区梅陇十一村46号401')
     expect(section).toContain('主要')
+  })
+
+  it('syncs resident addresses & learnings across nodes: union by id, newer wins, deletions stay deleted', () => {
+    const shanghai = { name: '上海', latitude: 31.23, longitude: 121.47, timezone: 'Asia/Shanghai' }
+    const beijing = { name: '北京', latitude: 39.9, longitude: 116.4, timezone: 'Asia/Shanghai' }
+    // Node A (desktop) has 家; node B (phone hub) starts empty, then receives A's state.
+    const cfgA = upsertResidentAddress(defaultAssistantAmbientConfig(), { label: '家', address: '上海市徐汇区梅陇十一村46号401', city: shanghai }).config
+    let cfgB = mergeAmbientConfigForSync(defaultAssistantAmbientConfig(), cfgA)
+    expect(cfgB.residentAddresses.map(a => a.label)).toEqual(['家'])
+    expect(cfgB.homeCity.name).toBe('上海')
+    // B adds 公司 locally; A adds nothing. Merging B back into A keeps both, exactly one primary.
+    cfgB = upsertResidentAddress(cfgB, { label: '公司', address: '北京市海淀区中关村大街1号', city: beijing }).config
+    const merged = mergeAmbientConfigForSync(cfgA, cfgB)
+    expect(merged.residentAddresses.map(a => a.label).sort()).toEqual(['公司', '家'])
+    expect(merged.residentAddresses.filter(a => a.isPrimary)).toHaveLength(1)
+    // An edit on B (newer updatedAt) beats the stale copy on A.
+    const editedOnB: typeof cfgB = {
+      ...cfgB,
+      residentAddresses: cfgB.residentAddresses.map(a => (a.label === '家' ? { ...a, address: '上海市徐汇区新地址2号', updatedAt: '2999-01-01T00:00:00.000Z' } : a)),
+    }
+    expect(mergeAmbientConfigForSync(cfgA, editedOnB).residentAddresses.find(a => a.label === '家')!.address).toBe('上海市徐汇区新地址2号')
+    // Deletion on the sender (id in removedIds) does not resurrect on the receiver.
+    const homeId = cfgA.residentAddresses[0]!.id
+    const afterDelete = mergeAmbientConfigForSync(merged, cfgB, [homeId])
+    expect(afterDelete.residentAddresses.map(a => a.label)).toEqual(['公司'])
+    // Learnings merge the same way.
+    const l1: PersonaLearningEntry = { id: 'pl-1', kind: 'preference', content: '喜欢简短回复', enabled: true, source: 'user', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }
+    const l2: PersonaLearningEntry = { id: 'pl-2', kind: 'style', content: '多用颜文字', enabled: true, source: 'auto', createdAt: '2026-01-02T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z' }
+    expect(mergePersonaLearningsForSync([l1], [l2]).map(e => e.id)).toEqual(['pl-1', 'pl-2'])
+    expect(mergePersonaLearningsForSync([l1, l2], [l2], ['pl-1']).map(e => e.id)).toEqual(['pl-2'])
   })
 
   it('plans navigation with Amap when a key exists and degrades to map links without one', async () => {
