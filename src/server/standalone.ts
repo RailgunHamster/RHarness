@@ -693,11 +693,18 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     const records = getStickerRecords()
     if (!records.length) return { text: rawText }
     const parsed = parseStickerMarker(rawText, records)
-    if (!parsed.sticker) return { text: parsed.cleanText }
+    // Fallback: models often paste the sticker's ID from sticker_list into the reply instead of emitting the
+    // `[sticker:...]` marker. Any explicit sticker ID in the text is treated as intent to send that sticker.
+    let sticker = parsed.sticker
+    if (!sticker) {
+      const idMatch = /stk-\d{10,}-[a-z0-9]{4,}/.exec(rawText)
+      if (idMatch) sticker = records.find(r => r.id === idMatch[0] && !r.deletedAt)
+    }
+    if (!sticker) return { text: parsed.cleanText }
     const cfg = getPersonaConfig()
     const recentBotFlags = (runtime.store.get(KV.assistant.messages) ?? []).filter(m => m.bot).slice(-6).map(m => Boolean(m.sticker))
     if (!stickerAllowedByPolicy(cfg, recentBotFlags)) return { text: parsed.cleanText }
-    const used: StickerRecord = { ...parsed.sticker, useCount: parsed.sticker.useCount + 1, lastUsedAt: new Date().toISOString() }
+    const used: StickerRecord = { ...sticker, useCount: sticker.useCount + 1, lastUsedAt: new Date().toISOString() }
     setStickerRecords(records.map(r => (r.id === used.id ? used : r)))
     return { text: parsed.cleanText, sticker: used }
   }
