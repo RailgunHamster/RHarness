@@ -257,7 +257,8 @@ export function syncRemoteNodeGitBranch(input: {
 export async function dispatchTurnToRemoteNode(input: {
   node: WorkerNodeRecord
   hubIdentity?: DeviceIdentityRecord
-  rememberDispatch?: (token: string, tools: string[]) => void
+  pull?: (peer: string, key: string, body: RemoteTurnRequestBody, signal: AbortSignal, emit: (type: string, data: unknown) => void) => Promise<RemoteTurnResponseBody>
+  rememberDispatch?: (token: string, tools: string[]) => void | (() => void)
   hubUrl: string
   hubEndpoints?: string[]
   sessionId: string
@@ -282,7 +283,9 @@ export async function dispatchTurnToRemoteNode(input: {
   syncedFiles?: RemoteSyncedFile[]
 }> {
   const candidates = buildNodeCandidateEndpoints(input.node)
-  if (!candidates.length) {
+  const pull = input.node.tags.includes('pull-worker')
+  if (pull && (!input.node.deviceId || !input.pull)) throw new Error('Pull worker requires a paired device')
+  if (!pull && !candidates.length) {
     throw new Error(`No reachable endpoints configured for worker node ${input.node.id}`)
   }
   const toolDefs = [...input.tools.values()].map(t => describeSessionTool(t, input.sessionId))
@@ -312,15 +315,20 @@ export async function dispatchTurnToRemoteNode(input: {
     ...(input.hubEndpoints?.length ? { hubEndpoints: input.hubEndpoints } : {}),
   }
 
-  const key = turnReceiptKey(input.hubIdentity?.privateKeyPem ?? randomBytes(32).toString('hex'), body)
+  const secret = input.hubIdentity?.privateKeyPem ?? randomBytes(32).toString('hex')
+  const key = turnReceiptKey(secret, body)
+  let revoke: void | (() => void) = undefined
   if (input.rememberDispatch) {
-    body.callbackToken = createHmac('sha256', key).update('RHarness tool callback v1').digest('hex')
-    input.rememberDispatch(body.callbackToken, toolDefs.map(spec => spec.name))
+    body.callbackToken = createHmac('sha256', secret).update('RHarness tool callback v1/' + key).digest('hex')
+    revoke = input.rememberDispatch(body.callbackToken, toolDefs.map(spec => spec.name))
   }
-  const payload = await requestRemoteTurn({ candidates, body, signal: input.signal, onEvent: input.onEvent, key,
+  const payload = pull
+    ? await input.pull!(input.node.deviceId!, key, body, input.signal, input.onEvent)
+    : await requestRemoteTurn({ candidates, body, signal: input.signal, onEvent: input.onEvent, key,
     expectedPeer: input.node.deviceId,
     ...(input.hubIdentity ? { proofFor: (peer: string) => signOperation(input.hubIdentity!, key, 'worker-turn', [peer,body]) } : {}),
   })
+  revoke?.()
   for (const ev of payload.events ?? []) {
     input.onEvent(ev.type, ev.data)
   }

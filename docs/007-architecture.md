@@ -338,8 +338,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/report-files.ts` | Validate and fingerprint report deliverables from ticket artifact directories |
 | `src/app/ollama-driver.ts` | Local Ollama model discovery, message and image transport, and scoped tool calls |
 | `src/app/model-probe.ts` | Isolated role-model text, tool and image capability probes |
-| `src/app/model-queue.ts` | Shared serving endpoint admission, foreground priority, cancellation and rate-limit backoff |
+| `src/app/model-queue.ts` | Endpoint admission, foreground priority, tool-time slot release, cancellation and rate-limit backoff |
 | `src/app/workspace-records.ts` | Scoped versioned documents and immutable connector action previews |
+| `src/app/pull-worker.ts` | Paired outbound-only worker polling, durable offers and signed receipt pages |
 | `src/app/turn-receipts.ts` | Durable dispatch receipts, reconnect cursors and interrupted-turn recovery |
 | `src/app/worker-nodes.ts` | Distributed LAN Worker Nodes registry, capability-based node selection, remote turn dispatch and P2P Git fast-forward merge |
 | `src/app/device-group.ts` | Decentralized ECDSA P-256 device group identity, multi-address discovery (LAN IP + hostname + Tailscale MagicDNS + Tailscale IP) and one-use invitation URI pairing |
@@ -503,7 +504,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 
 ## Persistence
 
-One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens. Unsent standalone conversation drafts are separate browser-local state: text, reply targets and preferences use localStorage; image drafts use IndexedDB. They are isolated by page path and conversation, and enter the Local Panel Source only when sent, as described in [005 Panel](005-panel.md).
+The Store owns `<stateDir>/orchestrator.sqlite` and the domain tables below. The standalone host opens `workspace-records.sqlite` for document versions, report bytes and reviewed actions. Portable workspace backups include document versions and files. Node-local `turn-receipts.sqlite` and `worker-pull.sqlite` retain execution outcomes and delivery cursors across reconnects. A restored action requires a new review before execution.
+
+Unsent panel messages use localStorage for text, reply targets and preferences, and IndexedDB for image drafts. The browser isolates them by page path and conversation. Sending a message delivers it to the Local Panel Source as described in [005 Panel](005-panel.md).
 
 | Table | Holds | Written by |
 | --- | --- | --- |

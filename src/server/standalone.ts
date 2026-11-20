@@ -11,7 +11,7 @@ import { homedir } from 'node:os'
 import { basename, extname, join, relative, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { Runtime } from '../app/runtime.ts'
-import { createStandaloneHost } from '../app/standalone-host.ts'
+import { createStandaloneHost, type RegisteredToolSpec } from '../app/standalone-host.ts'
 import { SettingsSchema } from '../policy.ts'
 import { Store } from '../app/store.ts'
 import { feishuKind } from '../sources/feishu.ts'
@@ -219,6 +219,8 @@ import { collectReportFiles } from '../app/report-files.ts'
 import { WorkspaceRecords, RevisionConflict, draftInput, transcriptDocument, workspaceTools } from '../app/workspace-records.ts'
 import { probeModel, type ProbeKind, type ProbeResult } from '../app/model-probe.ts'
 import { nativeModelQueue } from '../app/model-queue.ts'
+import { setTimeout as waitForPoll } from 'node:timers/promises'
+import { createWorkerPoll, PullMailbox, pullConfig } from '../app/pull-worker.ts'
 import { TurnReceipts } from '../app/turn-receipts.ts'
 import { KV } from '../kv.ts'
 import { key, latestReport, threadKey, waitsForPerson, type Ticket } from '../core/index.ts'
@@ -230,6 +232,7 @@ export interface StandaloneServerOptions {
   tlsCertFile?: string
   tlsKeyFile?: string
   trustedReleasePublishers?: string[]
+  pullHub?: { url: string; hubId: string }
   host?: string
   stateDir?: string
   repoDir?: string
@@ -512,11 +515,22 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   const stateDir = resolve(options.stateDir ?? process.env.DSH_SUPERAGENT_STATE_DIR ?? '.rharness-dev/superagent')
   const repoDir = resolve(options.repoDir ?? process.cwd())
   const liveAgents = options.liveAgents ?? true
+  const pullUrl = options.pullHub?.url ?? (liveAgents ? process.env.RHARNESS_PULL_HUB : undefined)
+  let outboundStatus: 'connecting' | 'idle' | 'working' | 'retrying' = 'connecting'
+  const outbound = pullUrl ? pullConfig(pullUrl, options.pullHub?.hubId ?? process.env.RHARNESS_PULL_HUB_ID ?? '') : undefined
   const privateToolkitMod = await loadRHToolkitDynamicModule()
   mkdirSync(stateDir, { recursive: true })
   recoverStaleStateLock(stateDir)
 
   let turnReceipts: TurnReceipts | undefined
+  const receipts = () => turnReceipts ??= new TurnReceipts(join(stateDir, 'turn-receipts.sqlite'))
+  let mailbox: PullMailbox | undefined
+  const pullMailbox = () => mailbox ??= new PullMailbox(join(stateDir, 'worker-pull.sqlite'))
+  const runRemote = (body: RemoteTurnRequestBody, onEvent?: (event: { type: string; data: unknown }) => void) =>
+    handleIncomingRemoteTurn(body, {
+      stateDir, repoRoot: repoDir, onEvent,
+      ...(options.driver ? { customDriver: reqItem => options.driver!({ ...reqItem, onToolResult: () => {} }) } : {}),
+    })
   const activeProbes = new Set<string>()
   const recentProbes = new Map<string, ProbeResult>()
   let browserInput: BrowserInputLease | undefined
@@ -1201,7 +1215,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           }
           runtime.store.set(KV.nodes.ticketNode(ticketId), assigned)
         }
-        const targetNode = nodes.find(n => n.id === assigned.nodeId && n.status === 'online' && n.url !== 'local' && n.url !== '')
+        const targetNode = nodes.find(n => n.id === assigned.nodeId && n.status === 'online' && n.id !== 'local' && (n.url || n.tags.includes('pull-worker')))
         if (targetNode) {
           const hubIdentity = getDeviceIdentity()
           const hubEndpoints = listenHost === '0.0.0.0'
@@ -1210,7 +1224,13 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           const remoteRes = await dispatchTurnToRemoteNode({
             node: targetNode,
             hubIdentity,
-            rememberDispatch: (token, tools) => runtime.store.set(KV.nodes.dispatch(effectiveReq.sessionId), { digest: sha256Hex(token), tools }),
+            pull: (...args) => pullMailbox().dispatch(...args),
+            rememberDispatch: (token, tools) => {
+              const key = KV.nodes.dispatch(effectiveReq.sessionId)
+              const digest = sha256Hex(token)
+              runtime.store.set(key, { digest, tools, expiresAt: Date.now() + 24 * 3600_000 })
+              return () => { if (runtime.store.get(key)?.digest === digest) runtime.store.delete(key) }
+            },
             hubUrl: hubEndpoints[0] ?? `http://127.0.0.1:${actualPort}`,
             hubEndpoints,
             sessionId: effectiveReq.sessionId,
@@ -2038,6 +2058,9 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     const isWorker = agent.id.startsWith('worker-')
     // Never pollute the Engineering Eval (`orchestrator-*`) session with personal assistant or memory tools
     if (!isAssistant && !isWorker) return
+    const registerPluginTool = (plugin: string, spec: RegisteredToolSpec) => agent.ctx.tools?.register({
+      ...spec, registration: { plugin, enabled: () => isPluginEnabled(plugin) },
+    })
 
     if (isAssistant) {
       agent.ctx.systemPrompt?.section({
@@ -2089,7 +2112,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           return undefined
         },
       })) {
-        agent.ctx.tools?.register(pat)
+        registerPluginTool('dsh-assistant-persona', pat)
       }
     }
 
@@ -2137,7 +2160,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       { audience: memoryAudience(), session: agent.id },
     )
     for (const t of memTools) {
-      agent.ctx.tools?.register({
+      registerPluginTool('dsh-memory', {
         ...t,
         execute: async (args: unknown, exec: { signal: AbortSignal }) => {
           if (!isPluginEnabled('dsh-memory')) {
@@ -2217,7 +2240,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       (source, transcript) => workspaceRecords().save(transcriptDocument(source, transcript), agent.id),
     )
     for (const pst of personalSkillTools) {
-      agent.ctx.tools?.register(pst)
+      registerPluginTool('dsh-personal-skills', pst)
     }
     const clawFeedTools = buildClawFeedPluginTools({
       readItems: () => (runtime ? (runtime.store.get(KV.clawfeed.items) ?? []) : []),
@@ -2225,43 +2248,32 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       isEnabled: () => isPluginEnabled('dsh-clawfeed'),
     })
     for (const cft of clawFeedTools) {
-      agent.ctx.tools?.register(cft)
+      registerPluginTool('dsh-clawfeed', cft)
     }
 
     // Mount absorbed OpenClaw & Community Top Plugins (Model Usage, Lossless DAG, Self-Improving, Web Research, Browser Bridge, Progress Card, Data SQL, Tool Search)
     for (const ut of buildModelUsageTools(getModelUsageState, getRuntimeGuardStats, () => isPluginEnabled('dsh-model-usage'))) {
-      agent.ctx.tools?.register(ut)
+      registerPluginTool('dsh-model-usage', ut)
     }
     for (const lt of buildLosslessContextTools(isAssistant ? getLcmDag : defaultLcmDagState, readChatArchive, () => isAssistant && isPluginEnabled('dsh-lossless-context'))) {
-      agent.ctx.tools?.register(lt)
+      registerPluginTool('dsh-lossless-context', lt)
     }
     for (const sit of buildSelfImprovingTools({
-      readLearnings: getLearnings,
-      writeLearnings: setLearnings,
-      promoteToMemory: learning => {
-        const saved = saveMemoryEntry(getMemoryEntries(), {
-          title: learning.title,
-          content: learning.suggestedRule,
-          category: 'preference',
-          tags: ['self-improving', learning.kind],
-          pinned: true,
-          source: role,
-        })
-        setMemoryEntries(saved.list)
-        return saved.entry
-      },
+      sessionId: agent.id,
+      readLearnings: () => isAssistant ? getLearnings() : getLearnings().filter(item => item.sourceSessionId === agent.id),
+      writeLearnings: next => setLearnings(isAssistant ? next : [...getLearnings().filter(item => item.sourceSessionId !== agent.id), ...next]),
       isEnabled: () => isPluginEnabled('dsh-self-improving'),
     })) {
-      agent.ctx.tools?.register(sit)
+      registerPluginTool('dsh-self-improving', sit)
     }
     for (const wrt of buildWebResearchPluginTools(
       () => (runtime ? (runtime.store.get(KV.plugins.config('dsh-web-research')) ?? {}) : {}),
       () => isPluginEnabled('dsh-web-research'),
     )) {
-      agent.ctx.tools?.register(wrt)
+      registerPluginTool('dsh-web-research', wrt)
     }
     for (const bbt of buildBrowserBridgeTools(getRegisteredNodes, () => isPluginEnabled('dsh-browser-bridge'), { lease: browserLease(), session: agent.id })) {
-      agent.ctx.tools?.register(bbt)
+      registerPluginTool('dsh-browser-bridge', bbt)
     }
     for (const pct of buildProgressCardTools({
       sessionId: agent.id,
@@ -2269,10 +2281,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       writeCards: setProgressCards,
       isEnabled: () => isPluginEnabled('dsh-progress-card'),
     })) {
-      agent.ctx.tools?.register(pct)
+      registerPluginTool('dsh-progress-card', pct)
     }
     for (const dst of buildDataSqlPluginTools(() => isPluginEnabled('dsh-data-sql'))) {
-      agent.ctx.tools?.register(dst)
+      registerPluginTool('dsh-data-sql', dst)
     }
     if (privateToolkitMod) {
       for (const rkt of privateToolkitMod.buildRHToolkitPluginTools(
@@ -2283,11 +2295,11 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         },
         () => isPluginEnabled('dsh-rhtoolkit'),
       )) {
-        agent.ctx.tools?.register(rkt)
+        registerPluginTool('dsh-rhtoolkit', rkt)
       }
     }
     for (const tst of buildToolSearchPluginTools(() => host.agents.get(agent.id)?.tools ?? new Map(), () => isPluginEnabled('dsh-tool-search'), agent.id)) {
-      agent.ctx.tools?.register(tst)
+      registerPluginTool('dsh-tool-search', tst)
     }
 
     agent.ctx.systemPrompt?.section({
@@ -2816,6 +2828,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   const handleHttpRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const forwardedHost = typeof req.headers['x-forwarded-host'] === 'string' ? req.headers['x-forwarded-host'].split(',')[0]!.trim() : undefined
     const rawHost = forwardedHost || req.headers.host
+    const localOperator = !forwardedHost && !req.headers['x-forwarded-for'] &&
+      ['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '') && sameOrigin(req, actualPort)
     const matchesAllowedPort =
       typeof rawHost === 'string' &&
       (rawHost.endsWith(`:${actualPort}`) ||
@@ -2857,7 +2871,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     if (url.pathname.startsWith('/orchestrator/standalone/')) {
       const sub = url.pathname.slice('/orchestrator/standalone/'.length)
       const isLanWorkerCall =
-        sub === 'worker-node/execute' ||
+        sub === 'worker-node/execute' || sub === 'worker-node/pull' ||
         sub === 'personal-skills/execute' ||
         sub === 'browser/status' ||
         sub === 'clawfeed/ingest' ||
@@ -2881,6 +2895,9 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       try {
         await runtime.ready
 
+        if (req.method === 'POST' && ['device-group/create','device-group/invite','device-group/join','device-group/retag'].includes(sub) && !localOperator) {
+          sendJson(res, 403, { error: '请在此节点本机的 localhost 面板管理设备组。Open this node’s local panel to manage pairing.' }); return
+        }
         if (sub === 'schedules' && req.method === 'GET') {
           sendJson(res, 200, { items: runScheduledReviews() }); return
         }
@@ -2917,7 +2934,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           })
           sendJson(res, 200, {
             build: currentBuild.shortCommit, platform: process.platform, nodeVersion: process.versions.node,
-            protocol: 1, lastReceipt: turnReceipts?.diagnostics() ?? null, modelQueue: nativeModelQueue.snapshot(),
+            protocol: 1, outbound: outbound ? outboundStatus : undefined, lastReceipt: existsSync(join(stateDir, 'turn-receipts.sqlite')) ? receipts().diagnostics() : null, modelQueue: nativeModelQueue.snapshot(),
             models: capabilities, probes: Object.fromEntries(recentProbes), browserConnected: browser.connected, browserPaused: browserLease().paused,
           })
           return
@@ -3125,6 +3142,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             deviceGroup: {
               identity: {
                 deviceId: identity.deviceId,
+                publicKeyB64: identity.publicKeyB64,
                 deviceName: identity.deviceName,
                 hostname: identity.hostname,
                 ...(identity.tailscaleDnsName ? { tailscaleDnsName: identity.tailscaleDnsName } : {}),
@@ -5634,7 +5652,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           }
 
           if (req.method === 'POST' && sub === 'cluster-update/publish') {
-            if (!sameOrigin(req, actualPort) || !['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '')) {
+            if (!localOperator) {
               sendJson(res, 403, { error: 'Publish from the signer node locally' }); return
             }
             const body = await readJsonBody(req)
@@ -5926,6 +5944,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           sendJson(res, 200, {
             identity: {
               deviceId: identity.deviceId,
+              publicKeyB64: identity.publicKeyB64,
               deviceName: identity.deviceName,
               hostname: identity.hostname,
               ...(identity.tailscaleDnsName ? { tailscaleDnsName: identity.tailscaleDnsName } : {}),
@@ -6058,7 +6077,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
               const data = await resp.json() as { packet?: DeviceGroupPacket; error?: string }
               if (!resp.ok) throw new Error(data.error ?? `HTTP ${resp.status}`)
               if (data.packet) {
-                verifyAndExtractGroupMembers(data.packet)
+                const claims = verifyAndExtractGroupMembers(data.packet)
+                if (data.packet.groupId !== invitation.groupId ||
+                    !claims.some(member => member.deviceId === invitation.deviceId) ||
+                    !claims.some(member => member.publicKeyB64 === identity.publicKeyB64)) throw new Error('Returned group does not match this invitation')
                 joinedPacket = data.packet
                 break
               }
@@ -6196,6 +6218,17 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           return
         }
 
+        if (req.method === 'POST' && sub === 'worker-node/pull') {
+          const { proof, known, update } = await readJsonBody(req, 24 * 1024 * 1024)
+          if (!proof || typeof proof !== 'object' || (known !== null && (typeof known !== 'string' || !/^[a-f0-9]{64}$/.test(known)))) {
+            sendJson(res, 400, { error: 'Invalid pull request' }); return
+          }
+          try {
+            const offer = pullMailbox().exchange(getDeviceIdentity(), trustedPeers(), proof as PeerOperation, known, update)
+            sendJson(res, 200, { offer })
+          } catch { sendJson(res, 403, { error: 'Pull proof or receipt rejected' }) }
+          return
+        }
         if (req.method === 'HEAD' && sub === 'worker-node/execute') {
           res.writeHead(200, { 'x-turn-peer': getDeviceIdentity().deviceId, 'x-turn-protocol': '1' })
           res.end()
@@ -6210,28 +6243,23 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             sendJson(res, 400, { error: 'Invalid turn receipt request' })
             return
           }
-          if (mode) turnReceipts ??= new TurnReceipts(join(stateDir, 'turn-receipts.sqlite'))
           if (mode === 'read') {
-            const receipt = turnReceipts!.read(key as string, after)
+            const receipt = receipts().read(key as string, after)
             sendJson(res, receipt ? 200 : 404, receipt ?? { error: 'Unknown receipt' })
             return
           }
           const body = await readJsonBody(req, 14 * 1024 * 1024) as unknown as RemoteTurnRequestBody
-          if (!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '')) {
+          if (!localOperator) {
             const raw = req.headers['x-turn-proof']
             const proof = typeof raw === 'string' ? JSON.parse(Buffer.from(raw, 'base64url').toString()) as PeerOperation : undefined
             if (!proof || proof.key !== key || !validOperation(proof, 'worker-turn', [getDeviceIdentity().deviceId,body], trustedPeers())) {
               sendJson(res, 403, { error: 'A signed dispatch from a paired hub is required' }); return
             }
           }
-          const execute = (onEvent?: (event: { type: string; data: unknown }) => void) => handleIncomingRemoteTurn(body, {
-            stateDir, onEvent,
-            repoRoot: repoDir,
-            ...(options.driver ? { customDriver: reqItem => options.driver!({ ...reqItem, onToolResult: () => {} }) } : {}),
-          })
+          const execute = (onEvent?: (event: { type: string; data: unknown }) => void) => runRemote(body, onEvent)
           if (mode === 'start') {
-            const accepted = turnReceipts!.start(key as string, body, execute)
-            sendJson(res, accepted ? 200 : 409, accepted ? turnReceipts!.read(key as string, after) : { error: 'Turn request changed after dispatch' })
+            const accepted = receipts().start(key as string, body, execute)
+            sendJson(res, accepted ? 200 : 409, accepted ? receipts().read(key as string, after) : { error: 'Turn request changed after dispatch' })
           } else sendJson(res, 200, await execute())
           return
         }
@@ -6264,7 +6292,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           const callback = typeof body.callbackToken === 'string' ? body.callbackToken : undefined
           if (callback) {
             const grant = runtime.store.get(KV.nodes.dispatch(sessionId))
-            if (!grant || sha256Hex(callback) !== grant.digest || !grant.tools.includes(toolName) || !/^[a-f0-9]{48}$/.test(String(body.operationKey))) {
+            if (!grant || !grant.expiresAt || Date.now() >= grant.expiresAt || sha256Hex(callback) !== grant.digest || !grant.tools.includes(toolName) || !/^[a-f0-9]{48}$/.test(String(body.operationKey))) {
               sendJson(res, 403, { error: 'Invalid dispatch tool grant' }); return
             }
           } else if (!sameOrigin(req, actualPort)) {
@@ -6804,6 +6832,23 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     }
   }
 
+  const pollStop = new AbortController()
+  const poll = outbound && createWorkerPoll(outbound, getDeviceIdentity, trustedPeers, receipts, runRemote)
+  const pollLoop = poll && (async () => {
+    let interval = 0
+    while (!pollStop.signal.aborted) {
+      if (interval) await waitForPoll(interval, undefined, { signal: pollStop.signal }).catch(() => {})
+      if (pollStop.signal.aborted) break
+      try {
+        const working = await poll(pollStop.signal)
+        outboundStatus = working ? 'working' : 'idle'
+        interval = working ? 500 : 5000
+      } catch {
+        outboundStatus = 'retrying'
+        interval = Math.min(30_000, Math.max(1000, interval * 2))
+      }
+    }
+  })()
   return {
     port: actualPort,
     ...(actualHttpsPort !== undefined ? { httpsPort: actualHttpsPort } : {}),
@@ -6813,6 +6858,9 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     get runtime() { return runtime },
     host,
     stop: async () => {
+      pollStop.abort()
+      await pollLoop
+      clearInterval(ambientRefreshTimer)
       clearInterval(scheduleTimer)
       if (updateDrainTimer) {
         clearInterval(updateDrainTimer)
@@ -6825,6 +6873,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       await turnReceipts?.close()
       workspace?.close()
       await runtime.stop()
+      mailbox?.close()
     },
   }
 }

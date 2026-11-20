@@ -80,6 +80,12 @@ Send one message, under 300 words: what will be installed, the accounts and CLIs
 
 ### Cluster release trust
 
-Each publisher signs its build manifest with its existing device identity. On receiving nodes, set `RHARNESS_RELEASE_PUBLISHERS` to the comma-separated SPKI public keys (base64url) of the release workstations you trust. Obtain the public key on the publisher itself from its device-group identity. The private key stays on that machine. A node also trusts its own device identity.
+Each publisher signs its build manifest with its existing device identity. On receiving nodes, set `RHARNESS_RELEASE_PUBLISHERS` to the comma-separated SPKI public keys (base64url) of the release workstations you trust. On the publisher's own panel, open **节点 → 设备指纹与发布公钥** and copy **发布公钥**. The private key stays on that machine. A node also trusts its own device identity.
 
 Run `node lib/standalone.js --publish-update` on the publisher. Each receiving node checks the signature, file hashes and generation before staging and again checks publisher trust before applying. To intentionally publish an older checkout, post to the local publish endpoint with `rollbackOf` set to the current destination build ID. The rollback receives a new signed generation. The high-water mark lives in the node state directory independently of personal-data restores.
+
+### Outbound-only executor
+
+Pair the worker with the hub using the local panel on each node. Give the worker the `pull-worker` device tag. Set `RHARNESS_PULL_HUB` on the worker to the hub's HTTPS origin and `RHARNESS_PULL_HUB_ID` to the hub's public device fingerprint from its device-group panel. Loopback HTTP also works for local tests. Restart the worker to apply the environment settings. Work assigned to this device is fetched over its outbound connection. Its signed progress and completion receipts survive reconnects.
+
+In the web panel, **运行配置 → 节点诊断** tests the selected role's text, tool or image capability using synthetic input. **定时研判** manages user-defined reviews. **草稿与确认** opens versioned documents, report attachments and proposed connector operations for review.

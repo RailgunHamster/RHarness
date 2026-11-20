@@ -703,7 +703,7 @@ export function groupMembersToWorkerNodes(
       lanIps: member.lanIps,
     })
     const primaryUrl = candidateEndpoints[0] ?? ''
-    if (!primaryUrl) continue
+    if (!primaryUrl && !member.tags.includes('pull-worker')) continue
     byId.set(slug, {
       id: slug, deviceId: member.deviceId,
       name: `${member.deviceName} (设备组已认证)`,

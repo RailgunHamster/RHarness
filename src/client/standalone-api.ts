@@ -6,7 +6,7 @@ export interface SessionSummary {
   id: string; title: string; status: string; model: { provider: string; model: string; reasoningEffort?: string }
 }
 export interface SessionDetail extends SessionSummary {
-  cwd: string; systemPrompt: string; tools: { name: string; description: string; parameters?: unknown; role?: string; version?: string }[]
+  cwd: string; systemPrompt: string; tools: { name: string; description: string; parameters?: unknown; role?: string; version?: string; plugin?: string; enabled?: boolean }[]
   events: SessionEvent[]; liveTrace?: TraceStep[]
 }
 export interface SessionUpdate {
@@ -93,6 +93,7 @@ export interface DeviceGroupMemberInfo {
 export interface DeviceGroupSummary {
   identity: {
     deviceId: string
+    publicKeyB64?: string
     deviceName: string
     hostname?: string
     tailscaleDnsName?: string

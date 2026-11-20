@@ -78,8 +78,10 @@ describe('cluster auto-update, supervisor lock safety, and data-center backup/im
     const stateDir = mkdtempSync(join(tmpdir(), 'rharness-rel-state-'))
     try {
       initTempGitRepo(pubRepo, 'v1')
-      initTempGitRepo(cleanPeerRepo, 'v1')
-      initTempGitRepo(dirtyDevRepo, 'v1')
+      for (const clone of [cleanPeerRepo, dirtyDevRepo]) {
+        execFileSync('git', ['clone', pubRepo, clone], { stdio: 'ignore' })
+        writeFileSync(join(clone, 'local-note.txt'), 'untracked operator note')
+      }
       const v1Build = inspectLocalBuild(cleanPeerRepo)
 
       // Advance publisher repo to v2
@@ -97,6 +99,7 @@ describe('cluster auto-update, supervisor lock safety, and data-center backup/im
       // Clean peer repo: fast-forwards Git HEAD AND atomically updates lib/
       const unpacked = unpackAndVerifyClusterRelease(rel.packageGz)
       const cleanOut = applyVerifiedReleaseToRepo(cleanPeerRepo, unpacked, stateDir)
+      expect(readFileSync(join(cleanPeerRepo, 'local-note.txt'), 'utf8')).toBe('untracked operator note')
       expect(cleanOut.gitUpdated).toBe(true)
       expect(cleanOut.skippedDirtyGit).toBe(false)
       expect(inspectLocalBuild(cleanPeerRepo).buildId).toBe(rel.manifest.buildId)

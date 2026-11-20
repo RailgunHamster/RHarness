@@ -685,6 +685,8 @@ export function buildToolSearchPluginTools(
           .map(t => ({
             name: t.name,
             description: t.description.slice(0, 220),
+            plugin: t.registration?.plugin ?? 'rharness',
+            enabled: t.registration?.enabled() ?? true,
           }))
         return { totalTools: all.length, matchedCount: matched.length, tools: matched }
       },

@@ -6,6 +6,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { startStandaloneServer } from '../src/server/standalone.ts'
 import { TurnReceipts, turnReceiptKey } from '../src/app/turn-receipts.ts'
 import { DatabaseSync } from 'node:sqlite'
+import { KV } from '../src/kv.ts'
+import { PullMailbox, pullConfig } from '../src/app/pull-worker.ts'
+import { ensureDeviceIdentity, createDeviceGroup, createGroupInvitation, createJoinRequest, groupMembersToWorkerNodes, redeemGroupInvitation, signOperation } from '../src/app/device-group.ts'
 import { buildNodeCandidateEndpoints } from '../src/app/device-group.ts'
 import { defaultModelProfilesConfig, resolveEffectiveModelProfile } from '../src/app/model-profiles.ts'
 import { selectWorkerNode, syncRemoteNodeGitBranch, type WorkerNodeRecord } from '../src/app/worker-nodes.ts'
@@ -87,6 +90,41 @@ describe('distributed LAN worker nodes and P2P Git fast-forward merge', () => {
     expect(selectWorkerNode(repoNodes, undefined, '查看 GitHub Actions 状态').id).toBe('local')
   })
 
+  it('resumes an outbound dispatch from its acknowledged cursor and rejects unpaired, misdirected or stale results', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pull-reconnect-'))
+    const hub = ensureDeviceIdentity(undefined, 4318), worker = ensureDeviceIdentity(undefined, 4319)
+    const other = ensureDeviceIdentity(undefined, 4320)
+    const trusted = [worker.publicKeyB64, other.publicKeyB64]
+    const body = { sessionId: 'worker-test', messages: [], provider: 'test', model: 'offline', systemPrompt: '', toolDefs: [] }
+    const key = turnReceiptKey('fixture', body)
+    const path = join(root, 'pull.sqlite')
+    const journal = new PullMailbox(path)
+    const waiting = new AbortController()
+    const seen: unknown[] = []
+    try {
+      expect(() => pullConfig('http://example.org',hub.deviceId)).toThrow()
+      const result = journal.dispatch(worker.deviceId, key, body, waiting.signal, (_type,data) => seen.push(data))
+      const exchange = (box: PullMailbox, known: string | null, update: unknown, who = worker) =>
+        box.exchange(hub,trusted,signOperation(who,'poll','worker-pull',[hub.deviceId,known,update]),known,update)
+      expect(exchange(journal,null,null,other)).toBeNull()
+      expect(exchange(journal,null,null)?.body).toEqual(body)
+      const page = { key, after: 0, page: { state: 'running', more: true, cursor: 1, events: [{ type: 'progress', data: 1 }] } }
+      expect(() => exchange(journal,key,page,other)).toThrow()
+      expect(() => journal.exchange(hub,[],signOperation(worker,'poll','worker-pull',[hub.deviceId,key,page]),key,page)).toThrow()
+      expect(exchange(journal,key,page)?.after).toBe(1)
+      const reconnected = new PullMailbox(path)
+      try {
+        expect(exchange(reconnected,null,null)?.after).toBe(1)
+        expect(exchange(reconnected,key,page)?.after).toBe(1)
+        const last = { key, after: 1, page: { state: 'completed', more: false, cursor: 2, events: [{ type: 'progress', data: 2 }], result: { replyText: 'finished' } } }
+        expect(exchange(reconnected,key,last)).toBeNull()
+        expect(exchange(reconnected,key,last)).toBeNull()
+      } finally { reconnected.close() }
+      expect(await result).toEqual({ replyText: 'finished', events: [] })
+      expect(seen).toEqual([1,2])
+    } finally { waiting.abort(); journal.close(); rmSync(root,{recursive:true,force:true}) }
+  })
+
   it('fetches a remote worker node Git branch directly and fast-forward merges it into the Hub main branch', () => {
     const root = mkdtempSync(join(tmpdir(), 'rharness-dist-git-'))
     const hubRepo = join(root, 'hub-repo')
@@ -122,15 +160,27 @@ describe('distributed LAN worker nodes and P2P Git fast-forward merge', () => {
     }
   }, 45_000)
 
-  it('dispatches a routed Ticket from the Hub server to a remote LAN Worker Node server and proxies orchestrator_report back', async () => {
+  it.each(['direct','pull'] as const)('dispatches a routed Ticket over %s transport and proxies orchestrator_report back', async transport => {
     const hubDir = mkdtempSync(join(tmpdir(), 'rharness-hub-'))
     const workerDir = mkdtempSync(join(tmpdir(), 'rharness-worker-'))
     let remoteExecuted = false
 
+    const hubServer = await startStandaloneServer({ port: 0, host: '127.0.0.1', stateDir: hubDir, repoDir: hubDir, liveAgents: false })
+    const hub = ensureDeviceIdentity(undefined, hubServer.port)
+    const worker = { ...ensureDeviceIdentity(undefined, 4318, ['pull-worker']), deviceName: 'win-pc' }
+    const initial = createDeviceGroup(hub)
+    const group = redeemGroupInvitation(hub, initial, createGroupInvitation(hub,initial,false).token, createJoinRequest(worker))
+    if (transport === 'pull') {
+      hubServer.runtime.store.set(KV.deviceGroup.identity, hub)
+      hubServer.runtime.store.set(KV.deviceGroup.packet, group)
+      hubServer.runtime.store.set(KV.nodes.registry, groupMembersToWorkerNodes(hub.deviceId, group, []))
+    }
     const workerServer = await startStandaloneServer({
       port: 0,
       host: '127.0.0.1',
       stateDir: workerDir,
+      repoDir: workerDir,
+      ...(transport === 'pull' ? { pullHub: { url: hubServer.url, hubId: hub.deviceId } } : {}),
       liveAgents: false,
       driver: async req => {
         remoteExecuted = true
@@ -145,12 +195,10 @@ describe('distributed LAN worker nodes and P2P Git fast-forward merge', () => {
       },
     })
 
-    const hubServer = await startStandaloneServer({
-      port: 0,
-      host: '127.0.0.1',
-      stateDir: hubDir,
-      liveAgents: false,
-    })
+    if (transport === 'pull') {
+      workerServer.runtime.store.set(KV.deviceGroup.identity, worker)
+      workerServer.runtime.store.set(KV.deviceGroup.packet, group)
+    }
 
     try {
       const api = async (method: string, path: string, body?: unknown) => {
@@ -167,7 +215,7 @@ describe('distributed LAN worker nodes and P2P Git fast-forward merge', () => {
       }
 
       // 1. Register the remote worker node on the Hub
-      const reg = await api('POST', '/orchestrator/standalone/nodes', {
+      const reg = transport === 'pull' ? await api('GET', '/orchestrator/standalone/nodes') : await api('POST', '/orchestrator/standalone/nodes', {
         id: 'win-pc',
         name: '主力开发台式机',
         url: workerServer.url,

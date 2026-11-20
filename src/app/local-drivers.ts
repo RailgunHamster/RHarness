@@ -26,11 +26,16 @@ export function runNativeModelTurn(input: Parameters<typeof runDshTurn>[0]): Pro
   const endpoint = input.provider === 'ollama-local' ? new URL(ollamaBase()).origin : providerEndpoints.get(input.provider) ?? input.provider
   const foreground = !input.sessionId?.startsWith('worker-')
   if (input.provider === 'ollama-local') return runOllamaTurn(input, request => nativeModelQueue.run(endpoint, foreground, input.signal, request))
-  return nativeModelQueue.run(endpoint, foreground, input.signal, () => {
-    if (input.provider === 'codex') return runCodexTurn(input)
-    if (input.provider === 'cursor') return runCursorTurn(input)
+  return nativeModelQueue.run(endpoint, foreground, input.signal, duringTool => {
+    const tools = new Map<string, RegisteredToolSpec>()
+    for (const [name, tool] of input.tools) {
+      tools.set(name, { ...tool, execute: (args, context) => duringTool(() => tool.execute(args, context)) })
+    }
+    const turn = { ...input, tools }
+    if (input.provider === 'codex') return runCodexTurn(turn)
+    if (input.provider === 'cursor') return runCursorTurn(turn)
     if (input.provider === 'human') throw new Error('Human sessions require the Session Console')
-    return runDshTurn(input)
+    return runDshTurn(turn)
   })
 }
 

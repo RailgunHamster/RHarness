@@ -78,7 +78,7 @@ export const KV = {
   /** Distributed LAN Worker Nodes registry and per-Ticket assigned node ID. */
   nodes: {
     registry: record<WorkerNodeRecord[]>('worker-nodes-registry'),
-    dispatch: family<{ digest: string; tools: string[] }, [sessionId: string]>('worker-turn-grant:'),
+    dispatch: family<{ digest: string; tools: string[]; expiresAt?: number }, [sessionId: string]>('worker-turn-grant:'),
     ticketNode: family<{ nodeId: string; nodeName: string; gitSource?: string; branch?: string; synced?: boolean }, [ticketId: string]>('ticket-worker-node:'),
   },
   /** Decentralized Device Group identity and signed group membership packet. */

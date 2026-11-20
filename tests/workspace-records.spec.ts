@@ -52,6 +52,24 @@ it('orders shared-endpoint turns, removes a cancelled waiter and allows another 
   expect(order).toEqual(['independent','assistant','worker'])
 })
 
+it('lets interactive inference use a worker slot during a slow tool and reacquires it before continuing', async () => {
+  const { ModelQueue } = await import('../src/app/model-queue.ts')
+  const queue = new ModelQueue(1), signal = new AbortController().signal
+  let entered!: () => void, release!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  const tool = new Promise<void>(resolve => { release = resolve })
+  const order: string[] = []
+  const worker = queue.run('endpoint', false, signal, async duringTool => {
+    await Promise.all([duringTool(async () => { entered(); await tool }), duringTool(async () => { await tool })])
+    order.push('worker')
+  })
+  await started
+  await queue.run('endpoint', true, signal, async () => { order.push('assistant'); release() })
+  await worker
+  expect(order).toEqual(['assistant','worker'])
+  expect(queue.snapshot()[0]).toMatchObject({ running: 0, queued: 0 })
+})
+
 it('requires a fresh observation after the browser is handed back', async () => {
   const { BrowserInputLease } = await import('../src/app/research-and-ux-plugins.ts')
   const lease = new BrowserInputLease()

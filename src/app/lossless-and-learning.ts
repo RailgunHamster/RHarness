@@ -20,7 +20,6 @@
  *      read-only snapshot of the current conversation without polluting formal chat history or interrupting ongoing work.
  */
 import { z } from 'zod'
-import type { MemoryEntry } from './memory-plugin.ts'
 import type { RegisteredToolSpec } from './standalone-host.ts'
 
 export interface LcmSummaryNode {
@@ -342,7 +341,7 @@ export function recordLearningEvent(
 export function buildSelfImprovingTools(options: {
   readLearnings: () => LearningEntry[]
   writeLearnings: (next: LearningEntry[]) => void
-  promoteToMemory: (learning: LearningEntry) => MemoryEntry
+  sessionId?: string
   isEnabled: () => boolean
 }): RegisteredToolSpec[] {
   const logSchema = z.object({
@@ -369,6 +368,7 @@ export function buildSelfImprovingTools(options: {
           title: args.title,
           detail: args.detail,
           suggestedRule: args.suggested_rule,
+          ...(options.sessionId ? { sourceSessionId: options.sessionId } : {}),
         })
         options.writeLearnings(list)
         return { ok: true, recorded: entry }

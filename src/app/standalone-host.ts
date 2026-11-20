@@ -25,6 +25,7 @@ import {
 import { assistantText, projectLiveTrace } from './session-events.ts'
 
 export interface RegisteredToolSpec {
+  registration?: { plugin: string; enabled: () => boolean }
   name: string
   description: string
   parameters?: unknown
@@ -35,7 +36,8 @@ export interface RegisteredToolSpec {
 export function describeSessionTool(spec: RegisteredToolSpec, sessionId: string) {
   const role = sessionId.startsWith('worker-') ? 'worker' : sessionId.startsWith('orchestrator-') ? 'orchestrator' : 'assistant'
   const version = createHash('sha256').update(JSON.stringify([spec.name,spec.description,spec.parameters])).digest('hex').slice(0, 16)
-  return { name: spec.name, description: spec.description, parameters: spec.parameters, version, role }
+  return { name: spec.name, description: spec.description, parameters: spec.parameters, version, role,
+    plugin: spec.registration?.plugin ?? 'rharness', enabled: spec.registration?.enabled() ?? true }
 }
 
 export interface SessionTurnMessage {

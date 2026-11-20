@@ -796,6 +796,9 @@ function WorkerNodesModal({
             </h3>
             <div className="dt-mono dt-hint">
               <div>{lang === 'zh' ? '机器名：' : 'Hostname: '}<strong>{deviceGroup.identity.hostname || deviceGroup.identity.deviceName}</strong> · ID: {deviceGroup.identity.deviceId.slice(0, 16)}…</div>
+              <details><summary>{lang === 'zh' ? '设备指纹与发布公钥' : 'Device fingerprint and release key'}</summary>
+                <div className="dt-record-editor"><label>{lang === 'zh' ? '设备指纹' : 'Device fingerprint'}<input readOnly value={deviceGroup.identity.deviceId} onFocus={e => e.target.select()} /></label>
+                {deviceGroup.identity.publicKeyB64 && <label>{lang === 'zh' ? '发布公钥' : 'Publisher public key'}<input readOnly value={deviceGroup.identity.publicKeyB64} onFocus={e => e.target.select()} /></label>}</div></details>
               {deviceGroup.identity.tailscaleDnsName && <div>Tailscale MagicDNS: <strong>{deviceGroup.identity.tailscaleDnsName}</strong> ({deviceGroup.identity.tailscaleIps?.join(', ')})</div>}
               <div>{lang === 'zh' ? '候选端点列表：' : 'Endpoints: '}{deviceGroup.identity.endpoints.join('  |  ')}</div>
             </div>
@@ -2276,7 +2279,7 @@ function SessionConsoleModal({ sessionId, lang, onClose, onSelectSession }: {
               <select className="dt-select" value={selectedTool} onChange={event => setToolName(event.target.value)}>
                 {detail.tools.map(tool => <option key={tool.name} value={tool.name}>{tool.name}</option>)}
               </select></label>
-            {detail.tools.filter(tool => tool.name === selectedTool).map(tool => <details key={tool.name}><summary>{lang === 'zh' ? '工具定义' : 'Tool definition'} · {tool.role} · {tool.version?.slice(0,8)}</summary><p>{tool.description}</p><pre className="dt-raw-events">{JSON.stringify(tool.parameters,null,2)}</pre></details>)}
+            {detail.tools.filter(tool => tool.name === selectedTool).map(tool => <details key={tool.name}><summary>{lang === 'zh' ? '工具定义' : 'Tool definition'} · {tool.plugin} · {tool.role} · {tool.version?.slice(0,8)}{tool.enabled === false ? (lang === 'zh' ? ' · 已停用' : ' · Disabled') : ''}</summary><p>{tool.description}</p><pre className="dt-raw-events">{JSON.stringify(tool.parameters,null,2)}</pre></details>)}
             {detail.id.startsWith('worker-') && <div className="dt-row-buttons">{(['progress', 'ready'] as const).map(state =>
               <Button key={state} size="sm" onClick={() => { setToolName('orchestrator_report'); setToolArgs(JSON.stringify({ state,
                 summary: state === 'ready' ? '已完成实现并通过全部验证。' : '正在分析并实现改动…' }, null, 2)) }}>
@@ -2577,7 +2580,13 @@ export function StandaloneRoot() {
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [scheduleOpen, setScheduleOpen] = useState(false)
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
-  const [diagnostics, setDiagnostics] = useState<{ build: string; platform: string; nodeVersion: string; protocol: number; probes: Record<string, { provider: string; model: string; passed: boolean; ms: number }>; models: { role: string; provider?: string; model?: string; available: boolean }[]; browserConnected: boolean; browserPaused: boolean; lastReceipt: { state: string; at: string } | null; modelQueue: { running: number; queued: number; cooldownMs: number }[] }>()
+  const [diagnostics, setDiagnostics] = useState<{ build: string; platform: string; nodeVersion: string; protocol: number; outbound?: 'connecting' | 'idle' | 'working' | 'retrying'; probes: Record<string, { provider: string; model: string; passed: boolean; ms: number }>; models: { role: string; provider?: string; model?: string; available: boolean }[]; browserConnected: boolean; browserPaused: boolean; lastReceipt: { state: string; at: string } | null; modelQueue: { running: number; queued: number; cooldownMs: number }[] }>()
+  const diagnosticExport = diagnostics && JSON.stringify({
+    build: diagnostics.build, platform: diagnostics.platform, nodeVersion: diagnostics.nodeVersion, protocol: diagnostics.protocol,
+    capabilities: Object.fromEntries(Object.entries(diagnostics.probes ?? {}).map(([test, value]) => [test, { passed: value.passed, ms: value.ms }])),
+    lastReceipt: diagnostics.lastReceipt?.state, outbound: diagnostics.outbound, modelQueue: diagnostics.modelQueue,
+    browserConnected: diagnostics.browserConnected, browserPaused: diagnostics.browserPaused,
+  }, null, 2)
   const [diagnosticError, setDiagnosticError] = useState('')
   const [diagnosticBusy, setDiagnosticBusy] = useState(false)
   const refreshDiagnostics = async () => {
@@ -3052,10 +3061,13 @@ export function StandaloneRoot() {
               <Button size="sm" disabled={diagnosticBusy} onClick={() => void checkModel(m.role)}>{lang === 'zh' ? '实测' : 'Test'}</Button></div>
           })}
           <div>{lang === 'zh' ? '排队' : 'Queued'} · {diagnostics.modelQueue.reduce((n,p) => n + p.queued, 0)}</div>
+          {diagnostics.outbound && <div>{lang === 'zh' ? '出站派工' : 'Outbound worker'} · {lang === 'zh' ? { connecting: '连接中', idle: '等待工单', working: '执行中', retrying: '正在重连' }[diagnostics.outbound] : diagnostics.outbound}</div>}
           <div>{lang === 'zh' ? '最近派工回执' : 'Last dispatch receipt'} · {diagnostics.lastReceipt ? diagnostics.lastReceipt.state + ' · ' + formatSmartTimestamp(diagnostics.lastReceipt.at, lang) : '—'}</div>
           <div>{lang === 'zh' ? '浏览器' : 'Browser'} · {diagnostics.browserConnected ? (lang === 'zh' ? '已连接' : 'Connected') : (lang === 'zh' ? '离线' : 'Offline')}</div>
           <Button variant="outline" disabled={diagnosticBusy} onClick={() => void takeoverBrowser()}>{diagnostics.browserPaused ? (lang === 'zh' ? '交还浏览器控制' : 'Release browser control') : (lang === 'zh' ? '接管浏览器' : 'Take browser control')}</Button>
         </>}
+        {diagnosticExport && <details><summary>{lang === 'zh' ? '预览诊断导出' : 'Preview diagnostic export'}</summary>
+          <pre>{diagnosticExport}</pre><a download="rharness-diagnostics.json" href={'data:application/json;charset=utf-8,' + encodeURIComponent(diagnosticExport)}>{lang === 'zh' ? '下载此 JSON' : 'Download this JSON'}</a></details>}
         <Button disabled={diagnosticBusy} onClick={() => void refreshDiagnostics()}>{diagnosticBusy ? (lang === 'zh' ? '检测中…' : 'Checking…') : (lang === 'zh' ? '重新检测' : 'Refresh')}</Button>
       </div>
     </Modal>

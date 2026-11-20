@@ -260,21 +260,34 @@ export function saveReleaseOnDataCenter(stateDir: string, packageGz: Buffer): Cl
   const verified = unpackAndVerifyClusterRelease(packageGz)
   const paths = getDataCenterReleasePaths(stateDir)
   mkdirSync(paths.dir, { recursive: true })
-  const tmpPkg = `${paths.packagePath}.tmp-${process.pid}`
+  const digest = sha256Hex(packageGz)
+  const packagePath = join(paths.dir, digest + '.pkg.gz')
+  const tmpPkg = `${packagePath}.tmp-${process.pid}`
   const tmpManifest = `${paths.manifestPath}.tmp-${process.pid}`
   writeFileSync(tmpPkg, packageGz)
-  renameSync(tmpPkg, paths.packagePath)
-  writeFileSync(tmpManifest, JSON.stringify(verified.manifest, null, 2), 'utf8')
+  renameSync(tmpPkg, packagePath)
+  writeFileSync(tmpManifest, JSON.stringify({ manifest: verified.manifest, digest }), 'utf8')
   renameSync(tmpManifest, paths.manifestPath)
+  // The manifest pointer is committed before retiring obsolete packages. Keep one fallback for an in-flight reader.
+  const old = readdirSync(paths.dir).filter(name => /^[a-f0-9]{64}\.pkg\.gz$/.test(name) && name !== digest + '.pkg.gz')
+    .sort((a,b) => statSync(join(paths.dir,b)).mtimeMs - statSync(join(paths.dir,a)).mtimeMs)
+  for (const name of old.slice(1)) {
+    try { rmSync(join(paths.dir,name)) } catch { /* An existing reader may still hold the file on Windows. */ }
+  }
   return verified.manifest
 }
 
 export function readLatestReleaseOnDataCenter(stateDir: string): { manifest: ClusterReleaseManifest; packagePath: string } | undefined {
   const paths = getDataCenterReleasePaths(stateDir)
-  if (!existsSync(paths.manifestPath) || !existsSync(paths.packagePath)) return undefined
+  if (!existsSync(paths.manifestPath)) return undefined
   try {
-    const manifest = JSON.parse(readFileSync(paths.manifestPath, 'utf8')) as ClusterReleaseManifest
-    return { manifest, packagePath: paths.packagePath }
+    const saved = JSON.parse(readFileSync(paths.manifestPath, 'utf8')) as ClusterReleaseManifest | { manifest: ClusterReleaseManifest; digest: string }
+    if ('manifest' in saved) {
+      if (!/^[a-f0-9]{64}$/.test(saved.digest)) return undefined
+      const packagePath = join(paths.dir, saved.digest + '.pkg.gz')
+      return existsSync(packagePath) ? { manifest: saved.manifest, packagePath } : undefined
+    }
+    return existsSync(paths.packagePath) ? { manifest: saved, packagePath: paths.packagePath } : undefined
   } catch {
     return undefined
   }
@@ -316,8 +329,20 @@ export function applyVerifiedReleaseToRepo(repoDir: string, envelope: ClusterRel
     writeFileSync(bundlePath, Buffer.from(envelope.gitBundleB64, 'base64'))
     try {
       execFileSync('git', ['fetch', bundlePath, 'HEAD'], { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] })
-      execFileSync('git', ['checkout', '-B', 'main', 'FETCH_HEAD'], { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] })
-      gitUpdated = true
+      const git = (args: string[]) => execFileSync('git', args, { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+      if (git(['rev-parse', 'FETCH_HEAD']) !== envelope.manifest.commit) throw new Error('Bundle HEAD differs from the release manifest')
+      const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'])
+      if (branch === 'main' || branch === 'HEAD') {
+        if (envelope.manifest.rollbackOf) git(['checkout', '--detach', 'FETCH_HEAD'])
+        else {
+          let fastForward = true
+          try { git(['merge-base', '--is-ancestor', 'HEAD', 'FETCH_HEAD']) } catch { fastForward = false }
+          // Preserve local branch tips when updating an independently provisioned, clean deployment.
+          if (fastForward) git(['merge', '--ff-only', 'FETCH_HEAD'])
+          else git(['checkout', '--detach', 'FETCH_HEAD'])
+        }
+        gitUpdated = true
+      }
     } catch {
       // Non-fatal: `lib/` swap below is what the running Node runtime actually executes.
     } finally {
