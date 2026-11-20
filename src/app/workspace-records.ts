@@ -93,6 +93,14 @@ export function workspaceTools(get: () => WorkspaceRecords, owner: string): Regi
     { name: 'workspace_read', description: 'List your documents or read one exact revision by ID.', parameters: z.toJSONSchema(read),
       execute: async raw => { const query = read.parse(raw); if (!query.id) return get().list(owner)
         const value = get().get(query.id, query.revision); if (value?.owner !== owner) throw new Error('Unknown document'); return value } },
+    { name: 'workspace_report_reference', description: 'Read a worker report shared by exact document ID and revision. Returns its validation evidence alongside the report.',
+      parameters: z.toJSONSchema(z.object({ id: z.string().uuid(), revision: z.number().int().positive() })),
+      execute: async raw => {
+        const args = z.object({ id: z.string().uuid(), revision: z.number().int().positive() }).parse(raw)
+        const report = get().get(args.id, args.revision)
+        if (report?.kind !== 'report' || !report.owner.startsWith('worker-')) throw new Error('Unknown report reference')
+        return report
+      } },
     { name: 'workspace_save', description: 'Create or revise a durable document, timestamped meeting note or worker report. Include verification evidence. Use base=0 for creation, then supply the last revision.',
       parameters: z.toJSONSchema(draftInput), execute: async raw => get().save(draftInput.parse(raw), owner) },
     { name: 'workspace_edit', description: 'Replace a unique passage in a specific document revision.', parameters: z.toJSONSchema(patch),

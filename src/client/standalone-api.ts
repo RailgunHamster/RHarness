@@ -169,6 +169,9 @@ export interface MilestoneReminderRuleInfo {
   leadDays: number[]
 }
 export interface MemoryEntryInfo {
+  scope?: 'personal' | 'project' | 'device' | 'role' | 'shared'
+  provenance?: { reference: string; verifiedAt: string }
+  supersedes?: string
   id: string
   title: string
   content: string

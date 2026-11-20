@@ -334,6 +334,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/local-drivers.ts` | Real local model catalog discovery and turn execution for `@deepseek-ai/dsh` (`~/.dsh/profiles/web`) and `codex app-server` |
 | `src/app/standalone-host.ts` | The standalone multi-provider agent host (`dsh`, `codex`, `claude`, `cursor` and `human`), session inspector and incremental execution-event cursor |
 | `src/app/worktree-merge.ts` | Inspects a Ticket's isolated Git worktree branch and merges its commits back into the main repository branch |
+| `src/app/model-queue.ts` | Shared serving endpoint admission, foreground priority, cancellation and rate-limit backoff |
 | `src/app/workspace-records.ts` | Scoped versioned documents and immutable connector action previews |
 | `src/app/turn-receipts.ts` | Durable dispatch receipts, reconnect cursors and interrupted-turn recovery |
 | `src/app/worker-nodes.ts` | Distributed LAN Worker Nodes registry, capability-based node selection, remote turn dispatch and P2P Git fast-forward merge |

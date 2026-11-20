@@ -1086,6 +1086,7 @@ function MemoryAndPluginsSection({
   const [title, setTitle] = useTextDraft('memory:add-title')
   const [content, setContent] = useTextDraft('memory:add-content')
   const [category, setCategory] = useState<MemoryCategoryInfo>('preference')
+  const [scope, setScope] = useState<NonNullable<MemoryEntryInfo['scope']>>('personal')
   const [tags, setTags] = useTextDraft('memory:add-tags')
   const [pinned, setPinned] = useState(true)
   const [milestoneDate, setMilestoneDate] = useTextDraft('memory:add-milestone-date')
@@ -1274,7 +1275,7 @@ function MemoryAndPluginsSection({
       const res = await standaloneFetch<{ memories: MemoryEntryInfo[]; memoryBackups?: MemoryBackupInfo[] }>('memories', 'POST', {
         title: title.trim(),
         content: content.trim(),
-        category,
+        category, scope,
         tags,
         pinned,
         ...(milestonePayload ? { milestone: milestonePayload } : {}),
@@ -1766,6 +1767,12 @@ function MemoryAndPluginsSection({
             </select>
           </label>
           <label className="dt-field">
+            <span className="dt-field-head">{lang === 'zh' ? '适用范围' : 'Scope'}</span>
+            <select className="dt-select" value={scope} onChange={event => setScope(event.target.value as typeof scope)}>
+              {Object.entries({ personal: '仅个人助理', project: '当前项目', device: '当前设备', role: '助理角色', shared: '共享' }).map(([key, label]) => <option key={key} value={key}>{lang === 'zh' ? label : key}</option>)}
+            </select>
+          </label>
+          <label className="dt-field">
             <span className="dt-field-head">{lang === 'zh' ? '检索标签 (逗号分隔)' : 'Tags'}</span>
             <Input value={tags} onChange={e => setTags(e.target.value)} placeholder="生日, 纪念日, 续费" />
           </label>
@@ -1898,7 +1905,7 @@ function MemoryAndPluginsSection({
                   )}
                   <strong>{mem.title}</strong>
                   {mem.tags.map(t => <span key={t} className="dt-mono dt-msg-receipt-branch">#{t}</span>)}
-                  <span className="dt-mono dt-hint">by {mem.source} · {formatSmartTimestamp(mem.updatedAt, lang)}</span>
+                  <span className="dt-mono dt-hint">{mem.scope ?? 'shared'} · {mem.source} · {formatSmartTimestamp(mem.updatedAt, lang)}{mem.provenance && ' · ' + mem.provenance.reference}</span>
                 </div>
                 <div style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{mem.content}</div>
               </div>
@@ -2564,6 +2571,22 @@ export function StandaloneRoot() {
   const [profilesModalOpen, setProfilesModalOpen] = useState(false)
   const [mdReaderTarget, setMdReaderTarget] = useState<{ path: string; line?: number }>()
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
+  const [diagnostics, setDiagnostics] = useState<{ build: string; platform: string; nodeVersion: string; protocol: number; models: { role: string; provider?: string; model?: string; available: boolean }[]; browserConnected: boolean; browserPaused: boolean; lastReceipt: { state: string; at: string } | null; modelQueue: { running: number; queued: number; cooldownMs: number }[] }>()
+  const [diagnosticError, setDiagnosticError] = useState('')
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false)
+  const refreshDiagnostics = async () => {
+    setDiagnosticBusy(true); setDiagnosticError('')
+    try { setDiagnostics(await standaloneFetch<NonNullable<typeof diagnostics>>('diagnostics')) }
+    catch (err) { setDiagnosticError(String(err)) }
+    finally { setDiagnosticBusy(false) }
+  }
+  const takeoverBrowser = async () => {
+    if (!diagnostics) return
+    setDiagnosticBusy(true)
+    try { await standaloneFetch('browser/control', 'POST', { paused: !diagnostics.browserPaused }); await refreshDiagnostics() }
+    catch (err) { setDiagnosticError(String(err)); setDiagnosticBusy(false) }
+  }
   const [mdReaderOpen, setMdReaderOpen] = useState(false)
   const [viewMode, setViewMode] = useState<MainViewSlotId>('assistant')
   const [roleModels, setRoleModels] = useState<RoleModelsSummary>()
@@ -2830,6 +2853,7 @@ export function StandaloneRoot() {
           {isProfilesPluginEnabled && <Button variant="outline" size="sm" onClick={() => setProfilesModalOpen(true)}>
             {lang === 'zh' ? '配置组' : 'Profiles'}
           </Button>}
+          <Button size="sm" variant="outline" onClick={() => { setDiagnosticsOpen(true); void refreshDiagnostics() }}>{lang === 'zh' ? '节点诊断' : 'Node diagnostics'}</Button>
           <nav className="dt-workspace-nav" aria-label={lang === 'zh' ? '工作台区域' : 'Workspace sections'}>
             <a href="#local-chat" onClick={() => setViewMode('workbench')}>{lang === 'zh' ? '工程对话' : 'Local chat'}</a>
             <a href="#management" onClick={() => setViewMode('management')}>{lang === 'zh' ? '管理面板' : 'Management'}</a>
@@ -3002,6 +3026,20 @@ export function StandaloneRoot() {
         onMetaUpdate={handleMetaUpdate}
       />
     </main>
+    <Modal open={diagnosticsOpen} onClose={() => setDiagnosticsOpen(false)} title={lang === 'zh' ? '本机诊断' : 'Local diagnostics'} closeLabel={lang === 'zh' ? '关闭' : 'Close'}>
+      <div className="dt-form">
+        {diagnosticError && <p role="alert">{diagnosticError}</p>}
+        {diagnostics && <>
+          <strong>{diagnostics.platform} · Node {diagnostics.nodeVersion} · #{diagnostics.build}</strong>
+          {diagnostics.models.map(m => <div className="dt-record-meta" key={m.role}><strong>{m.role}</strong><span>{m.provider} / {m.model} · {m.available ? (lang === 'zh' ? '已发现' : 'Discovered') : (lang === 'zh' ? '未发现' : 'Unavailable')}</span></div>)}
+          <div>{lang === 'zh' ? '排队' : 'Queued'} · {diagnostics.modelQueue.reduce((n,p) => n + p.queued, 0)}</div>
+          <div>{lang === 'zh' ? '最近派工回执' : 'Last dispatch receipt'} · {diagnostics.lastReceipt ? diagnostics.lastReceipt.state + ' · ' + formatSmartTimestamp(diagnostics.lastReceipt.at, lang) : '—'}</div>
+          <div>{lang === 'zh' ? '浏览器' : 'Browser'} · {diagnostics.browserConnected ? (lang === 'zh' ? '已连接' : 'Connected') : (lang === 'zh' ? '离线' : 'Offline')}</div>
+          <Button variant="outline" disabled={diagnosticBusy} onClick={() => void takeoverBrowser()}>{diagnostics.browserPaused ? (lang === 'zh' ? '交还浏览器控制' : 'Release browser control') : (lang === 'zh' ? '接管浏览器' : 'Take browser control')}</Button>
+        </>}
+        <Button disabled={diagnosticBusy} onClick={() => void refreshDiagnostics()}>{diagnosticBusy ? (lang === 'zh' ? '检测中…' : 'Checking…') : (lang === 'zh' ? '重新检测' : 'Refresh')}</Button>
+      </div>
+    </Modal>
     <WorkspaceDocuments open={workspaceOpen} close={() => setWorkspaceOpen(false)} lang={lang} />
     <ModelProfilesModal
       open={profilesModalOpen}

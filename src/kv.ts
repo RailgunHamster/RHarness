@@ -90,8 +90,10 @@ export const KV = {
     config: record<ModelProfilesConfig>('model-profiles-config'),
   },
   /** First-class Memory plugin entries and Plugin Manager enabled/disabled state. */
+  browser: { paused: record<boolean>('browser-input-paused') },
   memory: {
     items: record<MemoryEntry[]>('memory-plugin-entries'),
+    deletions: record<Record<string, string>>('memory-plugin-deletions'),
   },
   plugins: {
     state: record<PluginRegistryState>('plugin-registry-state'),

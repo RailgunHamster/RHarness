@@ -1572,6 +1572,7 @@ export function PersonalAssistantSlotView(props: {
               </button>
             )}
           </div>
+          <details className="dt-assistant-options"><summary>{lang === 'zh' ? '对话选项' : 'Chat options'}</summary>
           <div className="dt-row-buttons">
             <Button size="sm" variant="outline" onClick={() => setPersonaWorkbenchOpen(true)} data-testid="assistant-persona-btn" title={lang === 'zh' ? '人设风格、表情包图库、已学默契、常驻城市与新闻感知（助理也能通过工具自己改）' : 'Persona, stickers, learnings, home city & news'}>
               {lang === 'zh' ? '🎭 人设·表情·感知' : '🎭 Persona'}
@@ -1637,7 +1638,7 @@ export function PersonalAssistantSlotView(props: {
             <Button size="sm" variant="outline" onClick={() => { setChatFullscreen(false); onSwitchToMemoryTab() }}>
               {lang === 'zh' ? `🧠 长期记忆库 (${memories.length} 条 · ${pinnedMemories.length} 常驻)` : `🧠 Memory Library (${memories.length})`}
             </Button>
-          </div>
+          </div></details>
         </div>
 
         {error && <p className="dt-error" role="status">{error}</p>}
@@ -1729,7 +1730,7 @@ export function PersonalAssistantSlotView(props: {
                 }}
                 placeholder={
                   lang === 'zh'
-                    ? '输入消息、粘贴截图或拖入图片…（若助理判断属于工程需求，将在总结后连同您的原话与原图一并递交工程对话）'
+                    ? '输入消息，或粘贴图片…'
                     : 'Write a message, paste a screenshot, or drop images…'
                 }
               />
@@ -1783,7 +1784,7 @@ export function PersonalAssistantSlotView(props: {
         {/* Assistant Conversation Stream */}
         <div className="dt-activity-toolbar dt-assistant-toolbar">
           <span className="dt-hint">
-            {lang === 'zh' ? `共 ${messages.length} 条对话记录（默认定位到最新消息）` : `${messages.length} messages (auto-following latest)`}
+            {lang === 'zh' ? `${messages.length} 条消息` : `${messages.length} messages`}
           </span>
           <div className="dt-row-buttons">
             {!follow && (

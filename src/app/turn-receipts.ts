@@ -69,6 +69,11 @@ export class TurnReceipts {
     }
   }
 
+  diagnostics() {
+    const row = this.db.prepare('SELECT state,created FROM turns ORDER BY created DESC,rowid DESC LIMIT 1').get()
+    return row ? { state: String(row.state), at: new Date(Number(row.created) * 1000).toISOString() } : null
+  }
+
   async close() {
     await Promise.allSettled(this.active)
     this.db.close()

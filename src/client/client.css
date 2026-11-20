@@ -715,3 +715,15 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
   .dt-record-index { flex-direction: row; max-height: 100px; }
   .dt-record-link { flex: none; max-width: 160px; }
 }
+.dt-assistant-options { position: relative; }
+.dt-assistant-options summary { cursor: pointer; font-size: 13px; color: var(--dsw-alias-label-secondary); padding: 8px; border-radius: 8px; }
+.dt-assistant-options[open] > .dt-row-buttons { position: absolute; right: 0; z-index: 12; width: min(320px, 80vw); box-sizing: border-box; padding: 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; background: var(--dsw-alias-bg-layer-1); box-shadow: var(--dsw-elevation-prominent); }
+@media (max-width: 680px) {
+  .dt-standalone-bar { position: relative; }
+  .dt-standalone-actions { flex-wrap: nowrap; overflow: visible; font-size: 12px; }
+  .dt-standalone-actions > .dt-btn, .dt-runtime-menu summary { padding-inline: 6px; font-size: 12px; }
+  .dt-assistant-stream { min-height: 125px; height: clamp(140px, 31dvh, 320px); max-height: none; }
+  .dt-assistant-header { position: relative; }
+  .dt-assistant-options { position: static; }
+  .dt-assistant-options[open] > .dt-row-buttons { left: 0; right: auto; }
+}

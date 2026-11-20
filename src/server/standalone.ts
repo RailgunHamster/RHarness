@@ -96,7 +96,7 @@ import {
   defaultMemories,
   evaluateMilestoneCountdown,
   extractDurableMemoryFromUserMessage,
-  formatPinnedMemoryPromptSection,
+  formatPinnedMemoryPromptSection, memoryScopeKey, visibleMemory, type MemoryAudience, type MemoryScope,
   getUpcomingMilestones,
   listAndPurgeMemoryBackups,
   replaceMemoryEntry,
@@ -120,7 +120,7 @@ import {
   type LearningEntry,
 } from '../app/lossless-and-learning.ts'
 import {
-  buildBrowserBridgeTools,
+  BrowserInputLease, buildBrowserBridgeTools,
   buildDataSqlPluginTools,
   buildProgressCardTools,
   buildToolSearchPluginTools,
@@ -214,6 +214,7 @@ import {
   type WorkerNodeRecord,
 } from '../app/worker-nodes.ts'
 import { WorkspaceRecords, RevisionConflict, draftInput, workspaceTools } from '../app/workspace-records.ts'
+import { nativeModelQueue } from '../app/model-queue.ts'
 import { TurnReceipts } from '../app/turn-receipts.ts'
 import { KV } from '../kv.ts'
 import { key, latestReport, threadKey, waitsForPerson, type Ticket } from '../core/index.ts'
@@ -511,6 +512,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   recoverStaleStateLock(stateDir)
 
   let turnReceipts: TurnReceipts | undefined
+  let browserInput: BrowserInputLease | undefined
+  const browserLease = () => browserInput ??= new BrowserInputLease(runtime.store.get(KV.browser.paused) ?? false)
   let workspace: WorkspaceRecords | undefined
   const workspaceRecords = () => workspace ??= new WorkspaceRecords(join(stateDir, 'workspace-records.sqlite'))
 
@@ -909,7 +912,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
                 'content-type': 'application/json',
                 'x-orchestrator-request': '1',
               },
-              body: JSON.stringify({ mode, memories }),
+              body: JSON.stringify({ mode, memories: memories.filter(m => m.scope !== 'device'), deletions: runtime.store.get(KV.memory.deletions) ?? {} }),
               signal: AbortSignal.timeout(4000),
             })
             if (res.ok) break
@@ -921,6 +924,16 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
 
   const setMemoryEntries = (next: MemoryEntry[], syncMode: 'merge' | 'replace' | 'none' = 'merge'): void => {
     if (!runtime) return
+    if (syncMode !== 'none') {
+      const current = getMemoryEntries()
+      const ids = new Set(next.map(item => item.id))
+      const deleted = { ...(runtime.store.get(KV.memory.deletions) ?? {}) }
+      const at = new Date().toISOString()
+      for (const item of current) if (!ids.has(item.id) && item.scope !== 'device') deleted[item.id] = at
+      // A deliberate restore advances the record past its replicated tombstone.
+      next = next.map(item => deleted[item.id] && item.updatedAt <= deleted[item.id]! ? { ...item, updatedAt: new Date(Math.max(Date.now(), Date.parse(deleted[item.id]!) + 1)).toISOString() } : item)
+      runtime.store.set(KV.memory.deletions, deleted)
+    }
     runtime.store.set(KV.memory.items, next)
     if (syncMode !== 'none') {
       void broadcastMemoriesStateToPeers(syncMode)
@@ -1231,13 +1244,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         return await new Promise<string>(() => {})
       }
       const { onToolResult: _onToolResult, ...nativeRequest } = effectiveReq
-      const { runCodexTurn, runCursorTurn, runDshTurn } = await import('../app/local-drivers.ts')
-      const out =
-        effectiveReq.provider === 'codex'
-          ? await runCodexTurn(nativeRequest)
-          : effectiveReq.provider === 'cursor'
-            ? await runCursorTurn(nativeRequest)
-            : await runDshTurn(nativeRequest)
+      const { runNativeModelTurn } = await import('../app/local-drivers.ts')
+      const out = await runNativeModelTurn(nativeRequest)
       recordUsageAfterTurn(out)
       return out
     },
@@ -2033,7 +2041,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           ].join('\n')
         },
       })
-      for (const bridgeTool of buildAssistantBridgeTools(() => runtime)) {
+      for (const bridgeTool of buildAssistantBridgeTools(() => runtime, id => workspaceRecords().list(id).filter(doc => doc.kind === 'report'))) {
         registerWithMirror(bridgeTool)
       }
       for (const pat of buildAssistantPersonaAmbientTools({
@@ -2068,8 +2076,16 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
 
     for (const spec of workspaceTools(workspaceRecords, agent.id)) registerWithMirror(spec)
     const role: 'assistant' | 'worker' = isAssistant ? 'assistant' : 'worker'
+    const memoryAudience = (): MemoryAudience => ({ role, project: repoDir, device: getDeviceIdentity().deviceId })
+    const sessionMemories = () => getMemoryEntries().filter(entry => visibleMemory(entry, memoryAudience()))
+    const writeSessionMemories = (next: MemoryEntry[]) => {
+      const hidden = getMemoryEntries().filter(entry => !visibleMemory(entry, memoryAudience()))
+      const privateIds = new Set(hidden.map(entry => entry.id))
+      if (next.some(entry => privateIds.has(entry.id))) throw new Error('Memory ID is outside this scope')
+      setMemoryEntries([...next, ...hidden])
+    }
     const readChatArchive = () => {
-      if (!runtime) return []
+      if (!runtime || !isAssistant) return []
       const all = runtime.store.get(KV.assistant.messages) ?? []
       return all.map(m => ({
         id: m.id,
@@ -2081,8 +2097,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       }))
     }
     const memTools = buildMemoryPluginTools(
-      getMemoryEntries,
-      setMemoryEntries,
+      sessionMemories,
+      writeSessionMemories,
       role,
       readChatArchive,
       removed => { archiveMemoriesToBackupDir(stateDir, removed, 'single-delete') },
@@ -2099,6 +2115,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         return undefined
       },
       removed => { archiveMemoriesToBackupDir(stateDir, removed, 'edit-replace') },
+      { audience: memoryAudience(), session: agent.id },
     )
     for (const t of memTools) {
       agent.ctx.tools?.register({
@@ -2227,7 +2244,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     )) {
       registerWithMirror(wrt)
     }
-    for (const bbt of buildBrowserBridgeTools(getRegisteredNodes, () => isPluginEnabled('dsh-browser-bridge'))) {
+    for (const bbt of buildBrowserBridgeTools(getRegisteredNodes, () => isPluginEnabled('dsh-browser-bridge'), { lease: browserLease(), session: agent.id })) {
       registerWithMirror(bbt)
     }
     for (const pct of buildProgressCardTools({
@@ -2277,7 +2294,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       text: () => {
         if (!isPluginEnabled('dsh-memory')) return ''
         if (!isAssistant || !runtime) {
-          return formatPinnedMemoryPromptSection(getMemoryEntries())
+          return formatPinnedMemoryPromptSection(sessionMemories())
         }
         const cfg = getAssistantContextConfig()
         const lcmCfg = runtime.store.get(KV.plugins.config('dsh-lossless-context')) ?? {}
@@ -2289,7 +2306,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         const afterReset = cfg.contextResetAt ? allMsgs.filter(m => m.at >= cfg.contextResetAt!) : allMsgs
         const activeCount = effectiveTail > 0 ? Math.min(afterReset.length, effectiveTail) : afterReset.length
         const archivedCount = Math.max(0, allMsgs.length - activeCount)
-        return formatPinnedMemoryPromptSection(getMemoryEntries(), {
+        return formatPinnedMemoryPromptSection(sessionMemories(), {
           archivedCount,
           totalCount: allMsgs.length,
           recentLimit: effectiveTail,
@@ -2587,10 +2604,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     }
     if (options.driver) return (await options.driver(reqObj)) ?? ''
     if (!liveAgents) return `[BTW Side Answer] ${question}`
-    const { runCodexTurn, runCursorTurn, runDshTurn } = await import('../app/local-drivers.ts')
-    if (sel.provider === 'codex') return await runCodexTurn(reqObj)
-    if (sel.provider === 'cursor') return await runCursorTurn(reqObj)
-    return await runDshTurn(reqObj)
+    const { runNativeModelTurn } = await import('../app/local-drivers.ts')
+    return await runNativeModelTurn(reqObj)
   }
 
   const registerSources = (rt: Runtime) => {
@@ -2818,6 +2833,30 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       try {
         await runtime.ready
 
+        if (sub === 'diagnostics' && req.method === 'GET') {
+          const catalog = await host.getCatalog()
+          const browser = await inspectLocalBrowserBridge()
+          const models = resolveActiveRoleModels()
+          const capabilities = (['assistant','eval','executor'] as const).map(role => {
+            const selection = models[role]
+            const available = Boolean(selection && catalog.groups.find(group => group.id === selection.provider)?.models.some(model => model.id === selection.model))
+            return { role, provider: selection?.provider, model: selection?.model, available }
+          })
+          sendJson(res, 200, {
+            build: currentBuild.shortCommit, platform: process.platform, nodeVersion: process.versions.node,
+            protocol: 1, lastReceipt: turnReceipts?.diagnostics() ?? null, modelQueue: nativeModelQueue.snapshot(),
+            models: capabilities, browserConnected: browser.connected, browserPaused: browserLease().paused,
+          })
+          return
+        }
+        if (sub === 'browser/control' && req.method === 'POST') {
+          const body = await readJsonBody(req)
+          if (typeof body.paused !== 'boolean') throw new Error('Expected a browser ownership decision')
+          browserLease().setPaused(body.paused)
+          runtime.store.set(KV.browser.paused, body.paused)
+          sendJson(res, 200, { paused: browserLease().paused })
+          return
+        }
         if (sub === 'workspace' && req.method === 'GET') {
           const id = url.searchParams.get('id')
           if (!id) sendJson(res, 200, { items: workspaceRecords().list() })
@@ -4041,17 +4080,26 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         if (req.method === 'POST' && sub === 'memories/sync') {
           const body = await readJsonBody(req, 5 * 1024 * 1024)
           const mode = body.mode === 'replace' ? 'replace' : 'merge'
-          const incoming = Array.isArray(body.memories) ? (body.memories as MemoryEntry[]) : []
-          if (mode === 'replace') {
-            setMemoryEntries(incoming, 'none')
-          } else if (incoming.length > 0) {
-            const current = getMemoryEntries()
+          const deleted = { ...(runtime.store.get(KV.memory.deletions) ?? {}) }
+          const replicated = Boolean(body.deletions && typeof body.deletions === 'object' && !Array.isArray(body.deletions))
+          if (replicated) {
+            for (const [id, at] of Object.entries(body.deletions as Record<string, unknown>)) {
+              if (/^[\w-]{1,160}$/.test(id) && typeof at === 'string' && Number.isFinite(Date.parse(at)) && (!Object.hasOwn(deleted, id) || deleted[id]! < at)) deleted[id] = at
+            }
+            runtime.store.set(KV.memory.deletions, deleted)
+          }
+          const survives = (m: MemoryEntry) => m.scope === 'device' || !Object.hasOwn(deleted, m.id) || m.updatedAt > deleted[m.id]!
+          const incoming = (Array.isArray(body.memories) ? (body.memories as MemoryEntry[]) : []).filter(m => m.scope !== 'device' && survives(m))
+          if (mode === 'replace' && !replicated) {
+            setMemoryEntries([...getMemoryEntries().filter(m => m.scope === 'device'), ...incoming], 'none')
+          } else if (incoming.length > 0 || replicated) {
+            const current = getMemoryEntries().filter(survives)
             const byKey = new Map<string, MemoryEntry>()
             for (const m of current) byKey.set(m.id, m)
             for (const m of incoming) {
               // Match either by id or by normalized title
               const dupTitleEntry = [...byKey.values()].find(
-                e => e.id !== m.id && e.title.trim().toLowerCase() === m.title.trim().toLowerCase(),
+                e => e.id !== m.id && (e.scope ?? 'shared') === (m.scope ?? 'shared') && e.scopeKey === m.scopeKey && e.title.trim().toLowerCase() === m.title.trim().toLowerCase(),
               )
               if (dupTitleEntry) {
                 const winner = m.updatedAt >= dupTitleEntry.updatedAt ? m : dupTitleEntry
@@ -4261,7 +4309,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
               milestone = { targetDate: td, recurrence: rec, leadDays: ld.length ? ld : [...DEFAULT_MILESTONE_LEAD_DAYS] }
             }
           }
+          const scope = (['personal','project','device','role','shared'] as MemoryScope[]).find(value => value === body.scope)
           const { entry, list } = saveMemoryEntry(getMemoryEntries(), {
+            ...(scope ? { scope, scopeKey: memoryScopeKey(scope, { role: 'assistant', project: repoDir, device: getDeviceIdentity().deviceId }) } : {}),
+            provenance: { reference: 'panel', verifiedAt: new Date().toISOString() },
             ...(typeof body.id === 'string' && body.id.trim() ? { id: body.id.trim() } : {}),
             title,
             content,

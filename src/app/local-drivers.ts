@@ -13,10 +13,24 @@ import { delimiter, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { zstdDecompressSync } from 'node:zlib'
+import { nativeModelQueue } from './model-queue.ts'
 import { codexTurnContent, dshTurnContent, localMessageImages } from './local-images.ts'
 import type { RegisteredToolSpec, SessionTurnMessage } from './standalone-host.ts'
 import { assistantText, createCodexEventCollector, createCursorEventCollector, createDshEventCollector, projectLiveTrace, type LiveTraceStep, type SessionExecutionEvent } from './session-events.ts'
 export type { LiveTraceStep } from './session-events.ts'
+
+const providerEndpoints = new Map<string, string>()
+
+export function runNativeModelTurn(input: Parameters<typeof runDshTurn>[0]): Promise<string> {
+  const endpoint = providerEndpoints.get(input.provider) ?? input.provider
+  const foreground = !input.sessionId?.startsWith('worker-')
+  return nativeModelQueue.run(endpoint, foreground, input.signal, () => {
+    if (input.provider === 'codex') return runCodexTurn(input)
+    if (input.provider === 'cursor') return runCursorTurn(input)
+    if (input.provider === 'human') throw new Error('Human sessions require the Session Console')
+    return runDshTurn(input)
+  })
+}
 
 export interface CatalogEffort {
   id: string
@@ -163,7 +177,11 @@ export async function applyLiveDshPatchOverlay(base: DiscoveredCatalog): Promise
 
     const nextGroups = base.groups.map(g => ({ ...g, models: [...g.models] }))
 
+    providerEndpoints.clear()
     for (const [providerId, spec] of Object.entries(rawProviders)) {
+      if (spec?.baseURL) {
+        try { providerEndpoints.set(providerId, new URL(spec.baseURL).origin) } catch {}
+      }
       if (!spec || !Array.isArray(spec.models) || spec.models.length === 0) continue
       // Only replace the full model list for custom API providers (those with baseURL or api specified)
       const isCustomProvider = Boolean(spec.baseURL || spec.api)

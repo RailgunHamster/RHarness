@@ -31,3 +31,46 @@ it('binds an approval to the displayed revision, account and payload before star
   expect((await records.decide(next.id, 1, true, async () => { throw new Error('response lost') })).state).toBe('uncertain')
   await expect(records.decide(next.id, 1, true, perform)).rejects.toThrow(/reviewed/)
 })
+
+it('orders shared-endpoint turns, removes a cancelled waiter and allows another endpoint to proceed', async () => {
+  const { ModelQueue } = await import('../src/app/model-queue.ts')
+  const gate = new ModelQueue(1)
+  const signal = new AbortController().signal
+  let release!: () => void
+  const busy = gate.run('shared', false, signal, () => new Promise<void>(resolve => { release = resolve }))
+  await Promise.resolve()
+  const order: string[] = []
+  const work = gate.run('shared', false, signal, async () => { order.push('worker') })
+  const chat = gate.run('shared', true, signal, async () => { order.push('assistant') })
+  const controller = new AbortController()
+  const cancelled = gate.run('shared', true, controller.signal, async () => { order.push('cancelled') })
+  controller.abort()
+  await expect(cancelled).rejects.toThrow()
+  await gate.run('other', false, signal, async () => { order.push('independent') })
+  release()
+  await Promise.all([busy,work,chat])
+  expect(order).toEqual(['independent','assistant','worker'])
+})
+
+it('requires a fresh observation after the browser is handed back', async () => {
+  const { BrowserInputLease } = await import('../src/app/research-and-ux-plugins.ts')
+  const lease = new BrowserInputLease()
+  const old = lease.observation()
+  lease.setPaused(true)
+  await expect(lease.run('a', async () => {})).rejects.toThrow(/user/)
+  lease.setPaused(false); lease.record('a', old)
+  await expect(lease.run('a', async () => {})).rejects.toThrow(/Refresh/)
+  lease.record('a', lease.observation())
+  expect(await lease.run('a', async () => 'ok')).toBe('ok')
+})
+
+it('separates same-title memories by scope, records provenance and preserves supersession', async () => {
+  const { saveMemoryEntry, visibleMemory, replaceMemoryEntry } = await import('../src/app/memory-plugin.ts')
+  const common = { title: 'Location', content: 'Example' }
+  const personal = saveMemoryEntry([], { ...common, scope: 'personal' })
+  const project = saveMemoryEntry(personal.list, { ...common, scope: 'project', scopeKey: 'p', provenance: { reference: 'worker-1', verifiedAt: new Date().toISOString() } })
+  const audience = { role: 'worker' as const, project: 'p', device: 'b' }
+  expect(project.list.filter(entry => visibleMemory(entry, audience))).toEqual([project.entry])
+  const replacement = replaceMemoryEntry(project.list, project.entry.id, { content: 'Revised' })
+  expect(replacement.entry).toMatchObject({ supersedes: project.entry.id, scopeKey: 'p', provenance: project.entry.provenance })
+})

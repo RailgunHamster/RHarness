@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { runCodexTurn, runCursorTurn, runDshTurn } from './local-drivers.ts'
+import { runNativeModelTurn } from './local-drivers.ts'
 import { buildNodeCandidateEndpoints, detectLocalAddressFacts } from './device-group.ts'
 import type { RegisteredToolSpec, SessionTurnMessage } from './standalone-host.ts'
 import { inspectTicketWorktree } from './worktree-merge.ts'
@@ -521,12 +521,8 @@ export async function handleIncomingRemoteTurn(
   let replyText = ''
   if (options.customDriver) {
     replyText = (await options.customDriver(req)) ?? ''
-  } else if (body.provider === 'codex') {
-    replyText = await runCodexTurn(req)
-  } else if (body.provider === 'cursor') {
-    replyText = await runCursorTurn(req)
   } else {
-    replyText = await runDshTurn(req)
+    replyText = await runNativeModelTurn(req)
   }
 
   const finalSnap = snapshotRemoteWorktree()

@@ -44,7 +44,24 @@ export interface MilestoneCountdownStatus {
   stageLabel: string
 }
 
+export type MemoryScope = 'shared' | 'personal' | 'project' | 'device' | 'role'
+export interface MemoryAudience { role: 'assistant' | 'worker'; project: string; device: string }
+
+export function memoryScopeKey(scope: MemoryScope, audience: MemoryAudience) {
+  return scope === 'project' ? audience.project : scope === 'device' ? audience.device : scope === 'role' ? audience.role : ''
+}
+
+export function visibleMemory(entry: MemoryEntry, audience: MemoryAudience): boolean {
+  if (!entry.scope || entry.scope === 'shared') return true
+  if (entry.scope === 'personal') return audience.role === 'assistant'
+  return entry.scopeKey === memoryScopeKey(entry.scope, audience)
+}
+
 export interface MemoryEntry {
+  scope?: MemoryScope
+  scopeKey?: string
+  provenance?: { reference: string; verifiedAt: string }
+  supersedes?: string
   id: string
   title: string
   content: string
@@ -416,6 +433,9 @@ export function saveMemoryEntry(
     id?: string
     title: string
     content: string
+    scope?: MemoryScope
+    scopeKey?: string
+    provenance?: MemoryEntry['provenance']
     category?: MemoryCategory
     tags?: string[]
     pinned?: boolean
@@ -426,7 +446,8 @@ export function saveMemoryEntry(
   const now = new Date().toISOString()
   const existingIdx = input.id
     ? entries.findIndex(e => e.id === input.id)
-    : entries.findIndex(e => e.title.trim().toLowerCase() === input.title.trim().toLowerCase())
+    : entries.findIndex(e => e.title.trim().toLowerCase() === input.title.trim().toLowerCase()
+      && (e.scope ?? 'shared') === (input.scope ?? 'shared') && (e.scopeKey ?? '') === (input.scopeKey ?? ''))
 
   const prev = existingIdx >= 0 ? entries[existingIdx] : undefined
   const resolvedMilestone =
@@ -435,6 +456,9 @@ export function saveMemoryEntry(
       : (input.milestone ?? prev?.milestone)
 
   const entry: MemoryEntry = {
+    ...prev,
+    ...(input.scope ? { scope: input.scope, scopeKey: input.scopeKey ?? '' } : {}),
+    ...(input.provenance ? { provenance: input.provenance } : {}),
     id: prev?.id ?? input.id ?? `mem-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     title: input.title.trim() || '未命名记忆',
     content: input.content.trim(),
@@ -443,6 +467,7 @@ export function saveMemoryEntry(
     pinned: input.pinned ?? prev?.pinned ?? false,
     source: input.source ?? prev?.source ?? 'user',
     ...(resolvedMilestone ? { milestone: resolvedMilestone } : {}),
+    ...(resolvedMilestone === undefined && prev?.milestone ? { milestone: undefined } : {}),
     createdAt: prev?.createdAt ?? now,
     updatedAt: now,
   }
@@ -482,6 +507,7 @@ export function replaceMemoryEntry(
   const milestone = input.milestone === null ? undefined : (input.milestone ?? old.milestone)
   const entry: MemoryEntry = {
     id: `mem-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    scope: old.scope, scopeKey: old.scopeKey, supersedes: old.id, provenance: old.provenance,
     title,
     content,
     category: input.category ?? (milestone ? 'milestone' : old.category),
@@ -699,6 +725,7 @@ export function consolidateMemories(
     const normTitle = item.title.trim().toLowerCase().replace(/\s+/g, ' ')
     const dupIdx = deduped.findIndex(existing => {
       const exTitle = existing.title.trim().toLowerCase().replace(/\s+/g, ' ')
+      if ((existing.scope ?? 'shared') !== (item.scope ?? 'shared') || existing.scopeKey !== item.scopeKey) return false
       if (exTitle === normTitle) return true
       if (existing.category === item.category && existing.content.trim() === item.content.trim()) return true
       return false
@@ -832,9 +859,12 @@ export function buildMemoryPluginTools(
   archiveDeleted?: (removed: MemoryEntry[]) => void,
   federatedNotesSearch?: (query: string) => Promise<{ count: number; items: unknown[] } | undefined>,
   archiveReplaced?: (removed: MemoryEntry[]) => void,
+  context?: { audience: MemoryAudience; session: string },
 ): RegisteredToolSpec[] {
   const saveSchema = z.object({
     id: z.string().optional().describe('Optional existing memory ID to update.'),
+    scope: z.enum(['personal', 'project', 'device', 'role', 'shared']).optional(),
+    evidence: z.string().max(300).optional().describe('Source message, document or ticket reference.'),
     title: z.string().min(1).max(160).describe('Concise title of the memory entry.'),
     content: z.string().min(1).max(4000).describe('Fact, preference, or note to remember across sessions.'),
     category: z.enum(['preference', 'device', 'project', 'fact', 'episodic', 'milestone']).optional().describe('Memory category ("milestone" for birthdays, anniversaries, or annual renewals).'),
@@ -867,8 +897,12 @@ export function buildMemoryPluginTools(
               leadDays: args.lead_days?.length ? args.lead_days : [...DEFAULT_MILESTONE_LEAD_DAYS],
             }
           : undefined
+        const existing = args.id ? readEntries().find(entry => entry.id === args.id) : undefined
+        const scope = args.scope ?? existing?.scope ?? (context ? (role === 'assistant' ? 'personal' : 'project') : 'shared')
+        if (scope === 'personal' && role !== 'assistant') throw new Error('Personal memory belongs to the assistant')
         const { entry, list } = saveMemoryEntry(readEntries(), {
-          ...args,
+          ...args, scope, scopeKey: context ? memoryScopeKey(scope, context.audience) : '',
+          ...(context ? { provenance: { reference: args.evidence || context.session, verifiedAt: new Date().toISOString() } } : {}),
           ...(milestone ? { category: 'milestone', milestone } : {}),
           source: role,
         })
@@ -904,6 +938,7 @@ export function buildMemoryPluginTools(
           count: items.length,
           items: items.slice(0, 25),
           ...(siyuanNotesMatched ? { siyuanNotesMatched } : {}),
+          ...(args.query?.trim() && readChatArchive ? { messages: readChatArchive().filter(message => message.text.toLowerCase().includes(args.query!.trim().toLowerCase())).slice(-8).map(message => ({ id: message.id, at: message.at, excerpt: message.text.slice(0, 360) })) } : {}),
         }
       },
     },

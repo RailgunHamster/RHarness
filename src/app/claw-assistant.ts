@@ -589,6 +589,7 @@ export async function forwardAssistantMessageToEngineering(
     summary?: string
     originalText?: string
     contextNote?: string
+    contract?: Partial<Record<'constraints' | 'evidence' | 'dependencies' | 'acceptance', string[]>>
     conversation?: string
     sender?: string
   },
@@ -646,6 +647,7 @@ export async function forwardAssistantMessageToEngineering(
   // 3. User's original images attached in `content`
   const combinedText = [
     `**【个人助理转交总结】**\n${summary}`,
+    ...Object.entries(input.contract ?? {}).filter(([, lines]) => lines?.length).map(([field, lines]) => field + '\n' + lines!.map(line => '- ' + line).join('\n')),
     `**【附：用户给个人助理的原话${imageCount > 0 ? `（含 ${imageCount} 张原图）` : ''}】**\n${originalText}`,
   ].join('\n\n')
 
@@ -711,9 +713,13 @@ export async function forwardAssistantMessageToEngineering(
   return resolveHandoffStatus(rt, handoff)
 }
 
-export function buildAssistantBridgeTools(getRuntime: () => Runtime | undefined): RegisteredToolSpec[] {
+export function buildAssistantBridgeTools(getRuntime: () => Runtime | undefined, reports?: (sessionId: string) => unknown): RegisteredToolSpec[] {
   const forwardSchema = z.object({
     summary: z.string().min(1).max(600).describe('Brief summary of the engineering task distilled from your conversation with the user.'),
+    contract: z.object({
+      constraints: z.array(z.string().max(400)).max(8).optional(), evidence: z.array(z.string().max(400)).max(8).optional(),
+      dependencies: z.array(z.string().max(400)).max(8).optional(), acceptance: z.array(z.string().max(400)).max(8).optional(),
+    }).optional().describe('Optional user constraints, references, dependencies and acceptance criteria. Worker owns implementation.'),
     context_note: z.string().max(600).optional().describe('Optional context facts from memory or conversation, such as which machine/node or directory path the target repository or service lives on.'),
     message_ids: z.array(z.string()).optional().describe('Optional IDs of the user message(s) in this conversation; their verbatim original text and original images will be automatically attached and sent to Engineering Chat.'),
     original_message_id: z.string().optional().describe('Optional single user message ID being forwarded.'),
@@ -729,6 +735,27 @@ export function buildAssistantBridgeTools(getRuntime: () => Runtime | undefined)
 
   return [
     {
+      name: 'assistant_ticket_status',
+      description: 'Read current handoffs, worker questions, report references and progress without dispatch. Ordinals are 1-based, newest handoff first. If multiple titles match, show choices.',
+      parameters: z.toJSONSchema(z.object({ query: z.string().max(160).optional(), ordinal: z.number().int().positive().optional() })),
+      execute: async raw => {
+        const rt = getRuntime()
+        if (!rt) throw new Error('Engineering runtime unavailable')
+        const args = z.object({ query: z.string().optional(), ordinal: z.number().int().positive().optional() }).parse(raw ?? {})
+        const seen = new Set<string>()
+        const candidates = (rt.store.get(KV.assistant.messages) ?? []).slice().reverse().flatMap(message => {
+          if (!message.handoff || seen.has(message.handoff.triggerId)) return []
+          seen.add(message.handoff.triggerId)
+          return [resolveHandoffStatus(rt, message.handoff)]
+        }).map((status, index) => ({
+          ordinal: index + 1, title: status.ticketTitle || status.summary, ticketId: status.ticketId, state: status.ticketState ?? status.state,
+          question: status.attentionQuestion, report: status.reportSummary, node: status.nodeName, at: status.updatedAt,
+          documents: status.sessionId ? reports?.(status.sessionId) : undefined,
+        }))
+        return candidates.filter(row => (!args.ordinal || row.ordinal === args.ordinal) && (!args.query || (row.title + ' ' + (row.ticketId ?? '')).toLowerCase().includes(args.query.toLowerCase()))).slice(0, 24)
+      },
+    },
+    {
       name: 'assistant_forward_to_engineering',
       description: 'When a conversation with the user requires engineering or code changes, call this tool with a brief `summary`. It automatically attaches the user\'s verbatim original words and original images and sends them into Engineering Chat (`工程对话`) for Engineering Eval.',
       parameters: z.toJSONSchema(forwardSchema),
@@ -738,6 +765,7 @@ export function buildAssistantBridgeTools(getRuntime: () => Runtime | undefined)
         const args = forwardSchema.parse(rawArgs ?? {})
         const status = await forwardAssistantMessageToEngineering(rt, {
           summary: args.summary,
+          ...(args.contract ? { contract: args.contract } : {}),
           ...(args.context_note ? { contextNote: args.context_note } : {}),
           ...(args.message_ids ? { messageIds: args.message_ids } : {}),
           ...(args.original_message_id ? { originalMessageId: args.original_message_id } : {}),

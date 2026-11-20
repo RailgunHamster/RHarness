@@ -330,9 +330,32 @@ export async function inspectLocalBrowserBridge(customPort?: number): Promise<Br
   return { connected: false, tabCount: 0, tabs: [] }
 }
 
+/** Coordinates foreground browser access and invalidates pre-takeover observations. */
+export class BrowserInputLease {
+  private epoch = 0
+  private active?: AbortController
+  private observed = new Map<string, number>()
+  constructor(public paused = false) {}
+  setPaused(value: boolean) {
+    if (this.paused !== value) { this.paused = value; this.epoch++; this.observed.clear(); this.active?.abort() }
+  }
+  observation() { return this.epoch }
+  record(session: string, epoch: number) { if (!this.paused && epoch === this.epoch) this.observed.set(session, epoch) }
+  async run<T>(session: string, perform: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    if (this.paused) throw new Error('The user has taken browser control')
+    if (this.active) throw new Error('Another browser operation is in progress')
+    if (this.epoch && this.observed.get(session) !== this.epoch) throw new Error('Refresh local browser_tabs after user takeover')
+    const active = new AbortController()
+    this.active = active
+    try { return await perform(active.signal) }
+    finally { this.active = undefined }
+  }
+}
+
 export function buildBrowserBridgeTools(
   getNodes: () => readonly WorkerNodeRecord[],
   isEnabled: () => boolean,
+  input?: { lease: BrowserInputLease; session: string },
 ): RegisteredToolSpec[] {
   const tabsSchema = z.object({
     node: z.enum(['auto', 'local', 'claw']).optional().describe('Target machine Chrome ("auto" checks local first then claw).'),
@@ -351,7 +374,9 @@ export function buildBrowserBridgeTools(
         if (!isEnabled()) throw new Error('Browser Bridge plugin (dsh-browser-bridge) is disabled')
         const args = tabsSchema.parse(rawArgs ?? {})
         if (args.node !== 'claw') {
+          const epoch = input?.lease.observation()
           const local = await inspectLocalBrowserBridge()
+          if (local.connected && epoch !== undefined) input?.lease.record(input.session, epoch)
           if (local.connected || args.node === 'local') {
             return { ok: local.connected, host: 'local', ...local }
           }
@@ -387,26 +412,24 @@ export function buildBrowserBridgeTools(
       execute: async (rawArgs: unknown) => {
         if (!isEnabled()) throw new Error('Browser Bridge plugin (dsh-browser-bridge) is disabled')
         const args = openSchema.parse(rawArgs ?? {})
-        const authHeader = loadBrowserRelayAuthHeader()
-        for (const port of [9222, 18799]) {
-          try {
+        if (!['http:', 'https:'].includes(new URL(args.url).protocol)) throw new Error('Expected an HTTP or HTTPS URL')
+        const open = async (signal: AbortSignal) => {
+          const observed = await inspectLocalBrowserBridge()
+          signal.throwIfAborted()
+          if (!observed.connected || !observed.endpoint) throw new Error('Local browser bridge is offline')
+          const port = Number(new URL(observed.endpoint).port)
+          const authHeader = loadBrowserRelayAuthHeader()
             const headers: Record<string, string> = {}
             if (port === 18799 && authHeader) headers.authorization = authHeader
             const res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(args.url)}`, {
               method: 'PUT',
               headers,
-              signal: AbortSignal.timeout(4000),
+              signal: AbortSignal.any([signal, AbortSignal.timeout(4000)]),
             })
-            if (res.ok) {
-              const tab = await res.json()
-              return { ok: true, endpoint: `http://127.0.0.1:${port}`, tab }
-            }
-          } catch {}
+            if (!res.ok) throw new Error('Browser rejected the request (' + res.status + ')')
+            return { ok: true, endpoint: observed.endpoint, tab: await res.json() }
         }
-        return {
-          ok: false,
-          error: 'Signed-in Chrome CDP/Relay is not listening on :9222 or :18799',
-        }
+        return input ? input.lease.run(input.session, open) : open(AbortSignal.timeout(8000))
       },
     },
   ]
