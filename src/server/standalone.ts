@@ -6643,7 +6643,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             display: 'standalone',
             orientation: 'portrait-primary',
             background_color: '#f8fafc',
-            theme_color: '#2563eb',
+            theme_color: '#ffffff',
             icons: [
               {
                 src: '/favicon.svg',
@@ -6687,7 +6687,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <meta name="theme-color" content="#2563eb" />
+  <meta name="theme-color" content="#ffffff" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <meta name="apple-mobile-web-app-title" content="RHarness" />
@@ -6703,8 +6703,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       --dsw-alias-bg-layer-1: #ffffff;
       --dsw-alias-bg-layer-2: #ffffff;
       --dsw-alias-bg-layer-3: #f1f5f9;
-      --dsw-alias-bg-module-platform: #f1f5f9;
-      --dsw-alias-bg-mask-1: rgba(15, 23, 42, 0.35);
+      --dsw-alias-bg-module-platform: #f4f7fb;
+      --dsw-alias-bg-mask-1: rgba(177, 193, 212, 0.44);
       --dsw-mask-blur: blur(4px);
       --dsw-alias-label-primary: #0f172a;
       --dsw-alias-label-primary-foreground: #ffffff;
@@ -6719,7 +6719,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       --dsw-alias-link: #2563eb;
       --dsw-alias-button-primary-fill: #2563eb;
       --dsw-alias-button-primary-hover: #1d4ed8;
-      --dsw-alias-button-ghost-active-fill: #eff6ff;
+      --dsw-alias-button-ghost-active-fill: #e7f0ff;
       --dsw-alias-button-ghost-active-border: #93c5fd;
       --dsw-alias-interactive-bg-hover: #f1f5f9;
       --dsw-alias-interactive-bg-active: #e2e8f0;

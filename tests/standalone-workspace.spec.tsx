@@ -228,7 +228,7 @@ it('formats non-today timestamps with Chinese year-month-day and opens/closes fu
   })
   expect(document.querySelector('.dt-modal.dt-fullscreen-modal')).toBeNull()
 
-  // Clicking the dark translucent backdrop (.dt-modal-mask) on the sides also closes the expanded modal
+  // Clicking the modal backdrop (.dt-modal-mask) on the sides also closes the expanded modal
   await act(async () => { fullBtn.click() })
   expect(document.querySelector('.dt-modal.dt-fullscreen-modal')).not.toBeNull()
   const mask = document.querySelector<HTMLElement>('.dt-modal-mask')!

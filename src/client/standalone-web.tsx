@@ -1539,7 +1539,7 @@ function MemoryAndPluginsSection({
       footer={
         <div className="dt-live-head" style={{ width: '100%' }}>
           <span className="dt-hint">
-            {pluginPanelFeedback || (lang === 'zh' ? '点击左右暗色背景或按 ESC 即可关闭面板' : 'Click dark backdrop or press ESC to close')}
+            {pluginPanelFeedback || (lang === 'zh' ? '点击面板外或按 Esc 关闭' : 'Click outside the panel or press Esc to close')}
           </span>
           <div className="dt-row-buttons">
             <Button
@@ -2426,7 +2426,7 @@ function MarkdownReaderModal({
       description={
         doc
           ? `${doc.path}${doc.sourceNode ? ` · 🖥 来源节点：${doc.sourceNode}` : ''} · ${lineCount} 行 · ${formatSmartTimestamp(doc.updatedAt, lang)}`
-          : (lang === 'zh' ? '点击左右半透明暗色背景、按 ESC 或点击关闭按钮即可退出' : 'Click dark backdrop or press ESC to close')
+          : (lang === 'zh' ? '点击文档外、按 Esc 或使用关闭按钮退出' : 'Click outside the document or press Esc to close')
       }
       footer={
         <div className="dt-live-head" style={{ width: '100%' }}>

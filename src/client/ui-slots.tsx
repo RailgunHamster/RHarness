@@ -2406,7 +2406,7 @@ export function PersonalAssistantSlotView(props: {
                 : ''
             }
             closeLabel={lang === 'zh' ? '关闭 (ESC)' : 'Close (ESC)'}
-            description={lang === 'zh' ? '点击左右半透明暗色背景、按 ESC 键或点击关闭按钮即可退出' : 'Click the dark backdrop, press ESC, or click close to exit'}
+            description={lang === 'zh' ? '点击面板外、按 Esc 或使用关闭按钮退出' : 'Click outside the panel, press Esc, or use the close button'}
             footer={
               <div className="dt-row-buttons">
                 {fullMsg && !fullBot && !fullMsg.handoff && (
