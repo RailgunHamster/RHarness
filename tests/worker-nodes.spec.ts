@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { startStandaloneServer } from '../src/server/standalone.ts'
+import { TurnReceipts, turnReceiptKey } from '../src/app/turn-receipts.ts'
+import { DatabaseSync } from 'node:sqlite'
 import { buildNodeCandidateEndpoints } from '../src/app/device-group.ts'
 import { defaultModelProfilesConfig, resolveEffectiveModelProfile } from '../src/app/model-profiles.ts'
 import { selectWorkerNode, syncRemoteNodeGitBranch, type WorkerNodeRecord } from '../src/app/worker-nodes.ts'
@@ -13,6 +15,39 @@ function git(cwd: string, args: string[]) {
 }
 
 describe('distributed LAN worker nodes and P2P Git fast-forward merge', () => {
+  it('deduplicates execution, pages ordered events and recovers a durable receipt after restart', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'turn-receipts-'))
+    const path = join(root, 'turns.sqlite')
+    const body = { sessionId: 'worker-one', messages: [], provider: 'test', model: 'offline', systemPrompt: '', toolDefs: [] }
+    const key = turnReceiptKey('owner', body)
+    let journal = new TurnReceipts(path)
+    try {
+      const execute = vi.fn(async (emit: (e: { type: string; data: unknown }) => void) => {
+        for (let i = 0; i < 70; i++) emit({ type: 'progress', data: i })
+        return { replyText: 'done', events: [] }
+      })
+      expect(journal.start(key, body, execute)).toBe(true)
+      expect(journal.start(key, body, execute)).toBe(true)
+      expect(journal.start(key, { ...body, model: 'changed' }, execute)).toBe(false)
+      await journal.close()
+      const db = new DatabaseSync(path)
+      db.prepare("INSERT INTO turns VALUES ('interrupted','digest','running',NULL,NULL,unixepoch())").run()
+      db.close()
+      journal = new TurnReceipts(path)
+      expect(journal.read('interrupted', 0)?.state).toBe('uncertain')
+      expect(journal.start(key, body, execute)).toBe(true)
+      expect(execute).toHaveBeenCalledTimes(1)
+      expect(journal.read(key, 0)).toMatchObject({ cursor: 64, more: true })
+      const final = journal.read(key, 64)
+      expect(final).toMatchObject({ cursor: 70, more: false, result: { replyText: 'done' } })
+      expect(final?.events.map(event => event.data)).toEqual([64,65,66,67,68,69])
+      expect(journal.read(turnReceiptKey('another owner', body), 0)).toBeUndefined()
+    } finally {
+      await journal.close()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('derives peer candidate ports from the peer endpoint instead of leaking to the production default port', () => {
     // Regression: ephemeral test servers share the host/IP/hostname with a production server on :4318.
     // Derived LAN/hostname/Tailscale candidates must reuse the peer's real (ephemeral) port so peer

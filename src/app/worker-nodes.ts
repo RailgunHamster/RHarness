@@ -12,6 +12,8 @@
  *      machine, runs the local provider/model (`dsh`, `codex`, `cursor`), streams events, commits changes, and returns
  *      the branch ref so the Hub can `git fetch <remoteRepoUrl> agent/<branch>` and fast-forward merge into `main`.
  */
+import { randomBytes } from 'node:crypto'
+import { requestRemoteTurn, turnReceiptKey } from './turn-receipts.ts'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
@@ -251,6 +253,7 @@ export function syncRemoteNodeGitBranch(input: {
  */
 export async function dispatchTurnToRemoteNode(input: {
   node: WorkerNodeRecord
+  receiptSecret?: string
   hubUrl: string
   hubEndpoints?: string[]
   sessionId: string
@@ -309,34 +312,10 @@ export async function dispatchTurnToRemoteNode(input: {
     ...(input.hubEndpoints?.length ? { hubEndpoints: input.hubEndpoints } : {}),
   }
 
-  let payload: (RemoteTurnResponseBody & { error?: string }) | undefined
-  let lastError: Error | undefined
-  for (const candidateUrl of candidates) {
-    const baseUrl = candidateUrl.replace(/\/+$/, '')
-    try {
-      const res = await fetch(`${baseUrl}/orchestrator/standalone/worker-node/execute`, {
-        method: 'POST',
-        signal: input.signal,
-        headers: {
-          'content-type': 'application/json',
-          'x-orchestrator-request': '1',
-        },
-        body: JSON.stringify(body),
-      })
-      const data = await res.json() as RemoteTurnResponseBody & { error?: string }
-      if (!res.ok) {
-        throw new Error(data.error ?? `Remote worker node ${input.node.id} failed (${res.status})`)
-      }
-      payload = data
-      break
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err))
-      if (input.signal.aborted) throw lastError
-    }
-  }
-  if (!payload) {
-    throw lastError ?? new Error(`All endpoints unreachable for worker node ${input.node.id}: ${candidates.join(', ')}`)
-  }
+  const payload = await requestRemoteTurn({
+    candidates, body, signal: input.signal, onEvent: input.onEvent,
+    key: turnReceiptKey(input.receiptSecret ?? randomBytes(32).toString('hex'), body),
+  })
   for (const ev of payload.events ?? []) {
     input.onEvent(ev.type, ev.data)
   }
@@ -361,6 +340,7 @@ export async function handleIncomingRemoteTurn(
   options: {
     stateDir: string
     repoRoot: string
+    onEvent?: (event: { type: string; data: unknown }) => void
     localExecuteTool?: (sessionId: string, name: string, args: unknown) => Promise<unknown>
     customDriver?: (req: {
       sessionId: string
@@ -521,7 +501,8 @@ export async function handleIncomingRemoteTurn(
 
   const abort = new AbortController()
   const onEvent = (type: string, data: unknown) => {
-    events.push({ type, data })
+    if (options.onEvent) options.onEvent({ type, data })
+    else events.push({ type, data })
   }
 
   const req = {

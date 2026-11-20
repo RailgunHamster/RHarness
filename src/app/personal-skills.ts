@@ -6,10 +6,10 @@
  * (or environment variables), keeping the public codebase completely free of personal topology details.
  */
 import { execFile, execFileSync, spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
-import { homedir } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { Duplex } from 'node:stream'
@@ -1821,16 +1821,20 @@ export async function executePersonalSkillLocal(
 /**
  * Executes a personal business skill locally if on `claw`, or transparently proxies over HTTP to `claw` node.
  */
-export async function executePersonalSkillWithRemoteFallback(
-  toolName: string,
-  args: Record<string, unknown>,
-  getNodes: () => readonly WorkerNodeRecord[],
-): Promise<unknown> {
-  if (hasLocalClawPersonalAssets()) {
-    return await executePersonalSkillLocal(toolName, args)
-  }
+export function needsWriteReview(name: string, args: Record<string, unknown>): boolean {
+  return name === 'todo_write' || name === 'feishu_send_dm' || (name === 'calendar_add' && args.action !== 'status')
+    || (name === 'orders_report' && (args.action === 'add' || args.recompute === true))
+    || (name === 'interest_dedup' && Boolean(args.append_title)) || name === 'pdf_archive'
+}
 
-  // Find the online hub/personal node (by tag/name or fallback to any remote online node)
+export function localPersonalTarget(): string {
+  const cred = loadStandaloneFeishuCredentials()
+  const fingerprint = createHash('sha256').update(JSON.stringify([hostname(), cred?.appId, cred?.ownerOpenId,
+    cred?.dmChatId, CLAW_PATHS.ordersDir, CLAW_PATHS.interestsCsv, CLAW_PATHS.pdfDedupIndex])).digest('hex').slice(0, 20)
+  return hostname() + '/' + fingerprint
+}
+
+function personalEndpoints(getNodes: () => readonly WorkerNodeRecord[]): string[] {
   const nodes = getNodes().filter(n => n.id !== 'local' && n.status === 'online' && n.url !== 'local')
   const hubNode =
     nodes.find(
@@ -1846,8 +1850,36 @@ export async function executePersonalSkillWithRemoteFallback(
     ...CLAW_PATHS.peerFallbackEndpoints,
   ]
 
+  return [...new Set(candidateUrls)]
+}
+
+export async function resolvePersonalTarget(getNodes: () => readonly WorkerNodeRecord[]): Promise<string> {
+  if (hasLocalClawPersonalAssets()) return localPersonalTarget()
+  for (const base of personalEndpoints(getNodes)) {
+    try {
+      const res = await fetch(base.replace(/\/+$/, '') + '/orchestrator/standalone/personal-skills/execute', { method: 'HEAD', signal: AbortSignal.timeout(2500) })
+      const target = res.headers.get('x-personal-target')
+      if (res.ok && target) return target
+    } catch {}
+  }
+  throw new Error('Personal connector identity unavailable')
+}
+
+export async function executePersonalSkillWithRemoteFallback(
+  toolName: string, args: Record<string, unknown>, getNodes: () => readonly WorkerNodeRecord[], expectedTarget?: string,
+): Promise<unknown> {
+  if (hasLocalClawPersonalAssets()) {
+    if (expectedTarget && expectedTarget !== localPersonalTarget()) throw new Error('Connector account changed')
+    return await executePersonalSkillLocal(toolName, args)
+  }
   let lastErr = 'Unable to reach claw node for personal skill execution'
-  for (const base of [...new Set(candidateUrls)]) {
+  for (const base of personalEndpoints(getNodes)) {
+    if (expectedTarget) {
+      try {
+        const probe = await fetch(base.replace(/\/+$/, '') + '/orchestrator/standalone/personal-skills/execute', { method: 'HEAD', signal: AbortSignal.timeout(2500) })
+        if (probe.headers.get('x-personal-target') !== expectedTarget) continue
+      } catch { continue }
+    }
     try {
       const res = await fetch(`${base.replace(/\/+$/, '')}/orchestrator/standalone/personal-skills/execute`, {
         method: 'POST',
@@ -1855,7 +1887,7 @@ export async function executePersonalSkillWithRemoteFallback(
           'content-type': 'application/json',
           'x-orchestrator-request': '1',
         },
-        body: JSON.stringify({ name: toolName, args }),
+        body: JSON.stringify({ name: toolName, args, expectedTarget }),
         signal: AbortSignal.timeout(45_000),
       })
       const data = (await res.json()) as { ok?: boolean; result?: unknown; error?: string }
@@ -1863,6 +1895,7 @@ export async function executePersonalSkillWithRemoteFallback(
       return data.result
     } catch (err) {
       lastErr = err instanceof Error ? err.message : String(err)
+      if (needsWriteReview(toolName, args)) throw new Error('Check the destination before retrying: ' + lastErr)
     }
   }
   throw new Error(lastErr)
@@ -1871,12 +1904,14 @@ export async function executePersonalSkillWithRemoteFallback(
 export function buildPersonalSkillsPluginTools(
   getNodes: () => readonly WorkerNodeRecord[],
   isEnabled: () => boolean,
+  review?: (name: string, target: string, parsed: Record<string, unknown>) => unknown,
 ): RegisteredToolSpec[] {
   const guard = async (name: string, rawArgs: unknown, schema: z.ZodType) => {
     if (!isEnabled()) {
       throw new Error('The Personal Business Skills plugin (dsh-personal-skills) is currently disabled')
     }
     const parsed = schema.parse(rawArgs ?? {}) as Record<string, unknown>
+    if (review && needsWriteReview(name, parsed)) return review(name, await resolvePersonalTarget(getNodes), parsed)
     return await executePersonalSkillWithRemoteFallback(name, parsed, getNodes)
   }
 

@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './app.tsx'
-import { Button, Input, Modal, Switch, Tag } from './controls.tsx'
+import { Button, Icon, Input, Modal, Switch, Tag, type IconName } from './controls.tsx'
 import {
   formatModelSummary,
   formatSlotDayType,
@@ -11,6 +11,7 @@ import {
   type VisualModelCatalog,
 } from './settings-kit.tsx'
 import { PanelConversation } from './standalone-composer.tsx'
+import { WorkspaceDocuments } from './workspace-records.tsx'
 import { PersonalNotices } from './personal-notices.tsx'
 import { readTextDraft, useGlobalInputDrafts, useTextDraft, writeTextDraft } from './panel-draft.ts'
 import { LiveWorkspace, SessionActivity, useLiveSession } from './standalone-activity.tsx'
@@ -64,6 +65,24 @@ function makeTranslator(dict: Record<string, string>): T {
     return values ? template.replace(/\{(\w+)\}/g, (_match, name: string) =>
       values[name] !== undefined && values[name] !== null ? String(values[name]) : `{${name}}`) : template
   }) as T
+}
+
+const workspaceIcons: Record<string, IconName> = {
+  assistant: 'message', workbench: 'session', clawfeed: 'inbox', rhtoolkit: 'hash',
+  knowledge: 'review', 'persona-ambient': 'user', 'plugin-center': 'settings',
+  'live-inspector': 'running', pipeline: 'pull', management: 'shield',
+}
+
+function moveTabFocus(event: React.KeyboardEvent<HTMLElement>) {
+  if (!['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return
+  const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+  const index = tabs.indexOf(event.target as HTMLButtonElement)
+  if (index < 0) return
+  event.preventDefault()
+  const delta = event.key === 'ArrowDown' || event.key === 'ArrowRight' ? 1 : -1
+  const next = event.key === 'Home' ? tabs[0] : event.key === 'End' ? tabs.at(-1) : tabs[(index + delta + tabs.length) % tabs.length]
+  next?.focus()
+  next?.click()
 }
 
 export function RHarnessLogo({ size = 24 }: { size?: number }) {
@@ -2544,6 +2563,7 @@ export function StandaloneRoot() {
   const [nodesModalOpen, setNodesModalOpen] = useState(false)
   const [profilesModalOpen, setProfilesModalOpen] = useState(false)
   const [mdReaderTarget, setMdReaderTarget] = useState<{ path: string; line?: number }>()
+  const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [mdReaderOpen, setMdReaderOpen] = useState(false)
   const [viewMode, setViewMode] = useState<MainViewSlotId>('assistant')
   const [roleModels, setRoleModels] = useState<RoleModelsSummary>()
@@ -2756,25 +2776,30 @@ export function StandaloneRoot() {
   return <div className="dt-standalone-root" data-view-mode={viewMode}>
     <div className="dt-standalone-bar">
       <div className="dt-standalone-brand">
-        <RHarnessLogo size={26} />
+        <div className="dt-brand-lockup"><RHarnessLogo size={32} />
         <strong>RHarness</strong>
-        <span>{lang === 'zh' ? '智能体工作台' : 'Agent Workbench'}</span>
-        <div className="dt-mode-switcher" role="tablist" aria-label={lang === 'zh' ? '工作台视图模式' : 'Workspace view mode'}>
+        </div>
+        <div className="dt-workspace-tabs" role="tablist" onKeyDown={moveTabFocus} aria-label={lang === 'zh' ? '工作台视图模式' : 'Workspace view mode'}>
           {tabBarGroups.map(group => <button
             key={group.id}
             type="button"
             role="tab"
             className="dt-mode-tab"
             aria-selected={activeTabBar?.id === group.id}
+            tabIndex={activeTabBar?.id === group.id ? 0 : -1}
+            aria-controls="workspace-content"
             onClick={() => selectTabBar(group.id)}
             data-testid={`view-tab-${group.id}`}
           >
-            {group.label(lang, slotCounts)}
+            <Icon name={workspaceIcons[group.id] ?? 'queue'} size={18} />
+            {group.label(lang, slotCounts).replace(/^[^\p{Letter}\p{Number}]+/u, '')}
           </button>)}
         </div>
       </div>
       <div className="dt-standalone-actions">
-        <div className="dt-model-pills" aria-label={lang === 'zh' ? '当前模型与并发状态' : 'Active models and concurrency'}>
+        <details className="dt-runtime-menu">
+          <summary><Icon name="settings" />{lang === 'zh' ? '运行配置' : 'Runtime'}</summary>
+          <div className="dt-model-pills" aria-label={lang === 'zh' ? '当前模型与并发状态' : 'Active models and concurrency'}>
           {isProfilesPluginEnabled && profilesList.length > 0 && <div className="dt-mode-switcher" role="group" aria-label={lang === 'zh' ? '快速切换模型配置组' : 'Quick switch model profile'}>
             {profilesList.map((p, idx) => <button
               key={p.id}
@@ -2805,6 +2830,14 @@ export function StandaloneRoot() {
           {isProfilesPluginEnabled && <Button variant="outline" size="sm" onClick={() => setProfilesModalOpen(true)}>
             {lang === 'zh' ? '配置组' : 'Profiles'}
           </Button>}
+          <nav className="dt-workspace-nav" aria-label={lang === 'zh' ? '工作台区域' : 'Workspace sections'}>
+            <a href="#local-chat" onClick={() => setViewMode('workbench')}>{lang === 'zh' ? '工程对话' : 'Local chat'}</a>
+            <a href="#management" onClick={() => setViewMode('management')}>{lang === 'zh' ? '管理面板' : 'Management'}</a>
+            <a href="#live-execution" onClick={() => setViewMode('live-inspector')}>{lang === 'zh' ? '实时执行' : 'Live execution'}</a>
+          </nav>
+          </div>
+        </details>
+          <Button variant="outline" size="sm" onClick={() => setWorkspaceOpen(true)}>{lang === 'zh' ? '草稿与确认' : 'Drafts & approvals'}</Button>
           {isDeviceGroupPluginEnabled && <Button variant="outline" size="sm" onClick={() => setNodesModalOpen(true)} data-testid="open-nodes-modal-btn">
             {lang === 'zh' ? `节点 (${onlineNodeCount})` : `Nodes (${onlineNodeCount})`}
           </Button>}
@@ -2843,19 +2876,14 @@ export function StandaloneRoot() {
             onClick={() => setMdReaderOpen(true)}
             data-testid="open-markdown-reader-btn"
           >
-            {lang === 'zh' ? '📄 文档阅读' : '📄 Docs & Plans'}
+            {lang === 'zh' ? '文档' : 'Documents'}
           </Button>
-        </div>
-        <nav className="dt-workspace-nav" aria-label={lang === 'zh' ? '工作台区域' : 'Workspace sections'}>
-          <a href="#local-chat" onClick={() => setViewMode('workbench')}>{lang === 'zh' ? '工程对话' : 'Local chat'}</a>
-          <a href="#management" onClick={() => setViewMode('management')}>{lang === 'zh' ? '管理面板' : 'Management'}</a>
-          <a href="#live-execution" onClick={() => setViewMode('live-inspector')}>{lang === 'zh' ? '实时执行' : 'Live execution'}</a>
-        </nav>
+
         <Button variant="outline" size="sm" onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}>{lang === 'zh' ? 'English' : '中文'}</Button>
       </div>
     </div>
 
-    <div className="dt-workbench-grid">
+    <main id="workspace-content" className="dt-workbench-grid" role="tabpanel" aria-label={activeTabBar?.label(lang, slotCounts)}>
       <PanelConversation
         lang={lang}
         visible={viewMode === 'workbench'}
@@ -2866,13 +2894,14 @@ export function StandaloneRoot() {
       />
       <div id="management" className="dt-standalone-management">
         {activeTabBar && activeTabBar.members.length > 1 && (
-          <div className="dt-view-subtabs" role="tablist" aria-label={lang === 'zh' ? '标签栏内视图' : 'Views in this tab bar'} data-testid={`view-subtabs-${activeTabBar.id}`}>
+          <div className="dt-view-subtabs" role="tablist" onKeyDown={moveTabFocus} aria-label={lang === 'zh' ? '标签栏内视图' : 'Views in this tab bar'} data-testid={`view-subtabs-${activeTabBar.id}`}>
             {activeTabBar.members.map(member => <button
               key={member.id}
               type="button"
               role="tab"
               className="dt-mode-tab"
               aria-selected={viewMode === member.id}
+              tabIndex={viewMode === member.id ? 0 : -1}
               onClick={() => { setTabBarSelection(prev => ({ ...prev, [activeTabBar.id]: member.id })); setViewMode(member.id) }}
               data-testid={`view-subtab-${member.id}`}
             >
@@ -2972,7 +3001,8 @@ export function StandaloneRoot() {
         onSelectSession={setInspectedSession}
         onMetaUpdate={handleMetaUpdate}
       />
-    </div>
+    </main>
+    <WorkspaceDocuments open={workspaceOpen} close={() => setWorkspaceOpen(false)} lang={lang} />
     <ModelProfilesModal
       open={profilesModalOpen}
       lang={lang}

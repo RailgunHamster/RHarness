@@ -188,7 +188,7 @@ import {
   buildClawFeedPluginTools,
   buildPersonalSkillsPluginTools,
   createFeishuStreamingCardSession,
-  executePersonalSkillLocal,
+  executePersonalSkillLocal, localPersonalTarget, hasLocalClawPersonalAssets as hasPersonalTarget, needsWriteReview,
   executePersonalSkillWithRemoteFallback,
   formatAgentToolStatusLabel,
   getClawFeedSinkEndpoints,
@@ -213,6 +213,8 @@ import {
   type RemoteTurnRequestBody,
   type WorkerNodeRecord,
 } from '../app/worker-nodes.ts'
+import { WorkspaceRecords, RevisionConflict, draftInput, workspaceTools } from '../app/workspace-records.ts'
+import { TurnReceipts } from '../app/turn-receipts.ts'
 import { KV } from '../kv.ts'
 import { key, latestReport, threadKey, waitsForPerson, type Ticket } from '../core/index.ts'
 import type { LiveSessionRunInfo, PanelMessageReceipt, PanelTopicSummary, PipelineRow } from '../client/standalone-api.ts'
@@ -507,6 +509,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   const privateToolkitMod = await loadRHToolkitDynamicModule()
   mkdirSync(stateDir, { recursive: true })
   recoverStaleStateLock(stateDir)
+
+  let turnReceipts: TurnReceipts | undefined
+  let workspace: WorkspaceRecords | undefined
+  const workspaceRecords = () => workspace ??= new WorkspaceRecords(join(stateDir, 'workspace-records.sqlite'))
 
   // Seed default sources on first run: Panel + Feishu enabled by default, GitHub disabled until configured.
   const dbPath = join(stateDir, 'orchestrator.sqlite')
@@ -1178,6 +1184,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             : [`http://127.0.0.1:${actualPort}`]
           const remoteRes = await dispatchTurnToRemoteNode({
             node: targetNode,
+            receiptSecret: hubIdentity.privateKeyPem,
             hubUrl: hubEndpoints[0] ?? `http://127.0.0.1:${actualPort}`,
             hubEndpoints,
             sessionId: effectiveReq.sessionId,
@@ -2059,6 +2066,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       }
     }
 
+    for (const spec of workspaceTools(workspaceRecords, agent.id)) registerWithMirror(spec)
     const role: 'assistant' | 'worker' = isAssistant ? 'assistant' : 'worker'
     const readChatArchive = () => {
       if (!runtime) return []
@@ -2166,6 +2174,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     const personalSkillTools = buildPersonalSkillsPluginTools(
       getRegisteredNodes,
       () => isPluginEnabled('dsh-personal-skills'),
+      (name, target, parsed) => {
+        const record = workspaceRecords().propose(agent.id, name, target, parsed)
+        return { state: record.state, id: record.id, revision: record.revision, target, message: 'Pending user review in Workspace documents. The action has not run.' }
+      },
     )
     for (const pst of personalSkillTools) {
       agent.ctx.tools?.register(pst)
@@ -2806,6 +2818,36 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       try {
         await runtime.ready
 
+        if (sub === 'workspace' && req.method === 'GET') {
+          const id = url.searchParams.get('id')
+          if (!id) sendJson(res, 200, { items: workspaceRecords().list() })
+          else {
+            const version = url.searchParams.get('revision')
+            const item = workspaceRecords().get(id, version ? Number(version) : undefined)
+            sendJson(res, item ? 200 : 404, item ?? { error: 'Unknown document revision' })
+          }
+          return
+        }
+        if (sub === 'workspace/save' && req.method === 'POST') {
+          const input = draftInput.parse(await readJsonBody(req, 1024 * 1024))
+          const owner = input.id ? workspaceRecords().get(input.id)?.owner : ASSISTANT_SESSION_ID
+          if (!owner) throw new Error('Unknown document')
+          sendJson(res, 200, workspaceRecords().save(input, owner))
+          return
+        }
+        if (sub === 'workspace/decide' && req.method === 'POST') {
+          const body = await readJsonBody(req)
+          if (typeof body.approve !== 'boolean') throw new Error('A decision is required')
+          const item = await workspaceRecords().decide(String(body.id), Number(body.revision), body.approve, async record => {
+            const args = JSON.parse(record.text) as Record<string, unknown>
+            if (!isPluginEnabled('dsh-personal-skills') || !record.tool || !record.target || !needsWriteReview(record.tool, args)) throw new Error('Connector unavailable')
+            const result = await executePersonalSkillWithRemoteFallback(record.tool, args, getRegisteredNodes, record.target)
+            if (result && typeof result === 'object' && 'ok' in result && result.ok === false) throw new Error('Connector reported a failure. Check the destination.')
+            return result
+          })
+          sendJson(res, 200, item)
+          return
+        }
         // Post a message from the Local Panel Source
         if (req.method === 'POST' && sub === 'panel/messages') {
           const body = await readJsonBody(req, PANEL_MESSAGE_BODY_BYTES)
@@ -5965,25 +6007,53 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         }
 
         // Execute a personal business skill locally on this node (`claw`) or proxy to `claw`
+        if (req.method === 'HEAD' && sub === 'personal-skills/execute') {
+          if (!hasPersonalTarget() || !isPluginEnabled('dsh-personal-skills')) { res.writeHead(404); res.end(); return }
+          res.writeHead(200, { 'x-personal-target': localPersonalTarget() })
+          res.end()
+          return
+        }
         if (req.method === 'POST' && sub === 'personal-skills/execute') {
           const body = await readJsonBody(req, 512 * 1024)
           const toolName = String(body.name ?? '').trim()
           const toolArgs = (typeof body.args === 'object' && body.args !== null ? body.args : {}) as Record<string, unknown>
           if (!toolName) throw new Error('Personal skill tool name is required')
+          if (body.expectedTarget && body.expectedTarget !== localPersonalTarget()) throw new Error('Connector account changed')
           const result = await executePersonalSkillLocal(toolName, toolArgs)
           sendJson(res, 200, { ok: true, result })
           return
         }
 
+        if (req.method === 'HEAD' && sub === 'worker-node/execute') {
+          res.writeHead(200, { 'x-turn-peer': getDeviceIdentity().deviceId, 'x-turn-protocol': '1' })
+          res.end()
+          return
+        }
         // Execute a distributed Worker turn on this machine when dispatched by a Hub node
         if (req.method === 'POST' && sub === 'worker-node/execute') {
+          const mode = url.searchParams.get('receipt')
+          const key = req.headers['x-turn-receipt']
+          const after = Number(url.searchParams.get('after') ?? 0)
+          if (mode && (typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key) || !['read', 'start'].includes(mode) || !Number.isSafeInteger(after) || after < 0)) {
+            sendJson(res, 400, { error: 'Invalid turn receipt request' })
+            return
+          }
+          if (mode) turnReceipts ??= new TurnReceipts(join(stateDir, 'turn-receipts.sqlite'))
+          if (mode === 'read') {
+            const receipt = turnReceipts!.read(key as string, after)
+            sendJson(res, receipt ? 200 : 404, receipt ?? { error: 'Unknown receipt' })
+            return
+          }
           const body = await readJsonBody(req, 14 * 1024 * 1024) as unknown as RemoteTurnRequestBody
-          const outcome = await handleIncomingRemoteTurn(body, {
-            stateDir,
-            repoRoot: process.cwd(),
+          const execute = (onEvent?: (event: { type: string; data: unknown }) => void) => handleIncomingRemoteTurn(body, {
+            stateDir, onEvent,
+            repoRoot: repoDir,
             ...(options.driver ? { customDriver: reqItem => options.driver!({ ...reqItem, onToolResult: () => {} }) } : {}),
           })
-          sendJson(res, 200, outcome)
+          if (mode === 'start') {
+            const accepted = turnReceipts!.start(key as string, body, execute)
+            sendJson(res, accepted ? 200 : 409, accepted ? turnReceipts!.read(key as string, after) : { error: 'Turn request changed after dispatch' })
+          } else sendJson(res, 200, await execute())
           return
         }
 
@@ -6329,7 +6399,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
 
         sendJson(res, 404, { error: 'Unknown standalone endpoint' })
       } catch (err) {
-        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+        sendJson(res, err instanceof RevisionConflict ? 409 : 400, { error: err instanceof Error ? err.message : String(err) })
       }
       return
     }
@@ -6555,6 +6625,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         await new Promise<void>(r => srv.close(() => r()))
       }
       await new Promise<void>(r => httpServer.close(() => r()))
+      await turnReceipts?.close()
+      workspace?.close()
       await runtime.stop()
     },
   }
