@@ -1,6 +1,7 @@
 import { createHash, createHmac } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
+import type { PeerOperation } from './device-group.ts'
 import type { RemoteTurnRequestBody, RemoteTurnResponseBody } from './worker-nodes.ts'
 
 type TurnEvent = RemoteTurnResponseBody['events'][number]
@@ -81,7 +82,7 @@ export class TurnReceipts {
 }
 
 export async function requestRemoteTurn(input: {
-  candidates: string[]; key: string; body: RemoteTurnRequestBody; signal: AbortSignal
+  candidates: string[]; key: string; body: RemoteTurnRequestBody; expectedPeer?: string; proofFor?: (peer: string) => PeerOperation; signal: AbortSignal
   onEvent: (type: string, data: unknown) => void
 }): Promise<RemoteTurnResponseBody> {
   const headers = { 'content-type': 'application/json', 'x-orchestrator-request': '1', 'x-turn-receipt': input.key }
@@ -90,14 +91,17 @@ export async function requestRemoteTurn(input: {
   let submitted = false
   let unknown: unknown
   // A receipt can be polled through another address of the same worker after a dropped response.
-  for (const base of [...input.candidates, ...input.candidates]) {
+  let deadline = Date.now() + 60_000
+  for (let attempt = 0; attempt < input.candidates.length * 2 || (peer && Date.now() < deadline); attempt++) {
+    if (attempt && attempt % input.candidates.length === 0) await delay(Math.min(4000, attempt * 250), undefined, { signal: input.signal })
+    const base = input.candidates[attempt % input.candidates.length]!
     const endpoint = base.replace(/\/+$/, '') + '/orchestrator/standalone/worker-node/execute'
     let probe: Response
     try {
       probe = await fetch(endpoint, { method: 'HEAD', signal: AbortSignal.any([input.signal, AbortSignal.timeout(4000)]) })
     } catch (error) { input.signal.throwIfAborted(); unknown = error; continue }
     const identity = probe.headers.get('x-turn-peer')
-    if (peer && peer !== identity) continue
+    if ((peer && peer !== identity) || (input.expectedPeer && input.expectedPeer !== identity)) continue
     if (!identity || probe.headers.get('x-turn-protocol') !== '1') {
       if (submitted) continue
       if (![404, 405].includes(probe.status)) { unknown = new Error('Worker receipt negotiation failed: ' + probe.status); continue }
@@ -113,7 +117,8 @@ export async function requestRemoteTurn(input: {
       try {
         const mode = submitted ? 'read' : 'start'
         res = await fetch(endpoint + '?receipt=' + mode + '&after=' + cursor, {
-          method: 'POST', headers, body: submitted ? '{}' : JSON.stringify(input.body),
+          method: 'POST', headers: { ...headers, ...(!submitted && input.proofFor ? { 'x-turn-proof': Buffer.from(JSON.stringify(input.proofFor(identity))).toString('base64url') } : {}) },
+          body: submitted ? '{}' : JSON.stringify(input.body),
           signal: AbortSignal.any([input.signal, AbortSignal.timeout(30_000)]),
         })
         page = await res.json() as TurnReceipt
@@ -121,6 +126,7 @@ export async function requestRemoteTurn(input: {
       if (res.status === 404 && submitted) { submitted = false; continue }
       if (!res.ok) throw new Error(page.error ?? 'Worker receipt rejected (' + res.status + ')')
       submitted = true
+      deadline = Date.now() + 60_000
       for (const event of page.events) input.onEvent(event.type, event.data)
       cursor = page.cursor
       if (page.more) continue

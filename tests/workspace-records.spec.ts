@@ -74,3 +74,90 @@ it('separates same-title memories by scope, records provenance and preserves sup
   const replacement = replaceMemoryEntry(project.list, project.entry.id, { content: 'Revised' })
   expect(replacement.entry).toMatchObject({ supersedes: project.entry.id, scopeKey: 'p', provenance: project.entry.provenance })
 })
+
+it('keeps immutable binary revisions and validates bytes on backup restore', async () => {
+  const { inspectReportFile } = await import('../src/app/report-files.ts')
+  const records = store()
+  const first = Buffer.from('# First report'), second = Buffer.from('# Second report')
+  const saved = records.publishFile('worker-1', inspectReportFile('report.md', first), first, 'verified')
+  const revised = records.publishFile('worker-1', inspectReportFile('report.md', second), second, 'verified')
+  expect(revised).toMatchObject({ id: saved.id, revision: 2 })
+  expect(records.publishFile('worker-1', inspectReportFile('report.md', second), second, 'verified').revision).toBe(2)
+  const pending = records.propose('assistant','todo_write','test',{})
+  const restored = store()
+  restored.restore(records.archive(),'replace')
+  expect(restored.download(saved.id,1)?.bytes.equals(first)).toBe(true)
+  expect(restored.get(pending.id)?.state).toBe('dismissed')
+  const damaged = records.archive()
+  damaged.files[0]!.data = Buffer.from('other').toString('base64')
+  const empty = store()
+  expect(() => empty.restore(damaged,'merge')).toThrow(/digest/)
+  expect(empty.list()).toEqual([])
+  expect(() => inspectReportFile('invalid.xlsx', first)).toThrow(/ZIP/)
+  expect(() => inspectReportFile('invalid.pdf', first)).toThrow(/PDF/)
+})
+
+it('preserves original meeting timestamps and only proposes a quoted follow-up against that revision', async () => {
+  const { transcriptDocument } = await import('../src/app/workspace-records.ts')
+  const records = store()
+  const doc = records.save(transcriptDocument('call.wav','00:00:12 Alice: review the draft'), 'assistant')
+  const tool = workspaceTools(() => records,'assistant').find(t => t.name === 'meeting_propose_followup')!
+  const req = { id: doc.id, revision: 1, excerpt: '00:00:12 Alice: review the draft', request: 'Review' }
+  const exec = { signal: AbortSignal.timeout(500) }
+  expect(await tool.execute(req,exec)).toMatchObject({ state: 'review', target: 'panel/engineering' })
+  await expect(tool.execute({ ...req, excerpt: 'unknown' },exec)).rejects.toThrow(/excerpt/)
+})
+
+it('coalesces missed scheduled ticks, retains machine authorship, and uses the same ID on replay', async () => {
+  const { consumeDueReviews, saveReview, reviewInput } = await import('../src/app/scheduled-reviews.ts')
+  const date = '2026-01-01T00:00:00.000Z'
+  const reviews = saveReview([], reviewInput.parse({ prompt: 'Check the report', mode: 'silent', due: date, intervalMinutes: 60 }))
+  const now = Date.parse(date) + 5.5 * 3600_000
+  const receive = vi.fn()
+  const next = consumeDueReviews(reviews,now,receive)
+  expect(receive).toHaveBeenCalledTimes(1)
+  expect(receive.mock.calls[0]![0]).toMatchObject({ human: false, meta: { requestedMode: 'silent' } })
+  expect(receive.mock.calls[0]![0]).not.toHaveProperty('channel')
+  consumeDueReviews(reviews,now,receive)
+  expect(receive.mock.calls[1]![0].id).toBe(next[0]?.lastTrigger)
+  expect(consumeDueReviews(next,now,receive)).toBe(next)
+})
+
+it('binds a signed connector command to a trusted issuer, a destination and exact arguments', async () => {
+  const { ensureDeviceIdentity, signOperation, validOperation } = await import('../src/app/device-group.ts')
+  const issuer = ensureDeviceIdentity(undefined, 0)
+  const value = ['calendar_add','local-account',{ summary: 'test' }]
+  const proof = signOperation(issuer, 'review:1', 'connector-write', value)
+  expect(validOperation(proof,'connector-write',value,[issuer.publicKeyB64])).toBe(true)
+  expect(validOperation(proof,'connector-write',value,[])).toBe(false)
+  expect(validOperation(proof,'connector-write',['another account'],[issuer.publicKeyB64])).toBe(false)
+  const records = store(), perform = vi.fn(async () => ({ ok: true }))
+  await Promise.all([records.performOnce('issuer/key','hash',perform), records.performOnce('issuer/key','hash',perform)])
+  expect(perform).toHaveBeenCalledTimes(1)
+  expect(records.operation('issuer/key','hash')?.state).toBe('done')
+})
+
+it('discovers a local model and completes a tool roundtrip through its actual HTTP driver', async () => {
+  const { createServer } = await import('node:http')
+  const { discoverOllama, runOllamaTurn } = await import('../src/app/ollama-driver.ts')
+  const { probeModel } = await import('../src/app/model-probe.ts')
+  const calls: string[] = []
+  const endpoint = createServer(async (req,res) => {
+    res.setHeader('content-type','application/json')
+    if (req.url === '/api/tags') { res.end(JSON.stringify({ models: [{ name: 'fixture' }] })); return }
+    const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk))
+    const body = JSON.parse(Buffer.concat(chunks).toString())
+    const message = body.messages.at(-1)
+    calls.push(message.role)
+    res.end(JSON.stringify({ message: message.role === 'tool' ? { role: 'assistant', content: JSON.parse(message.content).token }
+      : { role: 'assistant', content: '', tool_calls: [{ function: { name: 'probe_echo', arguments: {} } }] } }))
+  })
+  await new Promise<void>(resolve => endpoint.listen(0,'127.0.0.1',resolve))
+  try {
+    const addr = endpoint.address(); if (!addr || typeof addr === 'string') throw new Error('No fixture listener')
+    vi.stubEnv('RHARNESS_OLLAMA_URL', 'http://127.0.0.1:' + addr.port)
+    expect((await discoverOllama())?.models[0]?.id).toBe('fixture')
+    expect((await probeModel({ provider: 'ollama-local', model: 'fixture' },'tools',runOllamaTurn)).passed).toBe(true)
+    expect(calls).toEqual(['user','tool'])
+  } finally { vi.unstubAllEnvs(); await new Promise<void>(resolve => endpoint.close(() => resolve())) }
+})

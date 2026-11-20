@@ -11,6 +11,7 @@ import {
   type VisualModelCatalog,
 } from './settings-kit.tsx'
 import { PanelConversation } from './standalone-composer.tsx'
+import { ReviewSchedule } from './scheduled-reviews.tsx'
 import { WorkspaceDocuments } from './workspace-records.tsx'
 import { PersonalNotices } from './personal-notices.tsx'
 import { readTextDraft, useGlobalInputDrafts, useTextDraft, writeTextDraft } from './panel-draft.ts'
@@ -915,6 +916,8 @@ function WorkerNodesModal({
                     <strong>{p.name}</strong>
                     <span className="dt-mono dt-msg-receipt-branch">{p.buildId}</span>
                     {p.isDataCenter && <Tag tone="info">数据中心</Tag>}
+                    {p.capabilities && <span className="dt-hint">{p.capabilities.platform} · Node {p.capabilities.node} · {lang === 'zh' ? '回执' : 'Receipts'} v{p.capabilities.receiptProtocol}
+                      {Object.entries(p.capabilities.probes).map(([key, probe]) => <span key={key}> · {key} {probe.passed ? '✓' : '×'}</span>)}</span>}
                     {p.busy?.busy && <span className="dt-hint">🔥 {p.busy.reasons.join('、')}</span>}
                   </div>
                 </div>
@@ -2273,6 +2276,7 @@ function SessionConsoleModal({ sessionId, lang, onClose, onSelectSession }: {
               <select className="dt-select" value={selectedTool} onChange={event => setToolName(event.target.value)}>
                 {detail.tools.map(tool => <option key={tool.name} value={tool.name}>{tool.name}</option>)}
               </select></label>
+            {detail.tools.filter(tool => tool.name === selectedTool).map(tool => <details key={tool.name}><summary>{lang === 'zh' ? '工具定义' : 'Tool definition'} · {tool.role} · {tool.version?.slice(0,8)}</summary><p>{tool.description}</p><pre className="dt-raw-events">{JSON.stringify(tool.parameters,null,2)}</pre></details>)}
             {detail.id.startsWith('worker-') && <div className="dt-row-buttons">{(['progress', 'ready'] as const).map(state =>
               <Button key={state} size="sm" onClick={() => { setToolName('orchestrator_report'); setToolArgs(JSON.stringify({ state,
                 summary: state === 'ready' ? '已完成实现并通过全部验证。' : '正在分析并实现改动…' }, null, 2)) }}>
@@ -2571,8 +2575,9 @@ export function StandaloneRoot() {
   const [profilesModalOpen, setProfilesModalOpen] = useState(false)
   const [mdReaderTarget, setMdReaderTarget] = useState<{ path: string; line?: number }>()
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
+  const [scheduleOpen, setScheduleOpen] = useState(false)
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
-  const [diagnostics, setDiagnostics] = useState<{ build: string; platform: string; nodeVersion: string; protocol: number; models: { role: string; provider?: string; model?: string; available: boolean }[]; browserConnected: boolean; browserPaused: boolean; lastReceipt: { state: string; at: string } | null; modelQueue: { running: number; queued: number; cooldownMs: number }[] }>()
+  const [diagnostics, setDiagnostics] = useState<{ build: string; platform: string; nodeVersion: string; protocol: number; probes: Record<string, { provider: string; model: string; passed: boolean; ms: number }>; models: { role: string; provider?: string; model?: string; available: boolean }[]; browserConnected: boolean; browserPaused: boolean; lastReceipt: { state: string; at: string } | null; modelQueue: { running: number; queued: number; cooldownMs: number }[] }>()
   const [diagnosticError, setDiagnosticError] = useState('')
   const [diagnosticBusy, setDiagnosticBusy] = useState(false)
   const refreshDiagnostics = async () => {
@@ -2580,6 +2585,12 @@ export function StandaloneRoot() {
     try { setDiagnostics(await standaloneFetch<NonNullable<typeof diagnostics>>('diagnostics')) }
     catch (err) { setDiagnosticError(String(err)) }
     finally { setDiagnosticBusy(false) }
+  }
+  const [probeKind, setProbeKind] = useState('text')
+  const checkModel = async (role: string) => {
+    setDiagnosticBusy(true); setDiagnosticError('')
+    try { await standaloneFetch('diagnostics/probe','POST',{ role, kind: probeKind }); await refreshDiagnostics() }
+    catch (err) { setDiagnosticError(String(err)); setDiagnosticBusy(false) }
   }
   const takeoverBrowser = async () => {
     if (!diagnostics) return
@@ -2853,6 +2864,7 @@ export function StandaloneRoot() {
           {isProfilesPluginEnabled && <Button variant="outline" size="sm" onClick={() => setProfilesModalOpen(true)}>
             {lang === 'zh' ? '配置组' : 'Profiles'}
           </Button>}
+          <Button size="sm" variant="outline" onClick={() => setScheduleOpen(true)}>{lang === 'zh' ? '定时研判' : 'Scheduled reviews'}</Button>
           <Button size="sm" variant="outline" onClick={() => { setDiagnosticsOpen(true); void refreshDiagnostics() }}>{lang === 'zh' ? '节点诊断' : 'Node diagnostics'}</Button>
           <nav className="dt-workspace-nav" aria-label={lang === 'zh' ? '工作台区域' : 'Workspace sections'}>
             <a href="#local-chat" onClick={() => setViewMode('workbench')}>{lang === 'zh' ? '工程对话' : 'Local chat'}</a>
@@ -3026,12 +3038,19 @@ export function StandaloneRoot() {
         onMetaUpdate={handleMetaUpdate}
       />
     </main>
+    <ReviewSchedule open={scheduleOpen} close={() => setScheduleOpen(false)} lang={lang} />
     <Modal open={diagnosticsOpen} onClose={() => setDiagnosticsOpen(false)} title={lang === 'zh' ? '本机诊断' : 'Local diagnostics'} closeLabel={lang === 'zh' ? '关闭' : 'Close'}>
       <div className="dt-form">
         {diagnosticError && <p role="alert">{diagnosticError}</p>}
         {diagnostics && <>
           <strong>{diagnostics.platform} · Node {diagnostics.nodeVersion} · #{diagnostics.build}</strong>
-          {diagnostics.models.map(m => <div className="dt-record-meta" key={m.role}><strong>{m.role}</strong><span>{m.provider} / {m.model} · {m.available ? (lang === 'zh' ? '已发现' : 'Discovered') : (lang === 'zh' ? '未发现' : 'Unavailable')}</span></div>)}
+          <label>{lang === 'zh' ? '实测能力 ' : 'Test capability '}<select value={probeKind} onChange={e => setProbeKind(e.target.value)}>{Object.entries({ text: '文本', tools: '工具调用', vision: '识图' }).map(([key, label]) => <option key={key} value={key}>{lang === 'zh' ? label : key}</option>)}</select></label>
+          {diagnostics.models.map(m => {
+            const result = diagnostics.probes?.[m.role + '/' + probeKind]
+            return <div className="dt-record-meta" key={m.role}><strong>{m.role}</strong><span>{m.provider} / {m.model} · {m.available ? (lang === 'zh' ? '已发现' : 'Discovered') : (lang === 'zh' ? '未发现' : 'Unavailable')}
+              {result && result.model === m.model && result.provider === m.provider && ' · ' + (result.passed ? '✓' : '×') + ' ' + result.ms + ' ms'}</span>
+              <Button size="sm" disabled={diagnosticBusy} onClick={() => void checkModel(m.role)}>{lang === 'zh' ? '实测' : 'Test'}</Button></div>
+          })}
           <div>{lang === 'zh' ? '排队' : 'Queued'} · {diagnostics.modelQueue.reduce((n,p) => n + p.queued, 0)}</div>
           <div>{lang === 'zh' ? '最近派工回执' : 'Last dispatch receipt'} · {diagnostics.lastReceipt ? diagnostics.lastReceipt.state + ' · ' + formatSmartTimestamp(diagnostics.lastReceipt.at, lang) : '—'}</div>
           <div>{lang === 'zh' ? '浏览器' : 'Browser'} · {diagnostics.browserConnected ? (lang === 'zh' ? '已连接' : 'Connected') : (lang === 'zh' ? '离线' : 'Offline')}</div>

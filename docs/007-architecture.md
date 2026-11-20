@@ -334,6 +334,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/local-drivers.ts` | Real local model catalog discovery and turn execution for `@deepseek-ai/dsh` (`~/.dsh/profiles/web`) and `codex app-server` |
 | `src/app/standalone-host.ts` | The standalone multi-provider agent host (`dsh`, `codex`, `claude`, `cursor` and `human`), session inspector and incremental execution-event cursor |
 | `src/app/worktree-merge.ts` | Inspects a Ticket's isolated Git worktree branch and merges its commits back into the main repository branch |
+| `src/app/scheduled-reviews.ts` | Checkpointed panel review schedules and deterministic machine-generated triggers |
+| `src/app/report-files.ts` | Validate and fingerprint report deliverables from ticket artifact directories |
+| `src/app/ollama-driver.ts` | Local Ollama model discovery, message and image transport, and scoped tool calls |
+| `src/app/model-probe.ts` | Isolated role-model text, tool and image capability probes |
 | `src/app/model-queue.ts` | Shared serving endpoint admission, foreground priority, cancellation and rate-limit backoff |
 | `src/app/workspace-records.ts` | Scoped versioned documents and immutable connector action previews |
 | `src/app/turn-receipts.ts` | Durable dispatch receipts, reconnect cursors and interrupted-turn recovery |
@@ -402,6 +406,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/standalone-web.tsx` | The standalone browser entry mounting the management panel, local conversation, live workspace and debugging console |
 | `src/client/ui-slots.tsx` | First-class UI slot plugin registry (`BUILTIN_UI_VIEW_SLOTS`) and the Claw Personal Assistant window with one-way verbatim engineering handoff cards |
+| `src/client/scheduled-reviews.tsx` | Schedule, pause and resume recurring or one-time reviews |
 | `src/client/workspace-records.tsx` | Document revision editor and connector action review |
 | `src/client/personal-notices.tsx` | Compact notice list beside the assistant, mobile disclosure and full message reader |
 | `src/client/standalone-api.ts` | Standalone HTTP transport and Session event types |

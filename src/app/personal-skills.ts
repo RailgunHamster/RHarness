@@ -17,6 +17,7 @@ import { promisify } from 'node:util'
 import { z } from 'zod'
 import { loadPrivatePack } from './private-pack.ts'
 import type { RegisteredToolSpec } from './standalone-host.ts'
+import type { PeerOperation } from './device-group.ts'
 import type { WorkerNodeRecord } from './worker-nodes.ts'
 
 const execFileAsync = promisify(execFile)
@@ -1866,13 +1867,14 @@ export async function resolvePersonalTarget(getNodes: () => readonly WorkerNodeR
 }
 
 export async function executePersonalSkillWithRemoteFallback(
-  toolName: string, args: Record<string, unknown>, getNodes: () => readonly WorkerNodeRecord[], expectedTarget?: string,
+  toolName: string, args: Record<string, unknown>, getNodes: () => readonly WorkerNodeRecord[], expectedTarget?: string, proof?: PeerOperation,
 ): Promise<unknown> {
   if (hasLocalClawPersonalAssets()) {
     if (expectedTarget && expectedTarget !== localPersonalTarget()) throw new Error('Connector account changed')
     return await executePersonalSkillLocal(toolName, args)
   }
   let lastErr = 'Unable to reach claw node for personal skill execution'
+  let receiptOnly = false
   for (const base of personalEndpoints(getNodes)) {
     if (expectedTarget) {
       try {
@@ -1887,7 +1889,7 @@ export async function executePersonalSkillWithRemoteFallback(
           'content-type': 'application/json',
           'x-orchestrator-request': '1',
         },
-        body: JSON.stringify({ name: toolName, args, expectedTarget }),
+        body: JSON.stringify({ name: toolName, args, expectedTarget, proof, receiptOnly }),
         signal: AbortSignal.timeout(45_000),
       })
       const data = (await res.json()) as { ok?: boolean; result?: unknown; error?: string }
@@ -1895,7 +1897,10 @@ export async function executePersonalSkillWithRemoteFallback(
       return data.result
     } catch (err) {
       lastErr = err instanceof Error ? err.message : String(err)
-      if (needsWriteReview(toolName, args)) throw new Error('Check the destination before retrying: ' + lastErr)
+      if (needsWriteReview(toolName, args)) {
+        if (!proof) throw new Error('Check the destination before retrying: ' + lastErr)
+        receiptOnly = true
+      }
     }
   }
   throw new Error(lastErr)
@@ -1905,6 +1910,7 @@ export function buildPersonalSkillsPluginTools(
   getNodes: () => readonly WorkerNodeRecord[],
   isEnabled: () => boolean,
   review?: (name: string, target: string, parsed: Record<string, unknown>) => unknown,
+  onTranscript?: (path: string, transcript: string) => unknown,
 ): RegisteredToolSpec[] {
   const guard = async (name: string, rawArgs: unknown, schema: z.ZodType) => {
     if (!isEnabled()) {
@@ -1912,7 +1918,11 @@ export function buildPersonalSkillsPluginTools(
     }
     const parsed = schema.parse(rawArgs ?? {}) as Record<string, unknown>
     if (review && needsWriteReview(name, parsed)) return review(name, await resolvePersonalTarget(getNodes), parsed)
-    return await executePersonalSkillWithRemoteFallback(name, parsed, getNodes)
+    const result = await executePersonalSkillWithRemoteFallback(name, parsed, getNodes)
+    if (onTranscript && name === 'audio_transcribe' && result && typeof result === 'object' && 'ok' in result && result.ok && 'output' in result && typeof result.output === 'string' && result.output.trim()) {
+      return { ...result, document: onTranscript(String(parsed.audio_path), result.output) }
+    }
+    return result
   }
 
   const todoListSchema = z.object({

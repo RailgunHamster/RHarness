@@ -428,6 +428,22 @@ export function signClaim(claim: GroupClaim, privateKeyPem: string): SignedGroup
   }
 }
 
+export interface PeerOperation { key: string; issuer: string; at: number; signature: string }
+function operationBytes(key: string, at: number, domain: string, payload: unknown) {
+  return Buffer.from('RHarness peer operation v1\n' + JSON.stringify([key, at, domain, payload]))
+}
+export function signOperation(identity: DeviceIdentityRecord, key: string, domain: string, payload: unknown): PeerOperation {
+  const at = Date.now()
+  return { key, at, issuer: identity.publicKeyB64, signature: sign('sha256', operationBytes(key,at,domain,payload), identity.privateKeyPem).toString('base64url') }
+}
+export function validOperation(op: PeerOperation | undefined, domain: string, payload: unknown, trusted: readonly string[]) {
+  if (!op || !trusted.includes(op.issuer) || !/^[a-zA-Z0-9_.:-]{1,160}$/.test(op.key) || !Number.isSafeInteger(op.at) || Math.abs(Date.now() - op.at) > 300_000) return false
+  try {
+    const key = createPublicKey({ key: Buffer.from(op.issuer, 'base64url'), format: 'der', type: 'spki' })
+    return verify('sha256', operationBytes(op.key,op.at,domain,payload), key, Buffer.from(op.signature,'base64url'))
+  } catch { return false }
+}
+
 export function verifySignedClaim(signed: SignedGroupClaim): GroupClaim {
   const payloadBytes = Buffer.from(signed.payload, 'base64url')
   const claim = JSON.parse(payloadBytes.toString('utf8')) as GroupClaim
@@ -636,15 +652,28 @@ export function redeemGroupInvitation(
 
 export function verifyAndExtractGroupMembers(packet: DeviceGroupPacket): GroupClaim[] {
   const root = verifySignedClaim(packet.root)
-  if (root.kind !== 'root' || root.groupId !== packet.groupId) {
+  if (root.kind !== 'root' || root.groupId !== packet.groupId || root.publicKeyB64 !== root.issuerPublicKeyB64
+      || root.deviceId !== sha256Hex(Buffer.from(root.publicKeyB64, 'base64url'))) {
     throw new Error('设备组根证明无效')
   }
-  const claims: GroupClaim[] = []
-  for (const signed of packet.members) {
-    const claim = verifySignedClaim(signed)
-    if (claim.groupId !== packet.groupId) throw new Error('成员不属于该设备组')
-    claims.push(claim)
+  const claims = packet.members.map(verifySignedClaim)
+  const issuers = new Set([root.publicKeyB64])
+  const seen = new Set<string>()
+  for (const claim of claims) {
+    if (claim.groupId !== packet.groupId || claim.kind !== 'member' || seen.has(claim.deviceId) ||
+      claim.deviceId !== sha256Hex(Buffer.from(claim.publicKeyB64, 'base64url'))) throw new Error('Invalid group member identity')
+    seen.add(claim.deviceId)
   }
+  let expanded: boolean
+  do {
+    expanded = false
+    for (const claim of claims) {
+      if (issuers.has(claim.issuerPublicKeyB64) && claim.canInvite && !issuers.has(claim.publicKeyB64)) {
+        issuers.add(claim.publicKeyB64); expanded = true
+      }
+    }
+  } while (expanded)
+  if (claims.some(claim => !issuers.has(claim.issuerPublicKeyB64))) throw new Error('Unknown group invitation issuer')
   return claims
 }
 
@@ -676,7 +705,7 @@ export function groupMembersToWorkerNodes(
     const primaryUrl = candidateEndpoints[0] ?? ''
     if (!primaryUrl) continue
     byId.set(slug, {
-      id: slug,
+      id: slug, deviceId: member.deviceId,
       name: `${member.deviceName} (设备组已认证)`,
       url: primaryUrl,
       endpoints: candidateEndpoints,

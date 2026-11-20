@@ -21,7 +21,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { z } from 'zod'
 import { loadPrivatePack } from './private-pack.ts'
 import { sanitizePromptInjectionInText } from './runtime-guard-plugin.ts'
-import type { RegisteredToolSpec } from './standalone-host.ts'
+import { describeSessionTool, type RegisteredToolSpec } from './standalone-host.ts'
 import type { WorkerNodeRecord } from './worker-nodes.ts'
 
 // ============================================================================
@@ -660,6 +660,7 @@ export function buildDataSqlPluginTools(isEnabled: () => boolean): RegisteredToo
 export function buildToolSearchPluginTools(
   getSessionTools: () => Map<string, RegisteredToolSpec>,
   isEnabled: () => boolean,
+  sessionId = 'claw-assistant-main',
 ): RegisteredToolSpec[] {
   const searchSchema = z.object({
     query: z.string().optional().describe('Keyword to search across all available tool names and descriptions in this session.'),
@@ -699,9 +700,7 @@ export function buildToolSearchPluginTools(
         if (!found) return { found: false, error: `Tool not found: ${args.tool_name}` }
         return {
           found: true,
-          name: found.name,
-          description: found.description,
-          parameters: found.parameters,
+          ...describeSessionTool(found, sessionId),
         }
       },
     },

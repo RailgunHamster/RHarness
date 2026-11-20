@@ -457,6 +457,7 @@ export function saveMemoryEntry(
 
   const entry: MemoryEntry = {
     ...prev,
+    ...(prev && (prev.title !== input.title.trim() || prev.content !== input.content.trim()) ? { embedding: undefined } : {}),
     ...(input.scope ? { scope: input.scope, scopeKey: input.scopeKey ?? '' } : {}),
     ...(input.provenance ? { provenance: input.provenance } : {}),
     id: prev?.id ?? input.id ?? `mem-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -764,6 +765,7 @@ export function consolidateMemories(
     if (alreadyExists) continue
     const saved = saveMemoryEntry(working, {
       ...candidate,
+      scope: 'personal', provenance: { reference: msg.id, verifiedAt: msg.at },
       pinned: false,
       source: 'assistant',
     })

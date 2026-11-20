@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Button, Input, Modal, StateDot, Tag } from './controls.tsx'
+import { Button, Icon, Input, Modal, StateDot, Tag } from './controls.tsx'
 import {
   MAX_PANEL_IMAGES,
   MAX_PANEL_IMAGE_BYTES,
@@ -1782,7 +1782,7 @@ export function PersonalAssistantSlotView(props: {
         </form>
 
         {/* Assistant Conversation Stream */}
-        <div className="dt-activity-toolbar dt-assistant-toolbar">
+        <div className="dt-activity-toolbar dt-assistant-toolbar" hidden={!messages.length && !showAssistantLiveBubble}>
           <span className="dt-hint">
             {lang === 'zh' ? `${messages.length} 条消息` : `${messages.length} messages`}
           </span>
@@ -1812,9 +1812,17 @@ export function PersonalAssistantSlotView(props: {
           }}
         >
           {displayMessages.length === 0 && !showAssistantLiveBubble ? (
-            <p className="dt-hint">
-              {lang === 'zh' ? '发送文字或图片开始与个人助理对话。' : 'Send text or images to chat with Personal Assistant.'}
-            </p>
+            <div className="dt-assistant-welcome">
+              <Icon name="message" size={25} />
+              <h3>{lang === 'zh' ? '今天想处理什么？' : 'What would you like to work on?'}</h3>
+              <div className="dt-row-buttons">
+                {(lang === 'zh' ? ['整理今日待办', '查看工单进度'] : ['Review today’s tasks', 'Check ticket progress']).map(prompt =>
+                  <Button key={prompt} variant="outline" disabled={busy || Boolean(draft.trim())} onClick={() => {
+                    setDraft(prompt)
+                    composerInputRef.current?.focus()
+                  }}>{prompt}</Button>)}
+              </div>
+            </div>
           ) : (
             displayMessages.map((msg, idx) => {
               const isBot = Boolean(msg.bot)

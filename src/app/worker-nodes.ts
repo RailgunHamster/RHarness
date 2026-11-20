@@ -12,18 +12,20 @@
  *      machine, runs the local provider/model (`dsh`, `codex`, `cursor`), streams events, commits changes, and returns
  *      the branch ref so the Hub can `git fetch <remoteRepoUrl> agent/<branch>` and fast-forward merge into `main`.
  */
-import { randomBytes } from 'node:crypto'
+import { createHmac, randomBytes } from 'node:crypto'
 import { requestRemoteTurn, turnReceiptKey } from './turn-receipts.ts'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { hostname, tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { runNativeModelTurn } from './local-drivers.ts'
-import { buildNodeCandidateEndpoints, detectLocalAddressFacts } from './device-group.ts'
-import type { RegisteredToolSpec, SessionTurnMessage } from './standalone-host.ts'
+import { buildNodeCandidateEndpoints, detectLocalAddressFacts, signOperation, type DeviceIdentityRecord } from './device-group.ts'
+import { describeSessionTool, type RegisteredToolSpec, type SessionTurnMessage } from './standalone-host.ts'
+import { collectReportFiles } from './report-files.ts'
 import { inspectTicketWorktree } from './worktree-merge.ts'
 
 export interface WorkerNodeRecord {
+  deviceId?: string
   id: string
   name: string
   /** Primary URL (`'local'` for the built-in Hub node; `http://<ip-or-host>:<port>` for a remote LAN worker). */
@@ -59,6 +61,7 @@ export interface RemoteTurnRequestBody {
   toolDefs: { name: string; description: string; parameters?: unknown }[]
   hubUrl?: string
   hubEndpoints?: string[]
+  callbackToken?: string
 }
 
 export interface RemoteSyncedFile {
@@ -193,18 +196,19 @@ export function syncRemoteNodeGitBranch(input: {
   // 1. Materialize any synced files (`.artifacts/*`, `docs/*.md`, etc.) onto the Hub's worktree and repo immediately
   if (syncedFiles && syncedFiles.length > 0) {
     for (const file of syncedFiles) {
-      if (!file.relPath || file.relPath.includes('..')) continue
-      try {
-        const buf = Buffer.from(file.contentB64, 'base64')
-        if (localWorktreeDir) {
-          const wtTarget = resolve(localWorktreeDir, file.relPath)
-          mkdirSync(dirname(wtTarget), { recursive: true })
-          writeFileSync(wtTarget, buf)
-        }
-        const hubTarget = resolve(hubRepoRoot, file.relPath)
-        mkdirSync(dirname(hubTarget), { recursive: true })
-        writeFileSync(hubTarget, buf)
-      } catch {}
+      // Tracked source and docs travel via Git. Only standalone report files need a separate copy.
+      if (!/^\.artifacts\/[\p{L}\p{N}_.() -]+$/u.test(file.relPath) || file.contentB64.length > 12 * 1024 * 1024) continue
+      for (const root of [localWorktreeDir, hubRepoRoot]) {
+        if (!root) continue
+        try {
+          const folder = join(root, '.artifacts')
+          mkdirSync(folder, { recursive: true })
+          if (!lstatSync(folder).isDirectory() || relative(realpathSync(root), realpathSync(folder)) !== '.artifacts') continue
+          const target = join(root, file.relPath)
+          if (existsSync(target) && (!lstatSync(target).isFile() || root === hubRepoRoot)) continue
+          writeFileSync(target, Buffer.from(file.contentB64, 'base64'))
+        } catch {}
+      }
     }
   }
 
@@ -224,7 +228,7 @@ export function syncRemoteNodeGitBranch(input: {
     if (localWorktreeDir && existsSync(join(localWorktreeDir, '.git'))) {
       try {
         runGit(localWorktreeDir, ['fetch', fetchTarget, branch])
-        runGit(localWorktreeDir, ['reset', '--hard', 'FETCH_HEAD'])
+        if (!runGit(localWorktreeDir, ['status', '--porcelain', '--untracked-files=no'])) runGit(localWorktreeDir, ['merge', '--ff-only', 'FETCH_HEAD'])
       } catch {}
     }
     const baseHead = runGit(hubRepoRoot, ['rev-parse', 'HEAD'])
@@ -233,13 +237,12 @@ export function syncRemoteNodeGitBranch(input: {
     if (ahead === 0) {
       return { merged: Boolean(syncedFiles?.length), output: 'Remote worker branch is already up to date with Hub HEAD.' }
     }
-    const mergeOut = runGit(hubRepoRoot, ['merge', '--no-edit', 'FETCH_HEAD'])
+    const mergeOut = runGit(hubRepoRoot, ['merge', '--ff-only', 'FETCH_HEAD'])
     return {
       merged: true,
       output: [fetchOut, mergeOut].filter(Boolean).join('\n') || `Fetched and merged ${branch} from ${remoteGitSource}.`,
     }
   } catch (err) {
-    try { runGit(hubRepoRoot, ['merge', '--abort']) } catch {}
     const msg = err instanceof Error ? err.message : String(err)
     return { merged: Boolean(syncedFiles?.length), output: '', error: msg }
   } finally {
@@ -253,7 +256,8 @@ export function syncRemoteNodeGitBranch(input: {
  */
 export async function dispatchTurnToRemoteNode(input: {
   node: WorkerNodeRecord
-  receiptSecret?: string
+  hubIdentity?: DeviceIdentityRecord
+  rememberDispatch?: (token: string, tools: string[]) => void
   hubUrl: string
   hubEndpoints?: string[]
   sessionId: string
@@ -281,11 +285,7 @@ export async function dispatchTurnToRemoteNode(input: {
   if (!candidates.length) {
     throw new Error(`No reachable endpoints configured for worker node ${input.node.id}`)
   }
-  const toolDefs = [...input.tools.values()].map(t => ({
-    name: t.name,
-    description: t.description,
-    parameters: t.parameters,
-  }))
+  const toolDefs = [...input.tools.values()].map(t => describeSessionTool(t, input.sessionId))
   const activeModel = input.node.defaultModel ?? {
     provider: input.provider,
     model: input.model,
@@ -312,9 +312,14 @@ export async function dispatchTurnToRemoteNode(input: {
     ...(input.hubEndpoints?.length ? { hubEndpoints: input.hubEndpoints } : {}),
   }
 
-  const payload = await requestRemoteTurn({
-    candidates, body, signal: input.signal, onEvent: input.onEvent,
-    key: turnReceiptKey(input.receiptSecret ?? randomBytes(32).toString('hex'), body),
+  const key = turnReceiptKey(input.hubIdentity?.privateKeyPem ?? randomBytes(32).toString('hex'), body)
+  if (input.rememberDispatch) {
+    body.callbackToken = createHmac('sha256', key).update('RHarness tool callback v1').digest('hex')
+    input.rememberDispatch(body.callbackToken, toolDefs.map(spec => spec.name))
+  }
+  const payload = await requestRemoteTurn({ candidates, body, signal: input.signal, onEvent: input.onEvent, key,
+    expectedPeer: input.node.deviceId,
+    ...(input.hubIdentity ? { proofFor: (peer: string) => signOperation(input.hubIdentity!, key, 'worker-turn', [peer,body]) } : {}),
   })
   for (const ev of payload.events ?? []) {
     input.onEvent(ev.type, ev.data)
@@ -357,13 +362,15 @@ export async function handleIncomingRemoteTurn(
   },
 ): Promise<RemoteTurnResponseBody> {
   const slug = body.worktreeName || (body.ticketId ? `ticket-${body.ticketId.slice(0, 12)}` : body.sessionId.replace(/[^a-zA-Z0-9_-]/g, '-'))
+  if (isAbsolute(slug) || !/^[\p{L}\p{N}_-][\p{L}\p{N}_.-]{0,119}$/u.test(slug) || slug.endsWith('.')) throw new Error('Invalid ticket worktree name')
   const branchName = `agent/${slug}`
   const worktreeDir = resolve(options.stateDir, 'remote-work', slug)
   mkdirSync(resolve(options.stateDir, 'remote-work'), { recursive: true })
 
   if (existsSync(join(options.repoRoot, '.git')) && !existsSync(join(worktreeDir, '.git'))) {
     try {
-      runGit(options.repoRoot, ['worktree', 'add', '-B', branchName, worktreeDir, 'HEAD'])
+      const existing = runGit(options.repoRoot, ['branch', '--list', branchName])
+      runGit(options.repoRoot, existing ? ['worktree', 'add', worktreeDir, branchName] : ['worktree', 'add', '-b', branchName, worktreeDir, 'HEAD'])
     } catch {
       mkdirSync(worktreeDir, { recursive: true })
     }
@@ -371,7 +378,7 @@ export async function handleIncomingRemoteTurn(
     mkdirSync(worktreeDir, { recursive: true })
   }
 
-  // Snapshot helper: commits any dirty worktree files, builds a git bundle of `branchName`, and collects `.artifacts/*` & changed docs
+  // Ship tracked files in Git and bounded report attachments separately.
   const snapshotRemoteWorktree = (): {
     headSha: string
     gitBundleB64?: string
@@ -380,32 +387,12 @@ export async function handleIncomingRemoteTurn(
     let headSha = ''
     let gitBundleB64: string | undefined
     const syncedFiles: RemoteSyncedFile[] = []
-    const seenRel = new Set<string>()
-
-    const addFileIfSmall = (fullPath: string, relPath: string) => {
-      const normRel = relPath.replaceAll('\\', '/')
-      if (seenRel.has(normRel) || normRel.includes('..')) return
-      try {
-        if (!existsSync(fullPath)) return
-        const st = statSync(fullPath)
-        if (!st.isFile() || st.size > 2 * 1024 * 1024) return
-        seenRel.add(normRel)
-        syncedFiles.push({
-          relPath: normRel,
-          contentB64: readFileSync(fullPath).toString('base64'),
-        })
-      } catch {}
-    }
-
-    // Collect any `.artifacts/*` files in the remote worktree (which are git-ignored so not in the git bundle)
-    const artDir = join(worktreeDir, '.artifacts')
-    if (existsSync(artDir)) {
-      try {
-        for (const name of readdirSync(artDir)) {
-          addFileIfSmall(join(artDir, name), `.artifacts/${name}`)
-        }
-      } catch {}
-    }
+    let totalBytes = 0
+    collectReportFiles(worktreeDir, (file, bytes) => {
+      if (totalBytes + file.bytes > 8 * 1024 * 1024) return
+      totalBytes += file.bytes
+      syncedFiles.push({ relPath: '.artifacts/' + file.name, contentB64: bytes.toString('base64') })
+    })
 
     const wtStatus = inspectTicketWorktree(options.repoRoot, worktreeDir)
     if (wtStatus.available) {
@@ -419,13 +406,6 @@ export async function handleIncomingRemoteTurn(
         headSha = runGit(worktreeDir, ['rev-parse', '--short', 'HEAD'])
         // Only bundle & collect changed files when the remote worktree branch actually has commits ahead of baseBranch
         if (wtStatus.aheadCommits.length > 0 || wtStatus.dirtyFiles.length > 0) {
-          const changedList = runGit(worktreeDir, ['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'])
-            .split(/\r?\n/)
-            .map(s => s.trim())
-            .filter(Boolean)
-          for (const rel of changedList) {
-            addFileIfSmall(join(worktreeDir, rel), rel)
-          }
           const tmpBundle = join(tmpdir(), `rharness-out-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.bundle`)
           try {
             runGit(worktreeDir, ['bundle', 'create', tmpBundle, branchName])
@@ -462,6 +442,7 @@ export async function handleIncomingRemoteTurn(
         // BEFORE sending the report to the Hub, so the Hub merges the branch and writes artifacts BEFORE waking Eval!
         const preReportSnap = def.name === 'orchestrator_report' ? snapshotRemoteWorktree() : undefined
 
+        const operationKey = randomBytes(24).toString('hex')
         let lastHubErr: Error | undefined
         for (const candidate of hubCandidates) {
           const hubBase = candidate.replace(/\/+$/, '')
@@ -471,8 +452,8 @@ export async function handleIncomingRemoteTurn(
               signal: exec.signal,
               headers: { 'content-type': 'application/json', 'x-orchestrator-request': '1' },
               body: JSON.stringify({
-                name: def.name,
-                args,
+                name: def.name, args,
+                ...(body.callbackToken ? { callbackToken: body.callbackToken, operationKey } : {}),
                 ...(preReportSnap
                   ? {
                       branch: branchName,
@@ -491,7 +472,7 @@ export async function handleIncomingRemoteTurn(
             return data.result
           } catch (err) {
             lastHubErr = err instanceof Error ? err : new Error(String(err))
-            if (exec.signal.aborted) throw lastHubErr
+            if (exec.signal.aborted || !body.callbackToken) throw lastHubErr
           }
         }
         throw lastHubErr ?? new Error(`All Hub endpoints failed for tool ${def.name}`)

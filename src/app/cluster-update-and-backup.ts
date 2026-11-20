@@ -358,6 +358,8 @@ export interface DataCenterBackupSummary {
   includesSecrets: boolean
 }
 
+import type { WorkspaceArchive } from './workspace-records.ts'
+
 export interface DataCenterBackupPayload {
   version: 1
   createdAt: string
@@ -376,6 +378,7 @@ export interface DataCenterBackupPayload {
     modelProfiles?: ModelProfilesConfig
     pluginState?: PluginRegistryState
     clawfeedItems?: unknown[]
+    workspace?: WorkspaceArchive
     losslessDag?: unknown
     selfImprovingLearnings?: unknown[]
     stickers: StickerRecord[]
@@ -414,6 +417,7 @@ export function createDataCenterBackupArchive(input: {
   clawfeedItems?: unknown[]
   losslessDag?: unknown
   selfImprovingLearnings?: unknown[]
+  workspace?: WorkspaceArchive
   stickers: StickerRecord[]
   now?: Date
 }): { payload: DataCenterBackupPayload; archiveGz: Buffer; sha256: string } {
@@ -450,6 +454,7 @@ export function createDataCenterBackupArchive(input: {
       ambientConfig: input.ambientConfig,
       ...(input.includesSecrets && input.amapApiKey ? { amapApiKey: input.amapApiKey } : {}),
       memories: input.memories,
+      ...(input.workspace ? { workspace: input.workspace } : {}),
       assistantMessages: input.assistantMessages,
       ...(input.assistantContextConfig ? { assistantContextConfig: input.assistantContextConfig } : {}),
       ...(input.modelProfiles ? { modelProfiles: input.modelProfiles } : {}),

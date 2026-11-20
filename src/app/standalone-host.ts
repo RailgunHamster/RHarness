@@ -7,6 +7,7 @@
  * - Human Operator in Panel Session Console (`human`)
  */
 import { Context } from '@deepseek-ai/cordis'
+import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -29,6 +30,12 @@ export interface RegisteredToolSpec {
   parameters?: unknown
   output?: { render?: (args: unknown, value: unknown) => unknown }
   execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown>
+}
+
+export function describeSessionTool(spec: RegisteredToolSpec, sessionId: string) {
+  const role = sessionId.startsWith('worker-') ? 'worker' : sessionId.startsWith('orchestrator-') ? 'orchestrator' : 'assistant'
+  const version = createHash('sha256').update(JSON.stringify([spec.name,spec.description,spec.parameters])).digest('hex').slice(0, 16)
+  return { name: spec.name, description: spec.description, parameters: spec.parameters, version, role }
 }
 
 export interface SessionTurnMessage {
@@ -640,7 +647,7 @@ export function createStandaloneHost(options: StandaloneHostOptions) {
         model: scheduledModel ?? rec?.model ?? agent?.options ?? (cachedCatalog ?? FALLBACK_CATALOG).default,
         ...(rec?.model ? { lastTurnModel: rec.model } : {}),
         systemPrompt: agent ? [...agent.sections.values()].map(s => s.text({})).join('\n\n') : '',
-        tools: agent ? [...agent.tools.values()].map(t => ({ name: t.name, description: t.description, parameters: t.parameters })) : [],
+        tools: agent ? [...agent.tools.values()].map(t => describeSessionTool(t, sessionId)) : [],
         events: [...(rec?.events ?? [])],
         liveTrace: liveTrace(sessionId, cwd, rec?.events ?? []),
       }

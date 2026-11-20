@@ -6,7 +6,7 @@ export interface SessionSummary {
   id: string; title: string; status: string; model: { provider: string; model: string; reasoningEffort?: string }
 }
 export interface SessionDetail extends SessionSummary {
-  cwd: string; systemPrompt: string; tools: { name: string; description: string }[]
+  cwd: string; systemPrompt: string; tools: { name: string; description: string; parameters?: unknown; role?: string; version?: string }[]
   events: SessionEvent[]; liveTrace?: TraceStep[]
 }
 export interface SessionUpdate {
@@ -463,6 +463,7 @@ export interface ClusterUpdateStatusInfo {
     shortCommit: string
     subject?: string
     isDataCenter?: boolean
+    capabilities?: { node: string; platform: string; receiptProtocol: number; probes: Record<string,{ passed: boolean; provider: string; model: string; at: string }> }
     busy?: { busy: boolean; reasons: string[] }
     stagedBuildId?: string | null
   }[]

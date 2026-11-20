@@ -14,7 +14,7 @@
 .dt-model-pill strong { color: var(--dsw-alias-label-primary); font-weight: 600; }
 .dt-pill-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-brand-primary); display: inline-block; }
 .dt-pill-dot[data-tone='worker'] { background: var(--dsw-alias-state-success-primary); }
-.dt-standalone-root { padding-bottom: 36px; }
+.dt-standalone-root { padding-bottom: 36px; font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif; }
 .dt-workbench-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; width: min(1440px, calc(100% - 32px)); margin: 18px auto 0; align-items: start; }
 .dt-panel-conversation, .dt-live-workspace, .dt-pipeline-card { box-sizing: border-box; display: flex; flex-direction: column; gap: 14px; width: 100%; margin: 0; padding: 16px; border: 1px solid var(--dsw-alias-border-l3); border-radius: 16px; background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); scroll-margin-top: 68px; min-width: 0; }
 .dt-workbench-grid > .dt-panel-conversation { grid-column: 1; grid-row: 1; }
@@ -100,6 +100,11 @@
 }
 .dt-assistant-header { order: 0; }
 .dt-assistant-toolbar { order: 2; padding: 0 2px; }
+.dt-assistant-toolbar[hidden] { display: none; }
+.dt-assistant-welcome { flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 14px; padding: 18px 6px; text-align: center; color: var(--dsw-alias-label-secondary); }
+.dt-assistant-welcome > svg { padding: 11px; box-sizing: content-box; border-radius: 15px; color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-1); }
+.dt-assistant-welcome h3 { margin: 0; font-size: clamp(17px, 2vw, 22px); letter-spacing: -.02em; color: var(--dsw-alias-label-primary); }
+.dt-assistant-welcome .dt-row-buttons { justify-content: center; }
 .dt-assistant-stream { order: 3; min-height: 360px; max-height: clamp(380px, calc(100dvh - 320px), 780px); padding: 14px 16px; gap: 12px; }
 .dt-assistant-composer { order: 4; gap: 8px; }
 .dt-assistant-composer .dt-image-drop { padding: 10px 12px; border-style: solid; border-color: var(--dsw-alias-border-l3); border-radius: 14px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); }

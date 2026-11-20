@@ -506,3 +506,31 @@ describe('distributed LAN worker nodes and P2P Git fast-forward merge', () => {
     }
   }, 60_000)
 })
+
+it('recovers a lost acceptance over another address without resubmitting to another device', async () => {
+  const { requestRemoteTurn } = await import('../src/app/turn-receipts.ts')
+  const body = { sessionId: 'worker-fixture', provider: 'test', model: 'test', messages: [], systemPrompt: '', toolDefs: [] }
+  const journal = new TurnReceipts(':memory:')
+  const key = turnReceiptKey('fixture-hub',body)
+  const execute = vi.fn(async (emit: (event: { type: string; data: unknown }) => void) => {
+    emit({ type: 'progress', data: 'one' }); return { replyText: 'finished', events: [] }
+  })
+  const onEvent = vi.fn()
+  try {
+    vi.stubGlobal('fetch',async (url: string, init: RequestInit) => {
+      const parsed = new URL(url)
+      const identity = parsed.hostname === 'unrelated.test' ? 'other' : 'same-worker'
+      if (init.method === 'HEAD') return new Response(null,{ headers: { 'x-turn-peer': identity, 'x-turn-protocol': '1' } })
+      expect(identity).toBe('same-worker')
+      if (parsed.searchParams.get('receipt') === 'start') {
+        journal.start(key,body,execute)
+        if (parsed.hostname === 'first.test') throw new TypeError('Lost acceptance')
+      }
+      return Response.json(journal.read(key,Number(parsed.searchParams.get('after'))))
+    })
+    const result = await requestRemoteTurn({ body,key,onEvent,expectedPeer: 'same-worker', signal: AbortSignal.timeout(3000), candidates: ['http://first.test','http://unrelated.test','http://second.test'] })
+    expect(result.replyText).toBe('finished')
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(onEvent.mock.calls).toEqual([['progress','one']])
+  } finally { vi.unstubAllGlobals(); await journal.close() }
+})

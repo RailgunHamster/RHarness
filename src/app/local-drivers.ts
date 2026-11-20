@@ -13,6 +13,7 @@ import { delimiter, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { zstdDecompressSync } from 'node:zlib'
+import { discoverOllama, ollamaBase, runOllamaTurn } from './ollama-driver.ts'
 import { nativeModelQueue } from './model-queue.ts'
 import { codexTurnContent, dshTurnContent, localMessageImages } from './local-images.ts'
 import type { RegisteredToolSpec, SessionTurnMessage } from './standalone-host.ts'
@@ -22,8 +23,9 @@ export type { LiveTraceStep } from './session-events.ts'
 const providerEndpoints = new Map<string, string>()
 
 export function runNativeModelTurn(input: Parameters<typeof runDshTurn>[0]): Promise<string> {
-  const endpoint = providerEndpoints.get(input.provider) ?? input.provider
+  const endpoint = input.provider === 'ollama-local' ? new URL(ollamaBase()).origin : providerEndpoints.get(input.provider) ?? input.provider
   const foreground = !input.sessionId?.startsWith('worker-')
+  if (input.provider === 'ollama-local') return runOllamaTurn(input, request => nativeModelQueue.run(endpoint, foreground, input.signal, request))
   return nativeModelQueue.run(endpoint, foreground, input.signal, () => {
     if (input.provider === 'codex') return runCodexTurn(input)
     if (input.provider === 'cursor') return runCursorTurn(input)
@@ -588,13 +590,15 @@ export async function discoverCursorCatalog(): Promise<CatalogGroup | undefined>
 
 /** Build the complete live catalog combining local DSH providers (including Claude), local Codex App Server, local Cursor Agent CLI, and Human Console. */
 export async function discoverFullLocalCatalog(cacheFile?: string): Promise<DiscoveredCatalog> {
-  const [dsh, codexGroup, cursorGroup] = await Promise.all([
+  const [dsh, codexGroup, cursorGroup, ollama] = await Promise.all([
     discoverDshCatalog(),
     discoverCodexCatalog(),
     discoverCursorCatalog(),
+    discoverOllama(),
   ])
 
   const groups: CatalogGroup[] = [...dsh.groups]
+  if (ollama && !groups.some(group => group.id === ollama.id)) groups.push(ollama)
   if (codexGroup) {
     groups.push(codexGroup)
   }
@@ -629,6 +633,7 @@ export async function discoverFullLocalCatalog(cacheFile?: string): Promise<Disc
 
 /** Execute a turn using the local Codex App Server (`codex app-server`) with dynamic tools bridged to the Session's tools. */
 export async function runCodexTurn(input: {
+  diagnostic?: boolean
   model: string
   reasoningEffort?: string
   cwd: string
@@ -780,7 +785,7 @@ export async function runCodexTurn(input: {
       allowProviderModelFallback: false,
       cwd: input.cwd,
       runtimeWorkspaceRoots: [input.cwd],
-      sandbox: 'danger-full-access',
+      sandbox: input.diagnostic ? 'read-only' : 'danger-full-access',
       approvalPolicy: 'never',
       ephemeral: true,
       dynamicTools,
@@ -813,6 +818,7 @@ export async function runCodexTurn(input: {
 
 /** Execute a turn using the local `@deepseek-ai/dsh` agent runtime with registered session tools. */
 export async function runDshTurn(input: {
+  diagnostic?: boolean
   sessionId?: string
   provider: string
   model: string
@@ -866,7 +872,7 @@ export async function runDshTurn(input: {
   const isAssistantSession = input.sessionId === 'claw-assistant-main'
   const isOrchestratorSession = Boolean(input.sessionId?.startsWith('orchestrator-'))
 
-  const roleOverrides = isAssistantSession
+  const roleOverrides = (input.diagnostic || isAssistantSession)
     ? [
         // Personal Assistant has NO local repo/filesystem/shell/subagent tools and does NOT load repo AGENTS.md
         { id: 'agent-instructions', disabled: true },
@@ -910,7 +916,7 @@ export async function runDshTurn(input: {
     { id: 'agent-loop', config: { agents: [] } },
     { id: 'session-persistence-jsonl', config: { root: join(temp, 'sessions') } },
     { id: 'approval', config: { policy: 'never' } },
-    { id: 'sandbox-policy', config: { mode: 'danger-full-access', workspaceRoot: input.cwd } },
+    { id: 'sandbox-policy', config: { mode: input.diagnostic ? 'read-only' : 'danger-full-access', workspaceRoot: input.cwd } },
     { id: 'system-prompt', config: { [personaField]: input.systemPrompt } },
     ...roleOverrides,
   ]
@@ -1084,6 +1090,7 @@ export function readLiveDshTrace(sessionId: string, cwd: string): LiveTraceStep[
 
 /** Execute a turn using the local Cursor Agent CLI (`cursor-agent --print --force --trust --model <model>`). */
 export async function runCursorTurn(input: {
+  diagnostic?: boolean
   model: string
   cwd: string
   systemPrompt: string
@@ -1112,8 +1119,7 @@ export async function runCursorTurn(input: {
         '--print',
         '--output-format', 'stream-json',
         '--stream-partial-output',
-        '--force',
-        '--trust',
+        ...(input.diagnostic ? ['--mode', 'ask'] : ['--force', '--trust']),
         '--workspace', input.cwd,
         '--model', input.model || 'auto',
         promptText,

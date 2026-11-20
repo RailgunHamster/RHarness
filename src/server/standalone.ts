@@ -77,7 +77,7 @@ import {
   retagOwnClaims,
   parseInvitationUri,
   redeemGroupInvitation,
-  verifyAndExtractGroupMembers,
+  verifyAndExtractGroupMembers, verifySignedClaim, signOperation, validOperation, sha256Hex, type PeerOperation,
   type DeviceGroupPacket,
   type DeviceJoinRequest,
 } from '../app/device-group.ts'
@@ -189,7 +189,7 @@ import {
   buildClawFeedPluginTools,
   buildPersonalSkillsPluginTools,
   createFeishuStreamingCardSession,
-  executePersonalSkillLocal, localPersonalTarget, hasLocalClawPersonalAssets as hasPersonalTarget, needsWriteReview,
+  executePersonalSkillLocal, localPersonalTarget, resolvePersonalTarget, hasLocalClawPersonalAssets as hasPersonalTarget, needsWriteReview,
   executePersonalSkillWithRemoteFallback,
   formatAgentToolStatusLabel,
   getClawFeedSinkEndpoints,
@@ -214,7 +214,10 @@ import {
   type RemoteTurnRequestBody,
   type WorkerNodeRecord,
 } from '../app/worker-nodes.ts'
-import { WorkspaceRecords, RevisionConflict, draftInput, workspaceTools } from '../app/workspace-records.ts'
+import { consumeDueReviews, reviewInput, saveReview } from '../app/scheduled-reviews.ts'
+import { collectReportFiles } from '../app/report-files.ts'
+import { WorkspaceRecords, RevisionConflict, draftInput, transcriptDocument, workspaceTools } from '../app/workspace-records.ts'
+import { probeModel, type ProbeKind, type ProbeResult } from '../app/model-probe.ts'
 import { nativeModelQueue } from '../app/model-queue.ts'
 import { TurnReceipts } from '../app/turn-receipts.ts'
 import { KV } from '../kv.ts'
@@ -514,6 +517,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   recoverStaleStateLock(stateDir)
 
   let turnReceipts: TurnReceipts | undefined
+  const activeProbes = new Set<string>()
+  const recentProbes = new Map<string, ProbeResult>()
   let browserInput: BrowserInputLease | undefined
   const browserLease = () => browserInput ??= new BrowserInputLease(runtime.store.get(KV.browser.paused) ?? false)
   let workspace: WorkspaceRecords | undefined
@@ -951,6 +956,11 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     return identity
   }
 
+  const trustedPeers = () => {
+    const identity = getDeviceIdentity(), packet = runtime.store.get(KV.deviceGroup.packet)
+    return [identity.publicKeyB64, ...(packet ? verifyAndExtractGroupMembers(packet).map(member => member.publicKeyB64) : [])]
+  }
+
   const getRegisteredNodes = (): WorkerNodeRecord[] => {
     const local = defaultLocalNode(actualPort)
     if (!runtime) return [local]
@@ -1199,7 +1209,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             : [`http://127.0.0.1:${actualPort}`]
           const remoteRes = await dispatchTurnToRemoteNode({
             node: targetNode,
-            receiptSecret: hubIdentity.privateKeyPem,
+            hubIdentity,
+            rememberDispatch: (token, tools) => runtime.store.set(KV.nodes.dispatch(effectiveReq.sessionId), { digest: sha256Hex(token), tools }),
             hubUrl: hubEndpoints[0] ?? `http://127.0.0.1:${actualPort}`,
             hubEndpoints,
             sessionId: effectiveReq.sessionId,
@@ -1258,12 +1269,16 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   const tryAutoMergeTicket = (sessionId: string) => {
     try {
       if (!runtime || runtime.lifetime.aborted || !sessionId.startsWith('worker-')) return
-      if (!isPluginEnabled('dsh-worktree-merge')) return
       const ticketId = sessionId.slice('worker-'.length)
       const ticket = runtime.store.tickets.get(ticketId)
       if (!ticket?.execution?.directory) return
       const reportState = ticket.assignments.at(-1)?.report?.state
       if (reportState === 'ready' || reportState === 'waiting') {
+        const summary = ticket.assignments.at(-1)?.report?.summary ?? ticket.title
+        collectReportFiles(ticket.execution.directory, (metadata, bytes) => {
+          workspaceRecords().publishFile(sessionId, metadata, bytes, summary)
+        })
+        if (!isPluginEnabled('dsh-worktree-merge')) return
         autoMergeTicketWorktree(process.cwd(), ticket.execution.directory, { title: ticket.title })
       }
     } catch {}
@@ -1992,6 +2007,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       setTimeout(() => tryAutoMergeTicket(agent.id), 120)
     }
     if (status === 'idle' && agent.id === ASSISTANT_SESSION_ID) {
+      refreshLosslessIndex()
       void broadcastAssistantStateToPeers('merge')
       void broadcastMemoriesStateToPeers('merge')
       setTimeout(() => {
@@ -2006,21 +2022,22 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     }
   }) as never)
 
+  function refreshLosslessIndex() {
+    const previous = getLcmDag()
+    if (!runtime || runtime.lifetime.aborted || !isPluginEnabled('dsh-lossless-context')) return previous
+    const all = runtime.store.get(KV.assistant.messages) ?? []
+    const config = runtime.store.get(KV.plugins.config('dsh-lossless-context')) ?? {}
+    const next = ingestMessagesIntoLcmDag(previous, all, Number(config.freshTailCount ?? getAssistantContextConfig().recentMessagesLimit ?? 6), Math.max(2, Number(config.chunkSize ?? 6)))
+    if (next.nodes.length !== previous.nodes.length || next.coveredMessageIds.length !== previous.coveredMessageIds.length) runtime.store.set(KV.lossless.dag, next)
+    return next
+  }
+
   // Mount first-class plugins onto Agent Sessions while keeping Engineering Eval (`orchestrator-*`) 100% pure
   host.ctx.on('agent/created' as never, (({ agent }: { agent: { id: string; ctx: { tools?: { register: (t: unknown) => void }; systemPrompt?: { section: (s: unknown) => void } } } }) => {
     const isAssistant = agent.id === ASSISTANT_SESSION_ID
     const isWorker = agent.id.startsWith('worker-')
     // Never pollute the Engineering Eval (`orchestrator-*`) session with personal assistant or memory tools
     if (!isAssistant && !isWorker) return
-
-    // Declared before the assistant-only registrations so persona/ambient and bridge tools are mirrored into the same
-    // registry `tool_catalog_search` / `tool_catalog_describe` enumerate (they were previously invisible there, which
-    // made the assistant conclude its sticker tools had disappeared).
-    const sessionToolRegistry = new Map<string, ReturnType<typeof buildModelUsageTools>[0]>()
-    const registerWithMirror = (spec: ReturnType<typeof buildModelUsageTools>[0]) => {
-      sessionToolRegistry.set(spec.name, spec)
-      agent.ctx.tools?.register(spec)
-    }
 
     if (isAssistant) {
       agent.ctx.systemPrompt?.section({
@@ -2044,7 +2061,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         },
       })
       for (const bridgeTool of buildAssistantBridgeTools(() => runtime, id => workspaceRecords().list(id).filter(doc => doc.kind === 'report'))) {
-        registerWithMirror(bridgeTool)
+        agent.ctx.tools?.register(bridgeTool)
       }
       for (const pat of buildAssistantPersonaAmbientTools({
         isEnabled: () => isPluginEnabled('dsh-assistant-persona'),
@@ -2072,11 +2089,11 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           return undefined
         },
       })) {
-        registerWithMirror(pat)
+        agent.ctx.tools?.register(pat)
       }
     }
 
-    for (const spec of workspaceTools(workspaceRecords, agent.id)) registerWithMirror(spec)
+    for (const spec of workspaceTools(workspaceRecords, agent.id)) agent.ctx.tools?.register(spec)
     const role: 'assistant' | 'worker' = isAssistant ? 'assistant' : 'worker'
     const memoryAudience = (): MemoryAudience => ({ role, project: repoDir, device: getDeviceIdentity().deviceId })
     const sessionMemories = () => getMemoryEntries().filter(entry => visibleMemory(entry, memoryAudience()))
@@ -2108,7 +2125,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         if (!isPluginEnabled('dsh-personal-skills')) return undefined
         const out = (await executePersonalSkillWithRemoteFallback(
           'siyuan_search',
-          { query, limit: 10 },
+          { query, limit: 10, ...(isAssistant ? {} : { instance: 'siyuan' }) },
           getRegisteredNodes,
         )) as { ok?: boolean; count?: number; items?: unknown[] } | undefined
         if (out?.ok && Array.isArray(out.items) && out.items.length > 0) {
@@ -2141,7 +2158,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             }
             if (t.name === 'memory_save' && resObj.saved && resObj.memory) {
               const mem = resObj.memory
-              const prev = beforeEntries.find(e => e.id === mem.id || e.title.trim().toLowerCase() === mem.title.trim().toLowerCase())
+              const prev = beforeEntries.find(e => e.id === mem.id)
               recordPersistenceChange({
                 domain: 'memory',
                 mode: 'auto',
@@ -2197,6 +2214,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         const record = workspaceRecords().propose(agent.id, name, target, parsed)
         return { state: record.state, id: record.id, revision: record.revision, target, message: 'Pending user review in Workspace documents. The action has not run.' }
       },
+      (source, transcript) => workspaceRecords().save(transcriptDocument(source, transcript), agent.id),
     )
     for (const pst of personalSkillTools) {
       agent.ctx.tools?.register(pst)
@@ -2211,15 +2229,11 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     }
 
     // Mount absorbed OpenClaw & Community Top Plugins (Model Usage, Lossless DAG, Self-Improving, Web Research, Browser Bridge, Progress Card, Data SQL, Tool Search)
-    for (const mt of memTools) sessionToolRegistry.set(mt.name, mt)
-    for (const pst of personalSkillTools) sessionToolRegistry.set(pst.name, pst)
-    for (const cft of clawFeedTools) sessionToolRegistry.set(cft.name, cft)
-
     for (const ut of buildModelUsageTools(getModelUsageState, getRuntimeGuardStats, () => isPluginEnabled('dsh-model-usage'))) {
-      registerWithMirror(ut)
+      agent.ctx.tools?.register(ut)
     }
-    for (const lt of buildLosslessContextTools(getLcmDag, readChatArchive, () => isPluginEnabled('dsh-lossless-context'))) {
-      registerWithMirror(lt)
+    for (const lt of buildLosslessContextTools(isAssistant ? getLcmDag : defaultLcmDagState, readChatArchive, () => isAssistant && isPluginEnabled('dsh-lossless-context'))) {
+      agent.ctx.tools?.register(lt)
     }
     for (const sit of buildSelfImprovingTools({
       readLearnings: getLearnings,
@@ -2238,16 +2252,16 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       },
       isEnabled: () => isPluginEnabled('dsh-self-improving'),
     })) {
-      registerWithMirror(sit)
+      agent.ctx.tools?.register(sit)
     }
     for (const wrt of buildWebResearchPluginTools(
       () => (runtime ? (runtime.store.get(KV.plugins.config('dsh-web-research')) ?? {}) : {}),
       () => isPluginEnabled('dsh-web-research'),
     )) {
-      registerWithMirror(wrt)
+      agent.ctx.tools?.register(wrt)
     }
     for (const bbt of buildBrowserBridgeTools(getRegisteredNodes, () => isPluginEnabled('dsh-browser-bridge'), { lease: browserLease(), session: agent.id })) {
-      registerWithMirror(bbt)
+      agent.ctx.tools?.register(bbt)
     }
     for (const pct of buildProgressCardTools({
       sessionId: agent.id,
@@ -2255,10 +2269,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       writeCards: setProgressCards,
       isEnabled: () => isPluginEnabled('dsh-progress-card'),
     })) {
-      registerWithMirror(pct)
+      agent.ctx.tools?.register(pct)
     }
     for (const dst of buildDataSqlPluginTools(() => isPluginEnabled('dsh-data-sql'))) {
-      registerWithMirror(dst)
+      agent.ctx.tools?.register(dst)
     }
     if (privateToolkitMod) {
       for (const rkt of privateToolkitMod.buildRHToolkitPluginTools(
@@ -2269,26 +2283,18 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
         },
         () => isPluginEnabled('dsh-rhtoolkit'),
       )) {
-        registerWithMirror(rkt)
+        agent.ctx.tools?.register(rkt)
       }
     }
-    for (const tst of buildToolSearchPluginTools(() => sessionToolRegistry, () => isPluginEnabled('dsh-tool-search'))) {
-      registerWithMirror(tst)
+    for (const tst of buildToolSearchPluginTools(() => host.agents.get(agent.id)?.tools ?? new Map(), () => isPluginEnabled('dsh-tool-search'), agent.id)) {
+      agent.ctx.tools?.register(tst)
     }
 
     agent.ctx.systemPrompt?.section({
       name: 'rharness-lossless-dag',
       text: () => {
         if (!isAssistant || !runtime || !isPluginEnabled('dsh-lossless-context')) return ''
-        const allMsgs = runtime.store.get(KV.assistant.messages) ?? []
-        const lcmCfg = runtime.store.get(KV.plugins.config('dsh-lossless-context')) ?? {}
-        const freshTail = Number(lcmCfg.freshTailCount ?? getAssistantContextConfig().recentMessagesLimit ?? 6)
-        const chunkSz = Math.max(2, Number(lcmCfg.chunkSize ?? 6))
-        const updatedDag = ingestMessagesIntoLcmDag(getLcmDag(), allMsgs, freshTail, chunkSz)
-        if (updatedDag.nodes.length !== getLcmDag().nodes.length) {
-          runtime.store.set(KV.lossless.dag, updatedDag)
-        }
-        return formatLosslessDagPromptSection(updatedDag)
+        return formatLosslessDagPromptSection(refreshLosslessIndex())
       },
     })
     agent.ctx.systemPrompt?.section({
@@ -2511,6 +2517,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       ambientConfig: getAmbientConfig(),
       ...(storedAmap ? { amapApiKey: storedAmap } : {}),
       memories: getMemoryEntries(),
+      ...(workspace || existsSync(join(stateDir, 'workspace-records.sqlite')) ? { workspace: workspaceRecords().archive() } : {}),
       assistantMessages: runtime?.store.get(KV.assistant.messages) ?? [],
       assistantContextConfig: getAssistantContextConfig(),
       ...(runtime?.store.get(KV.modelProfiles.config) ? { modelProfiles: runtime.store.get(KV.modelProfiles.config)! } : {}),
@@ -2547,6 +2554,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     if (restored.amapApiKey !== undefined) {
       runtime.store.set(KV.ambient.amap, { apiKey: restored.amapApiKey })
     }
+    if (payload.data.workspace) workspaceRecords().restore(payload.data.workspace, mode)
     runtime.store.set(KV.persona.stickers, restored.stickers)
     runtime.store.set(KV.assistant.contextConfig, restored.assistantContextConfig)
     runtime.store.set(KV.assistant.messages, restored.assistantMessages)
@@ -2562,6 +2570,16 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     return { safetySnapshot, summary: payload.summary, restoredStickerFiles: restored.restoredStickerFiles }
   }
 
+  const runScheduledReviews = () => {
+    const stored = runtime.store.get(KV.schedules.reviews) ?? []
+    const next = consumeDueReviews(stored, Date.now(), trigger => { runtime.receive(trigger) })
+    if (next !== stored) { runtime.store.set(KV.schedules.reviews, next); void runtime.pump().catch(() => {}) }
+    return next
+  }
+  const scheduleTimer = setInterval(() => {
+    if (!runtime.lifetime.aborted) runScheduledReviews()
+  }, 15_000)
+  scheduleTimer.unref()
   const maybeRunAutoDailyDataCenterBackup = () => {
     try {
       if (!runtime || !liveAgents || !isLocalDataCenter()) return
@@ -2863,6 +2881,31 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       try {
         await runtime.ready
 
+        if (sub === 'schedules' && req.method === 'GET') {
+          sendJson(res, 200, { items: runScheduledReviews() }); return
+        }
+        if (sub === 'schedules' && req.method === 'POST') {
+          const input = reviewInput.parse(await readJsonBody(req))
+          runtime.store.set(KV.schedules.reviews, saveReview(runtime.store.get(KV.schedules.reviews) ?? [], input))
+          sendJson(res, 200, { items: runScheduledReviews() }); return
+        }
+        if (sub === 'diagnostics/probe' && req.method === 'POST') {
+          const body = await readJsonBody(req)
+          const role = (['assistant','eval','executor'] as const).find(value => value === body.role)
+          const kind = (['text','tools','vision'] as ProbeKind[]).find(value => value === body.kind)
+          if (!role || !kind) throw new Error('Select a role and capability')
+          const selected = resolveActiveRoleModels()[role]
+          if (!selected || (!options.driver && !liveAgents)) throw new Error('No live driver for this role')
+          if (activeProbes.has(role)) { sendJson(res, 409, { error: 'Probe already running' }); return }
+          activeProbes.add(role)
+          try {
+            const result = await probeModel(selected, kind, options.driver ? async request => (await options.driver!({ ...request,
+              sessionId: request.sessionId!, onEvent: () => {}, onToolResult: () => {} })) ?? '' : undefined)
+            recentProbes.set(role + '/' + kind, result)
+            sendJson(res, 200, result)
+          } finally { activeProbes.delete(role) }
+          return
+        }
         if (sub === 'diagnostics' && req.method === 'GET') {
           const catalog = await host.getCatalog()
           const browser = await inspectLocalBrowserBridge()
@@ -2875,7 +2918,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           sendJson(res, 200, {
             build: currentBuild.shortCommit, platform: process.platform, nodeVersion: process.versions.node,
             protocol: 1, lastReceipt: turnReceipts?.diagnostics() ?? null, modelQueue: nativeModelQueue.snapshot(),
-            models: capabilities, browserConnected: browser.connected, browserPaused: browserLease().paused,
+            models: capabilities, probes: Object.fromEntries(recentProbes), browserConnected: browser.connected, browserPaused: browserLease().paused,
           })
           return
         }
@@ -2885,6 +2928,14 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           browserLease().setPaused(body.paused)
           runtime.store.set(KV.browser.paused, body.paused)
           sendJson(res, 200, { paused: browserLease().paused })
+          return
+        }
+        if (sub === 'workspace/file' && req.method === 'GET') {
+          const file = workspaceRecords().download(url.searchParams.get('id') ?? '', Number(url.searchParams.get('revision')))
+          if (!file) { sendJson(res, 404, { error: 'Report file unavailable' }); return }
+          res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(file.file.name),
+            'x-content-type-options': 'nosniff', 'cache-control': 'no-store' })
+          res.end(file.bytes)
           return
         }
         if (sub === 'workspace' && req.method === 'GET') {
@@ -2909,8 +2960,17 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           if (typeof body.approve !== 'boolean') throw new Error('A decision is required')
           const item = await workspaceRecords().decide(String(body.id), Number(body.revision), body.approve, async record => {
             const args = JSON.parse(record.text) as Record<string, unknown>
+            if (record.tool === 'meeting_followup' && record.target === 'panel/engineering') {
+              const note = workspaceRecords().get(String(args.id), Number(args.revision))
+              if (note?.kind !== 'meeting' || note.owner !== record.owner || !note.text.includes(String(args.excerpt))) throw new Error('Transcript reference changed')
+              const trigger = panelTrigger({ id: 'meeting-' + record.id, conversation: 'meeting-' + note.id, sender: 'operator',
+                at: new Date().toISOString(), text: String(args.request) + '\n\n' + note.title + ' · v' + note.revision + '\n' + String(args.excerpt) })
+              runtime.receive(trigger); await runtime.pump()
+              return { triggerId: trigger.id }
+            }
             if (!isPluginEnabled('dsh-personal-skills') || !record.tool || !record.target || !needsWriteReview(record.tool, args)) throw new Error('Connector unavailable')
-            const result = await executePersonalSkillWithRemoteFallback(record.tool, args, getRegisteredNodes, record.target)
+            const proof = signOperation(getDeviceIdentity(), record.id + ':' + record.revision, 'connector-write', [record.tool,record.target,args])
+            const result = await executePersonalSkillWithRemoteFallback(record.tool, args, getRegisteredNodes, record.target, proof)
             if (result && typeof result === 'object' && 'ok' in result && result.ok === false) throw new Error('Connector reported a failure. Check the destination.')
             return result
           })
@@ -5173,11 +5233,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           }
 
           if (actionId === 'send-feishu-test') {
-            const out = await executePersonalSkillWithRemoteFallback(
-              'feishu_send_dm',
-              { text: `✅ [RHarness 飞书直连测试] 来自 ${getDeviceIdentity().deviceName}：飞书 WebSocket 与私聊回复链路已就绪！您现在可以直接在飞书私聊向我发送任何问题或待办指令。` },
-              getRegisteredNodes,
-            )
+            const target = await resolvePersonalTarget(getRegisteredNodes)
+            const args = { text: `✅ [RHarness 飞书直连测试] 来自 ${getDeviceIdentity().deviceName}：飞书 WebSocket 与私聊回复链路已就绪！您现在可以直接在飞书私聊向我发送任何问题或待办指令。` }
+            const proof = signOperation(getDeviceIdentity(), 'manual-' + crypto.randomUUID(), 'connector-write', ['feishu_send_dm',target,args])
+            const out = await executePersonalSkillWithRemoteFallback('feishu_send_dm', args, getRegisteredNodes, target, proof)
             sendJson(res, 200, { ok: true, message: '已向您的飞书私聊发送测试消息', result: out })
             return
           }
@@ -5235,11 +5294,16 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
               const saved = saveMemoryEntry(mems, {
                 title: l.title,
                 content: l.suggestedRule,
-                category: 'preference',
+                category: l.kind === 'correction' ? 'preference' : 'episodic',
+                scope: l.kind === 'correction' ? 'personal' : 'project', scopeKey: l.kind === 'correction' ? '' : repoDir,
+                provenance: { reference: l.sourceSessionId || l.id, verifiedAt: l.updatedAt },
                 tags: ['self-improving', l.kind],
-                pinned: true,
+                pinned: l.kind === 'correction',
                 source: 'user',
               })
+              const prev = mems.find(entry => entry.id === saved.entry.id)
+              recordPersistenceChange({ domain: 'memory', mode: 'approval', status: 'approved', summary: saved.entry.title, toolName: 'promote-all-learnings',
+                patch: { domain: 'memory', op: prev ? 'update' : 'add', entryId: saved.entry.id, ...(prev ? { before: prev } : {}), after: saved.entry } })
               mems = saved.list
               count++
               return { ...l, status: 'promoted' as const, promotedMemoryId: saved.entry.id, updatedAt: new Date().toISOString() }
@@ -5248,7 +5312,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             setLearnings(updatedLearnings)
             sendJson(res, 200, {
               ok: true,
-              message: `已将 ${count} 条经验记录晋升为常驻记忆规则`,
+              message: `已保存 ${count} 条有来源的经验记录`,
             })
             return
           }
@@ -5433,6 +5497,8 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
               subject: currentBuild.subject,
               isDataCenter: isLocalDataCenter(),
               busy: isNodeBusyForUpdate(),
+              capabilities: { node: process.versions.node, platform: process.platform, receiptProtocol: 1,
+                probes: Object.fromEntries([...recentProbes].map(([key,p]) => [key, { passed: p.passed, provider: p.provider, model: p.model, at: p.at }])) },
               stagedBuildId: stagedUpdate?.envelope.manifest.buildId ?? null,
             })
             return
@@ -6017,7 +6083,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           const incoming = body.packet as DeviceGroupPacket
           const members = verifyAndExtractGroupMembers(incoming)
           const identity = getDeviceIdentity()
-          if (!members.some(m => m.deviceId === identity.deviceId)) {
+          const current = runtime.store.get(KV.deviceGroup.packet)
+          const rootKey = (packet: DeviceGroupPacket) => verifySignedClaim(packet.root).publicKeyB64
+          if (!current || current.groupId !== incoming.groupId || rootKey(current) !== rootKey(incoming)) throw new Error('Join the device group locally before accepting updates')
+          if (!members.some(m => m.deviceId === identity.deviceId && m.publicKeyB64 === identity.publicKeyB64)) {
             throw new Error('同步的设备组证明不包含本机身份')
           }
           runtime.store.set(KV.deviceGroup.packet, incoming)
@@ -6109,6 +6178,19 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           const toolArgs = (typeof body.args === 'object' && body.args !== null ? body.args : {}) as Record<string, unknown>
           if (!toolName) throw new Error('Personal skill tool name is required')
           if (body.expectedTarget && body.expectedTarget !== localPersonalTarget()) throw new Error('Connector account changed')
+          if (needsWriteReview(toolName, toolArgs)) {
+            const target = localPersonalTarget()
+            const proof = body.proof as PeerOperation | undefined
+            const content = [toolName, target, toolArgs]
+            if (!proof || body.expectedTarget !== target || !validOperation(proof, 'connector-write', content, trustedPeers())) {
+              sendJson(res, 403, { error: 'A reviewed write from a paired device is required' }); return
+            }
+            const key = proof.issuer + '/' + proof.key, digest = sha256Hex(JSON.stringify(content))
+            const receipt = body.receiptOnly === true ? workspaceRecords().operation(key, digest)
+              : await workspaceRecords().performOnce(key, digest, () => executePersonalSkillLocal(toolName, toolArgs))
+            if (receipt?.state !== 'done') { sendJson(res, 409, { error: 'Check the destination before retrying', state: receipt?.state ?? 'unknown' }); return }
+            sendJson(res, 200, { ok: true, result: receipt.result }); return
+          }
           const result = await executePersonalSkillLocal(toolName, toolArgs)
           sendJson(res, 200, { ok: true, result })
           return
@@ -6135,6 +6217,13 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             return
           }
           const body = await readJsonBody(req, 14 * 1024 * 1024) as unknown as RemoteTurnRequestBody
+          if (!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '')) {
+            const raw = req.headers['x-turn-proof']
+            const proof = typeof raw === 'string' ? JSON.parse(Buffer.from(raw, 'base64url').toString()) as PeerOperation : undefined
+            if (!proof || proof.key !== key || !validOperation(proof, 'worker-turn', [getDeviceIdentity().deviceId,body], trustedPeers())) {
+              sendJson(res, 403, { error: 'A signed dispatch from a paired hub is required' }); return
+            }
+          }
           const execute = (onEvent?: (event: { type: string; data: unknown }) => void) => handleIncomingRemoteTurn(body, {
             stateDir, onEvent,
             repoRoot: repoDir,
@@ -6172,41 +6261,58 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           const body = await readJsonBody(req, 20 * 1024 * 1024)
           const toolName = String(body.name ?? '')
 
-          // If a remote worker node attached its git bundle and/or synced files with `orchestrator_report`,
-          // sync them into the Hub's repository and local ticket worktree BEFORE running `orchestrator_report`
-          // so that when `Eval` wakes up immediately on `ready`, the commits and files are already on the Hub!
-          if (
-            sessionId.startsWith('worker-') &&
-            (typeof body.gitBundleB64 === 'string' || Array.isArray(body.syncedFiles))
-          ) {
-            const ticketId = sessionId.slice('worker-'.length)
-            const ticket = runtime.store.tickets.get(ticketId)
-            const branch = typeof body.branch === 'string' ? body.branch : ''
-            const gitSource = String(body.worktreeDir ?? body.repoRoot ?? 'remote')
-            const synced = syncRemoteNodeGitBranch({
-              hubRepoRoot: process.cwd(),
-              remoteGitSource: gitSource,
-              branch,
-              ...(ticket?.title ? { title: ticket.title } : {}),
-              ...(typeof body.gitBundleB64 === 'string' ? { gitBundleB64: body.gitBundleB64 } : {}),
-              ...(ticket?.execution?.directory ? { localWorktreeDir: ticket.execution.directory } : {}),
-              ...(Array.isArray(body.syncedFiles) ? { syncedFiles: body.syncedFiles as RemoteSyncedFile[] } : {}),
-            })
-            const existingAssigned = runtime.store.get(KV.nodes.ticketNode(ticketId))
-            if (existingAssigned) {
-              runtime.store.set(KV.nodes.ticketNode(ticketId), {
-                ...existingAssigned,
-                gitSource,
-                ...(branch ? { branch } : {}),
-                synced: synced.merged,
-              })
+          const callback = typeof body.callbackToken === 'string' ? body.callbackToken : undefined
+          if (callback) {
+            const grant = runtime.store.get(KV.nodes.dispatch(sessionId))
+            if (!grant || sha256Hex(callback) !== grant.digest || !grant.tools.includes(toolName) || !/^[a-f0-9]{48}$/.test(String(body.operationKey))) {
+              sendJson(res, 403, { error: 'Invalid dispatch tool grant' }); return
             }
+          } else if (!sameOrigin(req, actualPort)) {
+            sendJson(res, 403, { error: 'A session tool grant is required' }); return
           }
+          const applyTool = async () => {
+            // If a remote worker node attached its git bundle and/or synced files with `orchestrator_report`,
+            // sync them into the Hub's repository and local ticket worktree BEFORE running `orchestrator_report`
+            // so that when `Eval` wakes up immediately on `ready`, the commits and files are already on the Hub!
+            if (
+              sessionId.startsWith('worker-') &&
+              (typeof body.gitBundleB64 === 'string' || Array.isArray(body.syncedFiles))
+            ) {
+              const ticketId = sessionId.slice('worker-'.length)
+              const ticket = runtime.store.tickets.get(ticketId)
+              const branch = typeof body.branch === 'string' ? body.branch : ''
+              const gitSource = String(body.worktreeDir ?? body.repoRoot ?? 'remote')
+              const synced = syncRemoteNodeGitBranch({
+                hubRepoRoot: process.cwd(),
+                remoteGitSource: gitSource,
+                branch,
+                ...(ticket?.title ? { title: ticket.title } : {}),
+                ...(typeof body.gitBundleB64 === 'string' ? { gitBundleB64: body.gitBundleB64 } : {}),
+                ...(ticket?.execution?.directory ? { localWorktreeDir: ticket.execution.directory } : {}),
+                ...(Array.isArray(body.syncedFiles) ? { syncedFiles: body.syncedFiles as RemoteSyncedFile[] } : {}),
+              })
+              const existingAssigned = runtime.store.get(KV.nodes.ticketNode(ticketId))
+              if (existingAssigned) {
+                runtime.store.set(KV.nodes.ticketNode(ticketId), {
+                  ...existingAssigned,
+                  gitSource,
+                  ...(branch ? { branch } : {}),
+                  synced: synced.merged,
+                })
+              }
+            }
 
-          const result = await host.executeSessionTool(sessionId, toolName, body.args ?? {})
-          await runtime.pump()
-          if (toolName === 'orchestrator_report') tryAutoMergeTicket(sessionId)
-          sendJson(res, 200, { result })
+            const result = await host.executeSessionTool(sessionId, toolName, body.args ?? {})
+            await runtime.pump()
+            if (toolName === 'orchestrator_report') tryAutoMergeTicket(sessionId)
+            return result
+          }
+          if (callback) {
+            const receipt = await workspaceRecords().performOnce('tool/' + sha256Hex(callback) + '/' + String(body.operationKey),
+              sha256Hex(JSON.stringify([toolName,body.args])), applyTool)
+            if (receipt.state !== 'done') { sendJson(res, 409, { error: 'Tool invocation already in progress or outcome uncertain' }); return }
+            sendJson(res, 200, { result: receipt.result })
+          } else sendJson(res, 200, { result: await applyTool() })
           return
         }
 
@@ -6707,6 +6813,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     get runtime() { return runtime },
     host,
     stop: async () => {
+      clearInterval(scheduleTimer)
       if (updateDrainTimer) {
         clearInterval(updateDrainTimer)
         updateDrainTimer = undefined

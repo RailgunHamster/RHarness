@@ -49,6 +49,14 @@ export function WorkspaceDocuments({ open, close, lang }: { open: boolean; close
     } catch (err) { setError(String(err)) }
     finally { setBusy(false) }
   }
+  const download = async (record: WorkspaceRecord) => {
+    try {
+      const res = await fetch('/orchestrator/standalone/workspace/file?id=' + encodeURIComponent(record.id) + '&revision=' + record.revision, { headers: { 'x-orchestrator-request': '1' } })
+      if (!res.ok) throw new Error('Download failed (' + res.status + ')')
+      const url = URL.createObjectURL(await res.blob()), link = document.createElement('a')
+      link.href = url; link.download = record.attachment!.name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (err) { setError(String(err)) }
+  }
   const state = item && labels[item.state][zh ? 0 : 1]
   const action = item?.kind === 'action'
   const latest = items.find(row => row.id === item?.id)?.revision ?? item?.revision ?? 0
@@ -64,12 +72,13 @@ export function WorkspaceDocuments({ open, close, lang }: { open: boolean; close
         {item && <div className="dt-record-meta"><span>{state} · {item.owner}</span>
           <label>{zh ? '版本 ' : 'Revision '}<select value={item.revision} disabled={busy} onChange={e => void select(item.id, Number(e.target.value))}>
             {Array.from({ length: latest }, (_, i) => latest - i).map(v => <option key={v} value={v}>v{v}</option>)}</select></label></div>}
-        {action ? <><strong>{item.title}</strong><span>{zh ? '目标账户' : 'Destination'} · {item.target}</span><pre>{item.text}</pre>
+        {item?.attachment ? <><strong>{item.attachment.name}</strong><p>{item.text}</p><small>{item.attachment.validation} · {item.attachment.bytes.toLocaleString()} B</small>
+          <Button variant="primary" onClick={() => void download(item)}>{zh ? '下载此版本' : 'Download this revision'}</Button></> : action ? <><strong>{item.title}</strong><span>{zh ? '目标账户' : 'Destination'} · {item.target}</span><pre>{item.text}</pre>
           {item.result && <p role="status">{item.result}</p>}
           {item.state === 'review' && item.revision === latest && <div className="dt-row-buttons"><Button variant="primary" disabled={busy} onClick={() => void submit(true)}>{zh ? '确认执行此版本' : 'Approve this revision'}</Button>
           <Button variant="outline" disabled={busy} onClick={() => void submit(false)}>{zh ? '取消操作' : 'Dismiss'}</Button></div>}</>
           : <><label>{zh ? '标题' : 'Title'}<input value={title} disabled={busy} maxLength={200} onChange={e => setTitle(e.target.value)} /></label>
-          <label>{zh ? '正文' : 'Text'}<textarea value={text} disabled={busy} rows={12} maxLength={240000} onChange={e => setText(e.target.value)} /></label>
+          <label>{zh ? '正文' : 'Text'}<textarea aria-label={zh ? '正文' : 'Text'} value={text} disabled={busy} rows={12} maxLength={240000} onChange={e => setText(e.target.value)} /></label>
           {item?.evidence.map((line,i) => <small key={i}>{line}</small>)}
           <Button variant="primary" disabled={busy || !dirty || !title.trim() || Boolean(item && item.revision < latest)} onClick={() => void submit()}>{zh ? '保存版本' : 'Save revision'}</Button></>}
         {error && <p role="alert" className="dt-error">{error}</p>}

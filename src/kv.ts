@@ -78,6 +78,7 @@ export const KV = {
   /** Distributed LAN Worker Nodes registry and per-Ticket assigned node ID. */
   nodes: {
     registry: record<WorkerNodeRecord[]>('worker-nodes-registry'),
+    dispatch: family<{ digest: string; tools: string[] }, [sessionId: string]>('worker-turn-grant:'),
     ticketNode: family<{ nodeId: string; nodeName: string; gitSource?: string; branch?: string; synced?: boolean }, [ticketId: string]>('ticket-worker-node:'),
   },
   /** Decentralized Device Group identity and signed group membership packet. */
@@ -90,6 +91,7 @@ export const KV = {
     config: record<ModelProfilesConfig>('model-profiles-config'),
   },
   /** First-class Memory plugin entries and Plugin Manager enabled/disabled state. */
+  schedules: { reviews: record<import('./app/scheduled-reviews.ts').ScheduledReview[]>('panel-scheduled-reviews') },
   browser: { paused: record<boolean>('browser-input-paused') },
   memory: {
     items: record<MemoryEntry[]>('memory-plugin-entries'),
