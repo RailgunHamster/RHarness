@@ -20,7 +20,7 @@
  *    - Supports automatic rolling snapshots on `数据中心` (retaining the latest 14 snapshots + an
  *      automatic `pre-import` safety snapshot before any restore) and `merge` / `replace` restore modes.
  */
-import { createHash } from 'node:crypto'
+import { createHash, createPublicKey, sign, verify } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import {
   existsSync,
@@ -83,6 +83,10 @@ function collectFilesRecursive(rootDir: string, currentDir = rootDir): { relativ
 
 export interface ClusterReleaseManifest {
   version: 1
+  publisher?: string
+  generation?: number
+  rollbackOf?: string
+  signature?: string
   /** Deterministic composite identifier `<shortCommit>-<libHash8>` — changes on every commit OR rebuild. */
   buildId: string
   commit: string
@@ -138,7 +142,7 @@ export function inspectLocalBuild(repoDir: string): LocalBuildFacts {
 }
 
 /** Packages `<repoDir>`'s Git `HEAD` bundle + `lib/` directory into a verified gzipped release buffer. */
-export function createClusterReleasePackage(repoDir: string, now = new Date()): {
+export function createClusterReleasePackage(repoDir: string, now = new Date(), signer?: { privateKeyPem: string; publicKeyB64: string; generation: number; rollbackOf?: string }): {
   manifest: ClusterReleaseManifest
   packageGz: Buffer
   packageSha256: string
@@ -178,6 +182,12 @@ export function createClusterReleasePackage(repoDir: string, now = new Date()): 
       bundleSha256,
       libHash,
     }
+    if (signer) {
+      manifest.publisher = signer.publicKeyB64
+      manifest.generation = signer.generation
+      if (signer.rollbackOf) manifest.rollbackOf = signer.rollbackOf
+      manifest.signature = sign('sha256', releaseSigningBytes(manifest), signer.privateKeyPem).toString('base64url')
+    }
     const envelope: ClusterReleaseEnvelope = {
       manifest,
       gitBundleB64: bundleBytes.toString('base64'),
@@ -190,13 +200,32 @@ export function createClusterReleasePackage(repoDir: string, now = new Date()): 
   }
 }
 
+function releaseSigningBytes(manifest: ClusterReleaseManifest): Buffer {
+  const { signature: _signature, ...fields } = manifest
+  return Buffer.from('RHarness release v1\n' + JSON.stringify(fields))
+}
+
+export interface ReleaseCheckpoint { generation: number; buildId: string; signature: string }
+export function verifyReleasePublisher(manifest: ClusterReleaseManifest, trusted: readonly string[], previous?: ReleaseCheckpoint): ReleaseCheckpoint {
+  const { publisher, generation, signature } = manifest
+  if (!publisher || !signature || !trusted.includes(publisher) || !Number.isSafeInteger(generation) || generation! <= 0) throw new Error('Untrusted release publisher or unsigned release')
+  const key = createPublicKey({ key: Buffer.from(publisher, 'base64url'), format: 'der', type: 'spki' })
+  if (!verify('sha256', releaseSigningBytes(manifest), key, Buffer.from(signature, 'base64url'))) throw new Error('Invalid release signature')
+  if (previous && (generation! < previous.generation || (generation === previous.generation && signature !== previous.signature))) throw new Error('Stale or conflicting release generation')
+  if (manifest.rollbackOf && previous && signature !== previous.signature && manifest.rollbackOf !== previous.buildId) throw new Error('Rollback target is no longer current')
+  return { generation: generation!, buildId: manifest.buildId, signature }
+}
+
 /** Unpacks and cryptographically verifies a gzipped cluster release buffer (`bundleSha256` + `libHash`). */
 export function unpackAndVerifyClusterRelease(packageGz: Buffer): ClusterReleaseEnvelope {
-  const rawJson = gunzipSync(packageGz).toString('utf8')
+  const rawJson = gunzipSync(packageGz, { maxOutputLength: 256 * 1024 * 1024 }).toString('utf8')
   const parsed = JSON.parse(rawJson) as ClusterReleaseEnvelope
   if (!parsed?.manifest || parsed.manifest.version !== 1 || !Array.isArray(parsed.libFiles) || typeof parsed.gitBundleB64 !== 'string') {
     throw new Error('Invalid cluster release package format')
   }
+  if (!/^[a-f0-9]{40,64}$/.test(parsed.manifest.commit) || parsed.manifest.shortCommit !== parsed.manifest.commit.slice(0, 7)
+    || parsed.manifest.buildId !== parsed.manifest.shortCommit + '-' + parsed.manifest.libHash.slice(0, 8)
+    || parsed.manifest.fileCount !== parsed.libFiles.length || new Set(parsed.libFiles.map(file => file.relativePath.toLowerCase())).size !== parsed.libFiles.length) throw new Error('Invalid release manifest metadata')
   const bundleBytes = Buffer.from(parsed.gitBundleB64, 'base64')
   if (sha256Hex(bundleBytes) !== parsed.manifest.bundleSha256) {
     throw new Error('Cluster release git bundle SHA-256 mismatch')
@@ -204,7 +233,7 @@ export function unpackAndVerifyClusterRelease(packageGz: Buffer): ClusterRelease
   const h = createHash('sha256')
   const sorted = [...parsed.libFiles].sort((a, b) => a.relativePath.localeCompare(b.relativePath))
   for (const f of sorted) {
-    if (f.relativePath.includes('..') || f.relativePath.startsWith('/')) {
+    if (typeof f.relativePath !== 'string' || /[\\:\x00-\x1f]/.test(f.relativePath) || f.relativePath.split('/').some(part => !part || part === '.' || part === '..')) {
       throw new Error(`Unsafe relative path in release package: ${f.relativePath}`)
     }
     h.update(f.relativePath)

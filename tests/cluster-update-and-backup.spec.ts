@@ -12,7 +12,7 @@ import {
 import {
   applyVerifiedReleaseToRepo,
   computeRestoredDataCenterState,
-  createClusterReleasePackage,
+  createClusterReleasePackage, verifyReleasePublisher,
   createDataCenterBackupArchive,
   inspectLocalBuild,
   listDataCenterRollingSnapshots,
@@ -20,7 +20,7 @@ import {
   unpackAndVerifyClusterRelease,
   writeDataCenterRollingSnapshot,
 } from '../src/app/cluster-update-and-backup.ts'
-import { DATA_CENTER_TAG } from '../src/app/device-group.ts'
+import { DATA_CENTER_TAG, ensureDeviceIdentity } from '../src/app/device-group.ts'
 import { recoverStaleStateLock, startStandaloneServer } from '../src/server/standalone.ts'
 
 const PNG_BYTES = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.from('backup-sticker-png')])
@@ -132,13 +132,16 @@ describe('cluster auto-update, supervisor lock safety, and data-center backup/im
     initTempGitRepo(repoWorker, 'v1')
     initTempGitRepo(repoBuild, 'v1')
 
+    const publisher = ensureDeviceIdentity(undefined, 4321)
+    const trust = [publisher.publicKeyB64]
     let workerRestartCount = 0
-    const srvDC = await startStandaloneServer({ port: 0, host: '127.0.0.1', stateDir: stateDC, repoDir: repoDC, liveAgents: false })
+    const srvDC = await startStandaloneServer({ port: 0, host: '127.0.0.1', stateDir: stateDC, repoDir: repoDC, liveAgents: false, trustedReleasePublishers: trust })
     const srvWorker = await startStandaloneServer({
       port: 0,
       host: '127.0.0.1',
       stateDir: stateWorker,
       repoDir: repoWorker,
+      trustedReleasePublishers: trust,
       liveAgents: false,
       onUpdateRestart: () => { workerRestartCount++ },
     })
@@ -180,7 +183,13 @@ describe('cluster auto-update, supervisor lock safety, and data-center backup/im
       writeFileSync(join(repoBuild, 'lib', 'standalone.js'), 'export const VERSION = "v2";\n', 'utf8')
       execFileSync('git', ['add', 'src.txt'], { cwd: repoBuild, stdio: 'ignore' })
       execFileSync('git', ['commit', '-m', 'feat: cluster auto-update v2'], { cwd: repoBuild, stdio: 'ignore' })
-      const pkg = createClusterReleasePackage(repoBuild)
+      const untrusted = createClusterReleasePackage(repoBuild)
+      const rejected = await call(srvDC.url, 'POST', '/orchestrator/standalone/cluster-update/upload', { packageB64: untrusted.packageGz.toString('base64') })
+      expect(rejected.status).toBe(400)
+      const pkg = createClusterReleasePackage(repoBuild, new Date(), { ...publisher, generation: 2 })
+      const checkpoint = verifyReleasePublisher(pkg.manifest, trust)
+      expect(() => verifyReleasePublisher({ ...pkg.manifest, subject: 'tampered' }, trust)).toThrow(/signature/)
+      expect(() => verifyReleasePublisher(pkg.manifest, trust, { ...checkpoint, generation: 3 })).toThrow(/Stale/)
 
       const up = await call(srvDC.url, 'POST', '/orchestrator/standalone/cluster-update/upload', {
         packageB64: pkg.packageGz.toString('base64'),

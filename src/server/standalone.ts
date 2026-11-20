@@ -5,7 +5,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, extname, join, relative, resolve } from 'node:path'
@@ -59,6 +59,7 @@ import {
   saveReleaseOnDataCenter,
   unpackAndVerifyClusterRelease,
   writeDataCenterRollingSnapshot,
+  verifyReleasePublisher, type ReleaseCheckpoint,
   type ClusterReleaseEnvelope,
   type ClusterReleaseManifest,
   type DataCenterBackupPayload,
@@ -225,6 +226,7 @@ export interface StandaloneServerOptions {
   httpsPort?: number
   tlsCertFile?: string
   tlsKeyFile?: string
+  trustedReleasePublishers?: string[]
   host?: string
   stateDir?: string
   repoDir?: string
@@ -2321,6 +2323,32 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
 
   // ---- Cluster Auto-Update (Data-Center authoritative + drain-before-restart) & Data-Center Rolling Backups ----
   let currentBuild = inspectLocalBuild(repoDir)
+  const checkpointFile = join(stateDir, 'release-checkpoint.json')
+  const readCheckpoint = (): ReleaseCheckpoint | undefined => existsSync(checkpointFile)
+    ? JSON.parse(readFileSync(checkpointFile, 'utf8')) as ReleaseCheckpoint : undefined
+  const verifyIncomingRelease = (manifest: ClusterReleaseManifest) => {
+    const trusted = [getDeviceIdentity().publicKeyB64, ...(options.trustedReleasePublishers ?? []),
+      ...(process.env.RHARNESS_RELEASE_PUBLISHERS ?? '').split(',').map(key => key.trim()).filter(Boolean)]
+    const checkpoint = verifyReleasePublisher(manifest, trusted, readCheckpoint())
+    if (manifest.commit !== currentBuild.commit && manifest.rollbackOf !== currentBuild.buildId) {
+      let older = false
+      try { execFileSync('git', ['merge-base', '--is-ancestor', manifest.commit, 'HEAD'], { cwd: repoDir, stdio: 'ignore' }); older = true } catch {}
+      if (older) throw new Error('An older commit requires a signed rollback naming the current build')
+    }
+    return checkpoint
+  }
+  const persistCheckpoint = (manifest: ClusterReleaseManifest) => {
+    const checkpoint = verifyIncomingRelease(manifest)
+    writeFileSync(checkpointFile + '.tmp', JSON.stringify(checkpoint), 'utf8')
+    renameSync(checkpointFile + '.tmp', checkpointFile)
+  }
+  const storeVerifiedRelease = (buffer: Buffer) => {
+    const { manifest } = unpackAndVerifyClusterRelease(buffer)
+    verifyIncomingRelease(manifest)
+    const stored = saveReleaseOnDataCenter(stateDir, buffer)
+    persistCheckpoint(stored)
+    return stored
+  }
   let stagedUpdate: {
     envelope: ClusterReleaseEnvelope
     status: 'waiting-idle' | 'applying'
@@ -2360,6 +2388,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
       updateDrainTimer = undefined
     }
     try {
+      verifyIncomingRelease(stagedUpdate.envelope.manifest)
       applyVerifiedReleaseToRepo(repoDir, stagedUpdate.envelope, stateDir)
       currentBuild = inspectLocalBuild(repoDir)
       stagedUpdate = undefined
@@ -2379,6 +2408,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     reasons?: string[]
   } => {
     const envelope = unpackAndVerifyClusterRelease(packageGz)
+    persistCheckpoint(envelope.manifest)
     if (envelope.manifest.buildId === currentBuild.buildId) {
       return { upToDate: true, staged: envelope.manifest }
     }
@@ -5506,7 +5536,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
               return
             }
             const pkgBuf = Buffer.from(pkgB64, 'base64')
-            const manifest = saveReleaseOnDataCenter(stateDir, pkgBuf)
+            const manifest = storeVerifiedRelease(pkgBuf)
             const notified = await notifyOnlinePeersOfRelease(manifest)
             // Delay Data Center's own restart slightly (~1.8s) so peers finish pulling `latest.pkg.gz` first
             let selfOutcome: { upToDate?: boolean; applied?: boolean; waiting?: boolean } = {}
@@ -5538,10 +5568,19 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
           }
 
           if (req.method === 'POST' && sub === 'cluster-update/publish') {
-            const built = createClusterReleasePackage(repoDir)
+            if (!sameOrigin(req, actualPort) || !['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '')) {
+              sendJson(res, 403, { error: 'Publish from the signer node locally' }); return
+            }
+            const body = await readJsonBody(req)
+            const identity = getDeviceIdentity()
+            const now = new Date()
+            const built = createClusterReleasePackage(repoDir, now, { ...identity,
+              generation: Math.max(now.getTime(), (readCheckpoint()?.generation ?? 0) + 1),
+              ...(typeof body.rollbackOf === 'string' ? { rollbackOf: body.rollbackOf } : {}),
+            })
             const pkgB64 = built.packageGz.toString('base64')
             if (isLocalDataCenter()) {
-              const manifest = saveReleaseOnDataCenter(stateDir, built.packageGz)
+              const manifest = storeVerifiedRelease(built.packageGz)
               const notifiedPeers = await notifyOnlinePeersOfRelease(manifest)
               sendJson(res, 200, {
                 ok: true,
@@ -5555,7 +5594,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             const dc = findDataCenterPeer()
             if (!dc) {
               // No data center online: save locally as fallback and notify any online peers
-              saveReleaseOnDataCenter(stateDir, built.packageGz)
+              storeVerifiedRelease(built.packageGz)
               const notifiedPeers = await notifyOnlinePeersOfRelease(built.manifest)
               sendJson(res, 200, {
                 ok: true,

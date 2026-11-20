@@ -77,3 +77,9 @@ Send one message, under 300 words: what will be installed, the accounts and CLIs
 - How to try it: from an account on the allowed list, comment `@<agent login> <request>` on an issue in the repository. A Ticket appears on the overview within about a minute.
 - Three rules for the operator, from the Responsibility section of `docs/000-philosophy.md`: start narrow, tune for less noise, own what the agent says.
 - Where to read more: the numbered documents in `docs/`, in order.
+
+### Cluster release trust
+
+Each publisher signs its build manifest with its existing device identity. On receiving nodes, set `RHARNESS_RELEASE_PUBLISHERS` to the comma-separated SPKI public keys (base64url) of the release workstations you trust. Obtain the public key on the publisher itself from its device-group identity. The private key stays on that machine. A node also trusts its own device identity.
+
+Run `node lib/standalone.js --publish-update` on the publisher. Each receiving node checks the signature, file hashes and generation before staging and again checks publisher trust before applying. To intentionally publish an older checkout, post to the local publish endpoint with `rollbackOf` set to the current destination build ID. The rollback receives a new signed generation. The high-water mark lives in the node state directory independently of personal-data restores.
