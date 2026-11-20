@@ -249,6 +249,26 @@ it('formats non-today timestamps with Chinese year-month-day and opens/closes fu
   expect(mdModal.textContent).toContain('首批只读接入')
 })
 
+it('opens a scheduled notice beside the assistant without adding it to either conversation', async () => {
+  const originalFetch = fetch
+  const text = '📋 今日待办汇总（08:30）\n\n核对行程'
+  vi.stubGlobal('fetch', async (url: string) => {
+    if (url.endsWith('/personal-notices')) return Response.json({ items: [{ id: 'notice1', kind: 'todo', text, at: '2026-11-20T00:30:00Z' }] })
+    const response = await originalFetch(url)
+    if (!url.endsWith('/sessions')) return response
+    return Response.json({ ...await response.json(), plugins: [{ id: 'dsh-personal-skills', enabled: true }] })
+  })
+  await act(async () => root.render(<StandaloneRoot />))
+  const rail = container.querySelector<HTMLElement>('aside[aria-label="Claw 提示"]')!
+  expect(rail.textContent).toContain('今日待办')
+  expect(container.querySelector('.dt-assistant-stream')?.textContent).not.toContain('核对行程')
+  expect(container.querySelector('#local-chat')?.textContent).not.toContain('核对行程')
+  await act(async () => rail.querySelector('button.dt-notice-row')!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+  expect(document.querySelector('[role="dialog"]')?.textContent).toContain(text)
+  await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+  expect(document.querySelector('[role="dialog"]')).toBeNull()
+})
+
 it('expands Personal Assistant into full-screen chat-app mode with self/bot bubbles and exits on button or ESC', async () => {
   await act(async () => root.render(<StandaloneRoot />))
   const assistantTab = container.querySelector<HTMLButtonElement>('[data-testid="view-tab-assistant"]')!

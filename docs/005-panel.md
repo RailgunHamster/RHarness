@@ -33,6 +33,8 @@ Ticket details show the originating Trigger, Decision and reason, scope and Poli
 
 ## Standalone workspace
 
+With the Personal Business Skills plugin enabled, **Claw notices** appears beside Personal Assistant. It shows up to 12 recent life briefs, daily to-do summaries, K-line progress reports and fit reports from the configured bot in the owner's Feishu DM. Open a row to read the original message. On narrow screens, expand the notice list above the conversation. The panel checks for updates every minute while visible. Nodes without local Feishu credentials read the filtered list from the private pack's `personalPaths.peerFallbackEndpoints`.
+
 The standalone page puts **Local chat** first, directly on the page, followed by the management tabs and **Live execution**. Header links jump to each area. Conversation ID, sender and auto-accept settings are folded under **Conversation settings**; edit the ID and choose **Switch** (or press Enter) to change topics. **New topic** starts a separate conversation without carrying the previous topic's draft into it.
 
 The local composer saves every text edit immediately in this browser's local storage, together with the reply target for that topic. The selected conversation, sender and auto-accept preference also survive refreshing, closing and reopening the panel. Image drafts use IndexedDB separately so large attachments do not exhaust text storage. Each topic restores its own draft. Only a successful send clears its text, reply target and attachments; failed sends keep them available. Saving, restoring and storage failures are shown beside the composer. This is browser-local recovery, not synchronization across devices or origins; clearing site data also clears drafts.

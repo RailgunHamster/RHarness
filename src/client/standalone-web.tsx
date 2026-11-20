@@ -11,6 +11,7 @@ import {
   type VisualModelCatalog,
 } from './settings-kit.tsx'
 import { PanelConversation } from './standalone-composer.tsx'
+import { PersonalNotices } from './personal-notices.tsx'
 import { readTextDraft, useGlobalInputDrafts, useTextDraft, writeTextDraft } from './panel-draft.ts'
 import { LiveWorkspace, SessionActivity, useLiveSession } from './standalone-activity.tsx'
 import { TicketActivity } from './ticket-activity.tsx'
@@ -2879,7 +2880,7 @@ export function StandaloneRoot() {
             </button>)}
           </div>
         )}
-        {viewMode === 'assistant' && <PersonalAssistantSlotView
+        {viewMode === 'assistant' && <div className="dt-assistant-page"><PersonalAssistantSlotView
           lang={lang}
           messages={assistantMessages}
           liveRun={assistantLiveRun}
@@ -2902,7 +2903,9 @@ export function StandaloneRoot() {
           }}
           onSwitchToMemoryTab={() => setViewMode('memory-library')}
           onOpenAssistantSession={() => setActiveSession('claw-assistant-main')}
-        />}
+        />
+          {plugins.some(p => p.id === 'dsh-personal-skills' && p.enabled) && <PersonalNotices lang={lang} />}
+        </div>}
         {viewMode === 'clawfeed' && <ClawFeedNotificationsSlotView
           lang={lang}
           items={clawfeedItems}

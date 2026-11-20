@@ -202,6 +202,7 @@ import {
   uploadFeishuImage,
   type FeishuStreamingCardSession,
 } from '../app/personal-skills.ts'
+import { createPersonalNoticeReader, readPeerPersonalNotices } from '../app/personal-notices.ts'
 import {
   defaultLocalNode,
   dispatchTurnToRemoteNode,
@@ -570,6 +571,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
   }
 
   const isPluginEnabled = (pluginId: string): boolean => !getDisabledPlugins().includes(pluginId)
+  const readPersonalNotices = createPersonalNoticeReader()
   const loopDetector = new SessionLoopDetector()
 
   const getRuntimeGuardStats = () => {
@@ -4093,6 +4095,23 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             getRegisteredNodes,
           )
           sendJson(res, 200, out)
+          return
+        }
+
+        if (req.method === 'GET' && sub === 'personal-notices') {
+          const pack = loadPrivatePack()?.manifest
+          if (!pack?.enablePersonalSkillsPlugin || !isPluginEnabled('dsh-personal-skills')) {
+            sendJson(res, 404, { error: 'Personal skills are disabled' })
+            return
+          }
+          const cred = loadStandaloneFeishuCredentials()
+          if (cred?.dmChatId) {
+            sendJson(res, 200, await readPersonalNotices(cred))
+          } else if (url.searchParams.get('localOnly') === '1') {
+            sendJson(res, 503, { error: 'Feishu owner DM is not configured on this node' })
+          } else {
+            sendJson(res, 200, await readPeerPersonalNotices(pack.personalPaths?.peerFallbackEndpoints ?? []))
+          }
           return
         }
 

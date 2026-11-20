@@ -518,7 +518,7 @@ export function loadStandaloneFeishuCredentials(): FeishuCredentials | undefined
   return undefined
 }
 
-async function getFeishuTenantToken(cred: FeishuCredentials): Promise<string> {
+export async function getFeishuTenantToken(cred: FeishuCredentials): Promise<string> {
   const res = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
     method: 'POST',
     headers: { 'content-type': 'application/json; charset=utf-8' },

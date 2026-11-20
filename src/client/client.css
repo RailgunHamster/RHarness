@@ -83,6 +83,25 @@
 .dt-panel-message[data-bot='true'] { border-left-color: var(--dsw-alias-brand-primary); }
 .dt-panel-message .dt-md { margin-top: 2px; }
 .dt-assistant-shell { gap: 10px; }
+.dt-assistant-page { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 12px; }
+.dt-assistant-page:has(.dt-personal-notices) { grid-template-columns: minmax(0, 1fr) clamp(180px, 17%, 220px); }
+.dt-personal-notices { min-width: 0; padding: 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; background: var(--dsw-alias-bg-layer-1); }
+.dt-personal-notices h2, .dt-notice-toggle { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--dsw-alias-label-primary); font: inherit; font-weight: 600; font-size: 14px; }
+.dt-notice-toggle { display: none; width: 100%; padding: 0; text-align: left; background: transparent; border: 0; cursor: pointer; }
+.dt-notice-toggle svg:last-child { margin-left: auto; }
+.dt-notice-list { display: grid; max-height: min(46vh, 360px); overflow-y: auto; margin-top: 8px; }
+.dt-notice-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; padding: 8px 3px; background: transparent; color: var(--dsw-alias-label-primary); border: 0; border-top: 1px solid var(--dsw-alias-border-l2); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.dt-notice-row:hover, .dt-notice-row:focus-visible { background: var(--dsw-alias-bg-module-platform); }
+.dt-notice-preview { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--dsw-alias-label-secondary); }
+.dt-notice-row time { font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+.dt-modal.dt-notice-dialog { width: min(640px, 100%); }
+.dt-notice-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }
+@media (max-width: 900px) {
+  .dt-assistant-page:has(.dt-personal-notices) { grid-template-columns: minmax(0, 1fr); }
+  .dt-personal-notices { grid-row: 1; padding: 8px 12px; }
+  .dt-personal-notices h2, .dt-notice-list[data-expanded='false'] { display: none; }
+  .dt-notice-toggle { display: flex; min-height: 28px; }
+}
 .dt-assistant-header { order: 0; }
 .dt-assistant-toolbar { order: 2; padding: 0 2px; }
 .dt-assistant-stream { order: 3; min-height: 360px; max-height: clamp(380px, calc(100dvh - 320px), 780px); padding: 14px 16px; gap: 12px; }

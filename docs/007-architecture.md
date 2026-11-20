@@ -342,6 +342,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/claw-assistant.ts` | Claw Personal Assistant plugin (`@rharness/plugin-claw-assistant`) and one-way verbatim handoff bridge to the Engineering Eval engine with independent refusal right |
 | `src/app/assistant-persona-and-ambient.ts` | Personal-Assistant-only Persona/Sticker/Learning/Ambient plugin (`@rharness/plugin-assistant-persona-ambient`): persona presets & prompt, kaomoji bank, `~/.rharness/stickers` gallery, auto-applied persona learnings, lunar/solar-term rhythm, Open-Meteo home-city weather and RSS news briefs, plus Assistant-only management tools |
 | `src/app/personal-skills.ts` | Personal assistant skills, native Protobuf `pbbp2` Feishu WebSocket bridge, dual-instance SiYuan knowledge base with privacy guardrails, ClawFeed mobile notification ledger and scheduled script tools |
+| `src/app/personal-notices.ts` | Reads recent scheduled notices from the owner's Feishu DM and serves the filtered feed to other panel nodes |
 | `src/app/runtime-guard-plugin.ts` | `@rharness/plugin-runtime-guard` (Tokenjuice output compactor, `SessionLoopDetector` circuit breaker, external prompt-injection sanitizer) and `@rharness/plugin-model-usage` telemetry |
 | `src/app/lossless-and-learning.ts` | `@rharness/plugin-lossless-context` (hierarchical L1/L2 DAG summary tree, `lcm_grep`, `lcm_expand`) and `@rharness/plugin-self-improving` (correction ledger and `/btw` ephemeral side questions) |
 | `src/app/research-and-ux-plugins.ts` | `@rharness/plugin-web-research`, `@rharness/plugin-browser-bridge`, `@rharness/plugin-progress-card`, `@rharness/plugin-data-sql` and `@rharness/plugin-tool-search` |
@@ -398,6 +399,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/standalone-web.tsx` | The standalone browser entry mounting the management panel, local conversation, live workspace and debugging console |
 | `src/client/ui-slots.tsx` | First-class UI slot plugin registry (`BUILTIN_UI_VIEW_SLOTS`) and the Claw Personal Assistant window with one-way verbatim engineering handoff cards |
+| `src/client/personal-notices.tsx` | Compact notice list beside the assistant, mobile disclosure and full message reader |
 | `src/client/standalone-api.ts` | Standalone HTTP transport and Session event types |
 | `src/client/standalone-activity.tsx` | Cursor-based Session polling and public assistant/tool activity in the main workspace and console |
 | `src/client/ticket-activity.tsx` | Embedded live Session activity panel on the Ticket detail page |
@@ -476,6 +478,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/panel-images.spec.ts` | Local Panel image validation, content-addressed storage, Codex/DSH image projection and HTTP round-trips |
 | `tests/standalone-client.spec.tsx` | Durable per-topic drafts, storage failure feedback, send retention/clearing, image input, reply targets and live worker event polling |
 | `tests/standalone-workspace.spec.tsx` | Inline conversation-first workspace order, direct area navigation and language changes without losing the draft |
+| `tests/personal-notices.spec.ts` | Scheduled message filtering, pagination, deduplication, cache retries and peer fallback |
 | `tests/persona-ambient.spec.tsx` | Persona presets & prompt, sticker gallery file CRUD and marker/cooldown policy, persona learning extraction/dedupe, lunar/solar-term/weather/news ambient helpers, Assistant-only persona tools, and the 🎭 Persona/Sticker/Learning/Home-City workbench UI |
 | `tests/panel-draft.spec.ts` | Text and preference storage recovery, topic/path isolation, corrupt/unavailable storage and ordered image transactions; generic field drafts and the global input-draft safety net (save-on-type, refill-after-remount, programmatic-clear sync) |
 | `tests/standalone.spec.ts` | The standalone server, multi-provider catalog (`dsh`, `codex`, `claude`, `cursor` and `human`), Local Panel Source and Session Console |
