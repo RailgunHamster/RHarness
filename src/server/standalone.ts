@@ -221,6 +221,7 @@ import { probeModel, type ProbeKind, type ProbeResult } from '../app/model-probe
 import { nativeModelQueue } from '../app/model-queue.ts'
 import { setTimeout as waitForPoll } from 'node:timers/promises'
 import { createWorkerPoll, PullMailbox, pullConfig } from '../app/pull-worker.ts'
+import { publishStickerGallery, receiveStickerBatch } from '../app/sticker-sync.ts'
 import { TurnReceipts } from '../app/turn-receipts.ts'
 import { KV } from '../kv.ts'
 import { key, latestReport, threadKey, waitsForPerson, type Ticket } from '../core/index.ts'
@@ -667,7 +668,30 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     runtime.store.set(KV.persona.learnings, next)
     if (opts?.sync !== false) syncPersonaAfterMutation({ removedLearningIds: removedIds })
   }
-  const setStickerRecords = (next: StickerRecord[]): void => { if (runtime) runtime.store.set(KV.persona.stickers, next) }
+  let stickerTimer: ReturnType<typeof setTimeout> | undefined
+  let stickerJob: Promise<void> | undefined
+  let stickerSyncError = ''
+  const stickerStop = new AbortController()
+  const queueStickerSync = () => {
+    if (!liveAgents || stickerTimer || stickerStop.signal.aborted) return
+    stickerTimer = setTimeout(() => { stickerTimer = undefined; void syncStickers() }, 1500)
+    stickerTimer.unref()
+  }
+  const setStickerRecords = (next: StickerRecord[]): void => {
+    if (!runtime) return
+    const ids = new Set(next.map(item => item.id))
+    const removed = (runtime.store.get(KV.persona.stickers) ?? []).filter(item => !ids.has(item.id))
+    runtime.store.atomic(() => {
+      if (removed.length) {
+        const tombstones = runtime.store.get(KV.persona.stickerRemovals) ?? {}
+        const now = new Date().toISOString()
+        for (const item of removed) tombstones[item.id] = now
+        runtime.store.set(KV.persona.stickerRemovals, tombstones)
+      }
+      runtime.store.set(KV.persona.stickers, next)
+    })
+    queueStickerSync()
+  }
   // Reading stickers lazily purges trash entries past the 1-day retention (files deleted, change persisted).
   const getStickerRecords = (): StickerRecord[] => {
     const all = runtime ? (runtime.store.get(KV.persona.stickers) ?? []) : []
@@ -796,7 +820,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
    * local cache — mutations push up to the data center, it broadcasts applied changes to every
    * cache, and a periodic pull reconciles anything edited while it was unreachable (offline
    * edits merge by id / newer `updatedAt`; deletions ride along as tombstones until acked).
-   * With no data-center node in the group a node simply stays standalone-local. Sticker files remain node-local.
+   * With no data-center node in the group a node simply stays standalone-local. Sticker originals use a separate, verified transfer.
    */
   const isLocalDataCenter = (): boolean => {
     if (!runtime) return false
@@ -975,6 +999,25 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     return [identity.publicKeyB64, ...(packet ? verifyAndExtractGroupMembers(packet).map(member => member.publicKeyB64) : [])]
   }
 
+  const syncStickers = () => {
+    if (stickerJob || stickerStop.signal.aborted || !runtime || isLocalDataCenter() || !isPluginEnabled('dsh-assistant-persona')) return stickerJob
+    const packet = runtime.store.get(KV.deviceGroup.packet)
+    if (!packet) return
+    const center = verifyAndExtractGroupMembers(packet).find(member => isDataCenterNode(member.tags))
+    if (!center) return
+    const origin = center.endpoints.find(ep => ep.startsWith('https://')) ??
+      (center.tailscaleDnsName?.endsWith('.ts.net') ? 'https://' + center.tailscaleDnsName : undefined)
+    if (!origin) return
+    const records = getStickerRecords(), removals = runtime.store.get(KV.persona.stickerRemovals) ?? {}
+    stickerJob = publishStickerGallery(getDeviceIdentity(), { ...center, origin }, { records, removals }, stickerStop.signal)
+      .then(() => { stickerSyncError = '' })
+      .catch((error: unknown) => {
+        if (stickerStop.signal.aborted) return
+        stickerSyncError = error instanceof Error ? error.message : 'Sticker sync failed'
+      })
+      .finally(() => { stickerJob = undefined })
+    return stickerJob
+  }
   const getRegisteredNodes = (): WorkerNodeRecord[] => {
     const local = defaultLocalNode(actualPort)
     if (!runtime) return [local]
@@ -2624,6 +2667,9 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     maybeRunAutoDailyDataCenterBackup()
   }, 15 * 60 * 1000)
   ambientRefreshTimer.unref?.()
+  if (liveAgents) queueStickerSync()
+  const stickerInterval = liveAgents ? setInterval(queueStickerSync, 3 * 60_000) : undefined
+  stickerInterval?.unref()
 
   const runEphemeralBtwSideQuestion = async (question: string): Promise<string> => {
     const activeModels = resolveActiveRoleModels()
@@ -2871,7 +2917,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     if (url.pathname.startsWith('/orchestrator/standalone/')) {
       const sub = url.pathname.slice('/orchestrator/standalone/'.length)
       const isLanWorkerCall =
-        sub === 'worker-node/execute' || sub === 'worker-node/pull' ||
+        sub === 'worker-node/execute' || sub === 'worker-node/pull' || sub === 'assistant/sticker-replica' ||
         sub === 'personal-skills/execute' ||
         sub === 'browser/status' ||
         sub === 'clawfeed/ingest' ||
@@ -2897,6 +2943,21 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
 
         if (req.method === 'POST' && ['device-group/create','device-group/invite','device-group/join','device-group/retag'].includes(sub) && !localOperator) {
           sendJson(res, 403, { error: '请在此节点本机的 localhost 面板管理设备组。Open this node’s local panel to manage pairing.' }); return
+        }
+        if (sub === 'assistant/sticker-replica' && req.method === 'POST') {
+          const identity = getDeviceIdentity()
+          if (!isLocalDataCenter() || !isPluginEnabled('dsh-assistant-persona')) { sendJson(res, 404, { error: 'Sticker center unavailable' }); return }
+          const { proof, batch, content } = await readJsonBody(req, 12 * 1024 * 1024)
+          const op = proof as PeerOperation | undefined
+          if (!op || !validOperation(op,'sticker-publish',[identity.deviceId,batch],trustedPeers())) { sendJson(res, 403, { error: 'A paired device signature is required' }); return }
+          const merged = receiveStickerBatch({ records: getStickerRecords(), removals: runtime.store.get(KV.persona.stickerRemovals) ?? {} },batch,content)
+          if (merged.changed) runtime.store.atomic(() => {
+            runtime.store.set(KV.persona.stickers, merged.records)
+            runtime.store.set(KV.persona.stickerRemovals, merged.removals)
+          })
+          for (const item of merged.discarded) deleteStickerFile(item)
+          sendJson(res, 200, { need: merged.need, proof: signOperation(identity,op.key,'sticker-receipt',merged.need) })
+          return
         }
         if (sub === 'schedules' && req.method === 'GET') {
           sendJson(res, 200, { items: runScheduledReviews() }); return
@@ -3915,6 +3976,7 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
             learnings: getPersonaLearnings(),
             stickers: activeStickers(getStickerRecords()).map(s => ({ ...s, feishuImageKey: undefined })),
             stickerTrash: trashedStickers(getStickerRecords()).map(s => ({ ...s, feishuImageKey: undefined, purgeAt: stickerTrashPurgeAt(s) })),
+            ...(stickerSyncError ? { stickerSyncError } : {}),
             amapConfigured: Boolean(getAmapApiKey()),
             ambientConfig: getAmbientConfig(),
             ambient: getAmbientSnapshot(),
@@ -6860,6 +6922,10 @@ export async function startStandaloneServer(options: StandaloneServerOptions = {
     stop: async () => {
       pollStop.abort()
       await pollLoop
+      clearInterval(stickerInterval)
+      clearTimeout(stickerTimer)
+      stickerStop.abort()
+      await stickerJob
       clearInterval(ambientRefreshTimer)
       clearInterval(scheduleTimer)
       if (updateDrainTimer) {

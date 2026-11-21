@@ -692,6 +692,11 @@ describe('persona workbench UI', () => {
     expect(pill.textContent).toContain('北京')
     expect(container.querySelector('[data-testid="assistant-sticker-b1"]')).not.toBeNull()
 
+    const direct = container.querySelector<HTMLButtonElement>('[data-testid="assistant-stickers-btn"]')!
+    await act(async () => { direct.click() })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    expect(document.querySelector('[role="dialog"] [data-testid="sticker-card-stk-1"]')).not.toBeNull()
+    await act(async () => { (document.querySelector('[role="dialog"] .dt-modal-close') as HTMLButtonElement).click() })
     const openBtn = container.querySelector<HTMLButtonElement>('[data-testid="assistant-persona-btn"]')!
     await act(async () => { openBtn.click() })
     await act(async () => { await new Promise(r => setTimeout(r, 30)) })

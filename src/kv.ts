@@ -112,6 +112,7 @@ export const KV = {
     config: record<AssistantPersonaConfig>('assistant-persona-config'),
     learnings: record<PersonaLearningEntry[]>('assistant-persona-learnings'),
     stickers: record<StickerRecord[]>('assistant-sticker-records'),
+    stickerRemovals: record<Record<string, string>>('assistant-sticker-removals'),
     /** Data-center sync bookkeeping on non-data-center nodes: offline edits (`dirty`) + pending deletion tombstones awaiting ack. */
     syncMeta: record<{ dirty?: boolean; removedAddressIds?: string[]; removedLearningIds?: string[]; lastDataCenterSyncAt?: string }>('assistant-persona-sync-meta'),
   },

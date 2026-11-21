@@ -370,6 +370,7 @@ export interface AmbientSnapshotInfo {
 }
 export interface NewsItemInfo { title: string; url: string; source: string; topic: string; publishedAt?: string }
 export interface PersonaAmbientStateInfo {
+  stickerSyncError?: string
   config: AssistantPersonaConfigInfo
   presets: PersonaPresetInfo[]
   /** Whether an Amap (高德) key is configured (the key itself is never returned). */

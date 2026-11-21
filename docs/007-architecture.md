@@ -350,6 +350,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/claw-assistant.ts` | Claw Personal Assistant plugin (`@rharness/plugin-claw-assistant`) and one-way verbatim handoff bridge to the Engineering Eval engine with independent refusal right |
 | `src/app/assistant-persona-and-ambient.ts` | Personal-Assistant-only Persona/Sticker/Learning/Ambient plugin (`@rharness/plugin-assistant-persona-ambient`): persona presets & prompt, kaomoji bank, `~/.rharness/stickers` gallery, auto-applied persona learnings, lunar/solar-term rhythm, Open-Meteo home-city weather and RSS news briefs, plus Assistant-only management tools |
 | `src/app/personal-skills.ts` | Personal assistant skills, native Protobuf `pbbp2` Feishu WebSocket bridge, dual-instance SiYuan knowledge base with privacy guardrails, ClawFeed mobile notification ledger and scheduled script tools |
+| `src/app/sticker-sync.ts` | Authenticated, incremental publication of sticker originals and gallery metadata to the paired data center, preserving chat IDs and deletion markers |
 | `src/app/personal-notices.ts` | Reads recent scheduled notices from the owner's Feishu DM and serves the filtered feed to other panel nodes |
 | `src/app/runtime-guard-plugin.ts` | `@rharness/plugin-runtime-guard` (Tokenjuice output compactor, `SessionLoopDetector` circuit breaker, external prompt-injection sanitizer) and `@rharness/plugin-model-usage` telemetry |
 | `src/app/lossless-and-learning.ts` | `@rharness/plugin-lossless-context` (hierarchical L1/L2 DAG summary tree, `lcm_grep`, `lcm_expand`) and `@rharness/plugin-self-improving` (correction ledger and `/btw` ephemeral side questions) |
@@ -495,6 +496,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/standalone-events.spec.ts` | Incremental event cursors, live provider text/tool collectors, full-body trace snapshots, privacy, deduplication and session-isolated DSH log fallback |
 | `tests/worktree-merge.spec.ts` | Ticket Git worktree inspection and one-click merge into the main repository branch |
 | `tests/workspace-records.spec.ts` | Version conflicts, owner isolation, exact action approval and concurrent decisions |
+| `tests/sticker-sync.spec.ts` | Paired sticker replication, integrity checks, missing-file repair and protection against resurrection after deletion |
 | `tests/worker-nodes.spec.ts` | Distributed LAN worker node selection, remote ticket turn execution and P2P Git fast-forward merge |
 | `tests/cluster-update-and-backup.spec.ts` | Live-PID lock safety, cryptographic cluster release packaging/verification, dirty-tree protection, two-node Data-Center auto-update distribution and portable backup/snapshot/restore with sticker binaries |
 | `tests/private-pack.spec.ts` | Clean-room public deployment isolation (zero private IPs, domains, paths, seed memories or private plugins when `RHARNESS_PRIVATE_PACK_DIR=none`) and dynamic out-of-tree private pack loading |

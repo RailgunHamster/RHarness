@@ -480,41 +480,57 @@ export function InlineLiveAgentBubble({
   )
 }
 
-const stickerObjectUrlCache = new Map<string, string>()
-
-/** Renders a sticker image below a bot bubble, fetched through the authenticated standalone API and cached as an object URL. */
+// Fetch originals near the viewport and release their object URLs when the gallery page closes.
 export function StickerImage({ sticker, lang }: { sticker: { id: string; name: string }; lang: Lang }): ReactNode {
-  const [src, setSrc] = useState(() => stickerObjectUrlCache.get(sticker.id) ?? '')
+  const anchor = useRef<HTMLSpanElement>(null)
+  const [image, setImage] = useState<{ id: string; src: string }>()
+  const [failed, setFailed] = useState(false)
+  const [attempt, setAttempt] = useState(0)
   useEffect(() => {
-    const cached = stickerObjectUrlCache.get(sticker.id)
-    if (cached) { setSrc(cached); return }
-    let cancelled = false
-    void (async () => {
+    const controller = new AbortController()
+    let url: string | undefined
+    let observer: IntersectionObserver | undefined
+    setFailed(false)
+    const load = async () => {
       try {
-        const res = await fetch(`/orchestrator/standalone/assistant/stickers/${encodeURIComponent(sticker.id)}/content`, { headers: { 'x-orchestrator-request': '1' } })
-        if (!res.ok) return
-        const url = URL.createObjectURL(await res.blob())
-        stickerObjectUrlCache.set(sticker.id, url)
-        if (!cancelled) setSrc(url)
-      } catch {}
-    })()
-    return () => { cancelled = true }
-  }, [sticker.id])
-  if (!src) return <span className="dt-hint">😀 {sticker.name}</span>
-  return <img className="dt-chat-sticker" src={src} alt={sticker.name} title={sticker.name} loading="lazy" />
-  void lang
+        const res = await fetch('/orchestrator/standalone/assistant/stickers/' + encodeURIComponent(sticker.id) + '/content', {
+          headers: { 'x-orchestrator-request': '1' }, signal: controller.signal,
+        })
+        if (!res.ok) throw new Error('Sticker unavailable')
+        const blob = await res.blob()
+        if (controller.signal.aborted) return
+        url = URL.createObjectURL(blob)
+        setImage({ id: sticker.id, src: url })
+      } catch { if (!controller.signal.aborted) setFailed(true) }
+    }
+    if (anchor.current && typeof IntersectionObserver === 'function') {
+      observer = new IntersectionObserver(entries => {
+        if (entries.some(entry => entry.isIntersecting)) { observer?.disconnect(); void load() }
+      }, { rootMargin: '160px' })
+      observer.observe(anchor.current)
+    } else void load()
+    return () => { controller.abort(); observer?.disconnect(); if (url) URL.revokeObjectURL(url) }
+  }, [sticker.id, attempt])
+  return <span ref={anchor}>
+    {failed ? <button type="button" className="dt-textlink" onClick={() => { setImage(undefined); setAttempt(n => n + 1) }}>
+      {sticker.name} · {lang === 'zh' ? '图片未加载，重试' : 'Image unavailable, retry'}</button>
+    : image?.id === sticker.id ? <img className="dt-chat-sticker" src={image.src} alt={sticker.name} title={sticker.name} onError={() => setFailed(true)} />
+    : <span className="dt-hint">😀 {sticker.name}</span>}
+  </span>
 }
 
 /** 🎭 人设·表情·感知 workbench: Persona knobs, Sticker Gallery, Learned Knowledge, Home City / Weather / News.
  *  Rendered as a modal from the Personal Assistant header, or embedded as a full page under the
  *  「记忆与知识库」 tab bar's 🎭 人设·表情·城市 sub-tab (`embedded`). */
-export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged, embedded = false }: {
+export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged, embedded = false, initialTab = 'persona' }: {
   lang: Lang
   open: boolean
   onClose: () => void
   onAmbientChanged?: ((ambient: AmbientSnapshotInfo) => void) | undefined
   embedded?: boolean
+  initialTab?: 'persona' | 'stickers' | 'ambient'
 }): ReactNode {
+  const [galleryPage, setGalleryPage] = useState(0)
   const [tab, setTab] = useState<'persona' | 'stickers' | 'learnings' | 'ambient'>('persona')
   const [state, setState] = useState<PersonaAmbientStateInfo | null>(null)
   const [busy, setBusy] = useState(false)
@@ -555,9 +571,11 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
       onAmbientChanged?.(res.ambient)
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
-  useEffect(() => { if (open) void load() }, [open ])
+  useEffect(() => { if (open) { setTab(initialTab); setGalleryPage(0); void load() } }, [open, initialTab])
 
   if (!open) return null
+  const pageCount = Math.max(1, Math.ceil((state?.stickers.length ?? 0) / 24))
+  const page = Math.min(galleryPage, pageCount - 1)
   const cfg = draftConfig ?? state?.config
   const savePersona = async () => {
     if (!cfg) return
@@ -647,7 +665,6 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
     setBusy(true); setErr('')
     try {
       const res = await standaloneFetch<{ stickers: StickerInfo[]; stickerTrash: StickerInfo[] }>(`assistant/stickers/${encodeURIComponent(s.id)}/permanent`, 'DELETE')
-      stickerObjectUrlCache.delete(s.id)
       setState(curr => (curr ? { ...curr, stickers: res.stickers, stickerTrash: res.stickerTrash ?? curr.stickerTrash } : curr))
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
@@ -842,6 +859,8 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
         </div>
         {err && <p className="dt-error" role="status">{err}</p>}
         {notice && <p className="dt-hint" role="status">{notice}</p>}
+        {tab === 'stickers' && state?.stickerSyncError && <p className="dt-hint" role="status">
+          {lang === 'zh' ? '部分表情尚未同步到数据中心，将自动重试。' : 'Some stickers have not reached the data center. Sync will retry automatically.'}</p>}
         {!state || !cfg ? <p className="dt-hint">{lang === 'zh' ? '加载中…' : 'Loading…'}</p> : tab === 'persona' ? (
           <div className="dt-form" data-testid="persona-panel">
             <div className="dt-persona-presets">
@@ -879,7 +898,7 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
             </div>
             {state.stickers.length === 0 ? <p className="dt-hint">{lang === 'zh' ? '图库还是空的，上传第一张表情包吧~' : 'No stickers yet.'}</p> : (
               <div className="dt-sticker-grid">
-                {state.stickers.map(s => (
+                {state.stickers.slice(page * 24, (page + 1) * 24).map(s => (
                   <div key={s.id} className="dt-sticker-card" data-testid={`sticker-card-${s.id}`}>
                     <StickerImage sticker={s} lang={lang} />
                     <Input value={s.name} disabled={busy} onChange={e => setState(curr => (curr ? { ...curr, stickers: curr.stickers.map(x => x.id === s.id ? { ...x, name: e.target.value } : x) } : curr))} onBlur={e => { void saveStickerMeta(s, { name: e.target.value }) }} />
@@ -890,6 +909,11 @@ export function PersonaAmbientWorkbench({ lang, open, onClose, onAmbientChanged,
                 ))}
               </div>
             )}
+            {pageCount > 1 && <nav className="dt-row-buttons" aria-label={lang === 'zh' ? '表情包翻页' : 'Sticker pages'}>
+              <Button size="sm" disabled={page === 0} onClick={() => setGalleryPage(page - 1)}>{lang === 'zh' ? '上一页' : 'Previous'}</Button>
+              <span aria-live="polite">{page + 1} / {pageCount}</span>
+              <Button size="sm" disabled={page + 1 >= pageCount} onClick={() => setGalleryPage(page + 1)}>{lang === 'zh' ? '下一页' : 'Next'}</Button>
+            </nav>}
             {(state.stickerTrash?.length ?? 0) > 0 && (
               <div className="dt-form" data-testid="sticker-trash-panel">
                 <strong>{lang === 'zh' ? `🗑 回收站（${state.stickerTrash.length} 张 · 删除后保留 1 天，过期自动彻底清除）` : `🗑 Trash (${state.stickerTrash.length} · auto-purged after 1 day)`}</strong>
@@ -1140,7 +1164,7 @@ export function PersonalAssistantSlotView(props: {
   const [ephemeralBtwCard, setEphemeralBtwCard] = useState<{ question: string; answer: string; at: string } | null>(null)
   const [optimisticUserMsg, setOptimisticUserMsg] = useState<AssistantMessageInfo | null>(null)
   const [pendingTurnSinceMs, setPendingTurnSinceMs] = useState<number | null>(null)
-  const [personaWorkbenchOpen, setPersonaWorkbenchOpen] = useState(false)
+  const [personaTab, setPersonaTab] = useState<'persona' | 'stickers' | 'ambient'>()
   const [ambientOverride, setAmbientOverride] = useState<AmbientSnapshotInfo | undefined>()
   const [stickerSaveFor, setStickerSaveFor] = useState<{ messageId: string; imageIndex: number } | null>(null)
   const [stickerSaveName, setStickerSaveName] = useTextDraft('assistant:sticker-save-name')
@@ -1567,14 +1591,14 @@ export function PersonalAssistantSlotView(props: {
               </Tag>
             )}
             {displayAmbient && (
-              <button type="button" className="dt-ambient-pill" data-testid="assistant-ambient-pill" onClick={() => setPersonaWorkbenchOpen(true)} title={lang === 'zh' ? '常驻城市 / 天气 / 农历节气（点击打开「感知与城市」设置，助理也能自己改）' : 'Home city / weather / lunar (click to open Ambient settings)'}>
+              <button type="button" className="dt-ambient-pill" data-testid="assistant-ambient-pill" onClick={() => setPersonaTab('ambient')} title={lang === 'zh' ? '常驻城市 / 天气 / 农历节气（点击打开「感知与城市」设置，助理也能自己改）' : 'Home city / weather / lunar (click to open Ambient settings)'}>
                 {displayAmbient.oneLiner}
               </button>
             )}
           </div>
           <details className="dt-assistant-options"><summary>{lang === 'zh' ? '对话选项' : 'Chat options'}</summary>
           <div className="dt-row-buttons">
-            <Button size="sm" variant="outline" onClick={() => setPersonaWorkbenchOpen(true)} data-testid="assistant-persona-btn" title={lang === 'zh' ? '人设风格、表情包图库、已学默契、常驻城市与新闻感知（助理也能通过工具自己改）' : 'Persona, stickers, learnings, home city & news'}>
+            <Button size="sm" variant="outline" onClick={() => setPersonaTab('persona')} data-testid="assistant-persona-btn" title={lang === 'zh' ? '人设风格、表情包图库、已学默契、常驻城市与新闻感知（助理也能通过工具自己改）' : 'Persona, stickers, learnings, home city & news'}>
               {lang === 'zh' ? '🎭 人设·表情·感知' : '🎭 Persona'}
             </Button>
             <Button
@@ -1767,6 +1791,7 @@ export function PersonalAssistantSlotView(props: {
                 <Button variant="outline" size="sm" disabled={locked} onClick={() => fileInputRef.current?.click()}>
                   {lang === 'zh' ? (readingImages ? '读取图片…' : '添加图片') : (readingImages ? 'Reading…' : 'Add images')}
                 </Button>
+                <Button variant="outline" size="sm" onClick={() => setPersonaTab('stickers')} data-testid="assistant-stickers-btn">{lang === 'zh' ? '表情包' : 'Stickers'}</Button>
                 <span className="dt-hint">
                   {lang === 'zh' ? '支持粘贴截图 / 拖拽图片 · 最多 8 张' : 'Paste or drop up to 8 images'}
                 </span>
@@ -2386,7 +2411,7 @@ export function PersonalAssistantSlotView(props: {
         </details>
       </section>
 
-      <PersonaAmbientWorkbench lang={lang} open={personaWorkbenchOpen} onClose={() => setPersonaWorkbenchOpen(false)} onAmbientChanged={setAmbientOverride} />
+      <PersonaAmbientWorkbench lang={lang} open={Boolean(personaTab)} initialTab={personaTab} onClose={() => setPersonaTab(undefined)} onAmbientChanged={setAmbientOverride} />
 
       {(() => {
         const fullMsg = fullscreenMsgId ? messages.find(m => m.id === fullscreenMsgId) : undefined

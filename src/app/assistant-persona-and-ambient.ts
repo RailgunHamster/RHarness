@@ -315,7 +315,7 @@ export function resolveStickerFilePath(record: Pick<StickerRecord, 'fileName'>):
   return full
 }
 
-function detectStickerMediaType(buf: Buffer): StickerRecord['mediaType'] | undefined {
+export function detectStickerMediaType(buf: Buffer): StickerRecord['mediaType'] | undefined {
   if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png'
   if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg'
   if (buf.length >= 6 && ['GIF87a', 'GIF89a'].includes(buf.toString('ascii', 0, 6))) return 'image/gif'
