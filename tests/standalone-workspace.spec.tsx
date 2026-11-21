@@ -120,6 +120,35 @@ beforeEach(() => {
 })
 afterEach(() => { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals() })
 
+it('distinguishes unloaded personal records from an empty history and keeps loaded data on a later failure', async () => {
+  const healthyFetch = globalThis.fetch
+  let rejectRequest!: (reason: Error) => void
+  let pending = true
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) =>
+    pending && String(input).endsWith('/standalone/sessions')
+      ? new Promise<Response>((_, reject) => { rejectRequest = reject })
+      : healthyFetch(input, init))
+  await act(async () => root.render(<StandaloneRoot />))
+  const tab = (id: string) => container.querySelector<HTMLButtonElement>(`[data-testid="view-tab-${id}"]`)!
+  expect(container.textContent).toContain('正在读取本机记录')
+  expect(tab('assistant').textContent).not.toContain('(0)')
+  expect(tab('knowledge').textContent).not.toContain('(0)')
+  expect(container.querySelector('[data-testid="assistant-message-stream"]')).toBeNull()
+  await act(async () => rejectRequest(new Error('Offline')))
+  expect(container.textContent).toContain('正在自动重试')
+  pending = false
+  const retry = [...container.querySelectorAll('button')].find(b => b.textContent === '立即重试')!
+  await act(async () => retry.click())
+  expect(tab('assistant').textContent).toContain('(2)')
+  expect(container.querySelectorAll('[data-testid^="assistant-msg-"]')).toHaveLength(2)
+  pending = true
+  await act(async () => tab('knowledge').click())
+  await act(async () => tab('assistant').click())
+  await act(async () => rejectRequest(new Error('Offline again')))
+  expect(container.textContent).toContain('正在自动重试')
+  expect(container.querySelectorAll('[data-testid^="assistant-msg-"]')).toHaveLength(2)
+})
+
 it('renders conversation and input first, management next, and live execution last with direct navigation', async () => {
   await act(async () => root.render(<StandaloneRoot />))
   const chat = container.querySelector('#local-chat')!

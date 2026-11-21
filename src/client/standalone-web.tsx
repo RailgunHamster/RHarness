@@ -2609,6 +2609,9 @@ export function StandaloneRoot() {
   }
   const [mdReaderOpen, setMdReaderOpen] = useState(false)
   const [viewMode, setViewMode] = useState<MainViewSlotId>('assistant')
+  const [hasSnapshot, setHasSnapshot] = useState(false)
+  const [snapshotError, setSnapshotError] = useState('')
+  const [snapshotRetry, setSnapshotRetry] = useState(0)
   const [roleModels, setRoleModels] = useState<RoleModelsSummary>()
   const [modelProfiles, setModelProfiles] = useState<ModelProfilesState>()
   const [deviceGroup, setDeviceGroup] = useState<DeviceGroupSummary>()
@@ -2662,6 +2665,8 @@ export function StandaloneRoot() {
     pipeline?: PipelineRow[]
     serverBuild?: ServerBuildInfo
   }) => {
+    setHasSnapshot(true)
+    setSnapshotError('')
     if (meta.roleModels) setRoleModels(meta.roleModels)
     if (meta.modelProfiles) setModelProfiles(meta.modelProfiles)
     if (meta.deviceGroup) setDeviceGroup(meta.deviceGroup)
@@ -2750,14 +2755,14 @@ export function StandaloneRoot() {
   const tabBarGroups = useMemo(() => groupUIViewSlotsIntoTabBars(enabledSlots), [enabledSlots])
   const [tabBarSelection, setTabBarSelection] = useState<Partial<Record<string, MainViewSlotId>>>({})
   const activeTabBar = tabBarGroups.find(g => g.members.some(m => m.id === viewMode))
-  const slotCounts = {
+  const slotCounts = hasSnapshot ? {
     assistantCount: assistantMessages.length,
     clawfeedCount: clawfeedItems.length,
     memoryCount: memories.length,
     enabledPlugins: plugins.filter(p => p.enabled).length,
     totalPlugins: plugins.length,
     pipelineCount: pipelineRows.length,
-  }
+  } : undefined
   const selectTabBar = (groupId: string) => {
     const group = tabBarGroups.find(g => g.id === groupId)
     if (!group) return
@@ -2954,7 +2959,15 @@ export function StandaloneRoot() {
             </button>)}
           </div>
         )}
-        {viewMode === 'assistant' && <div className="dt-assistant-page"><PersonalAssistantSlotView
+        {['assistant', 'memory-library', 'clawfeed'].includes(viewMode) && (!hasSnapshot || snapshotError) && (
+          <div className="dt-pipeline-card" role="status">
+            {snapshotError ? <>
+              {lang === 'zh' ? '暂时无法读取本机记录，正在自动重试。' : 'Could not load the records from this node. Retrying automatically.'}
+              <Button size="sm" variant="outline" onClick={() => setSnapshotRetry(n => n + 1)}>{lang === 'zh' ? '立即重试' : 'Retry now'}</Button>
+            </> : (lang === 'zh' ? '正在读取本机记录…' : 'Loading records from this node…')}
+          </div>
+        )}
+        {viewMode === 'assistant' && hasSnapshot && <div className="dt-assistant-page"><PersonalAssistantSlotView
           lang={lang}
           messages={assistantMessages}
           liveRun={assistantLiveRun}
@@ -2980,7 +2993,7 @@ export function StandaloneRoot() {
         />
           {plugins.some(p => p.id === 'dsh-personal-skills' && p.enabled) && <PersonalNotices lang={lang} />}
         </div>}
-        {viewMode === 'clawfeed' && <ClawFeedNotificationsSlotView
+        {viewMode === 'clawfeed' && hasSnapshot && <ClawFeedNotificationsSlotView
           lang={lang}
           items={clawfeedItems}
           onItemsUpdated={setClawfeedItems}
@@ -2996,7 +3009,7 @@ export function StandaloneRoot() {
           onMemoryBackupsUpdated={setMemoryBackups}
           onPluginsUpdated={setPlugins}
         />}
-        {viewMode === 'memory-library' && <MemoryAndPluginsSection
+        {viewMode === 'memory-library' && hasSnapshot && <MemoryAndPluginsSection
           lang={lang}
           section="memory"
           memories={memories}
@@ -3045,6 +3058,8 @@ export function StandaloneRoot() {
         preferredSessionId={viewMode === 'assistant' ? 'claw-assistant-main' : undefined}
         onSelectSession={setInspectedSession}
         onMetaUpdate={handleMetaUpdate}
+        onMetaError={setSnapshotError}
+        retryKey={snapshotRetry}
       />
     </main>
     <ReviewSchedule open={scheduleOpen} close={() => setScheduleOpen(false)} lang={lang} />

@@ -246,6 +246,8 @@ export function LiveWorkspace({
   preferredSessionId,
   onSelectSession,
   onMetaUpdate,
+  onMetaError,
+  retryKey,
 }: {
   lang: Lang
   /**
@@ -259,6 +261,8 @@ export function LiveWorkspace({
   inspectedSessionId?: string | undefined
   preferredSessionId?: string | undefined
   onSelectSession?: ((id: string) => void) | undefined
+  onMetaError?: (message: string) => void
+  retryKey?: number
   onMetaUpdate?: ((meta: {
     roleModels?: RoleModelsSummary
     modelProfiles?: ModelProfilesState
@@ -316,12 +320,15 @@ export function LiveWorkspace({
   }, [manual, preferredSessionId])
 
   useEffect(() => {
-    const controller = new AbortController()
+    let stopped = false
+    let request: AbortController
     let timer: ReturnType<typeof setTimeout> | undefined
     const poll = async () => {
+      request = new AbortController()
+      const timeout = setTimeout(() => request.abort(), 15_000)
       try {
-        const result = await standaloneFetch<SessionsPayload>('sessions', 'GET', undefined, controller.signal)
-        if (controller.signal.aborted) return
+        const result = await standaloneFetch<SessionsPayload>('sessions', 'GET', undefined, request.signal)
+        if (stopped) return
         setSessions(result.sessions)
         onMetaUpdate?.({
           ...(result.roleModels ? { roleModels: result.roleModels } : {}),
@@ -348,12 +355,19 @@ export function LiveWorkspace({
           return chooseAutoSession(result.sessions, current, preferredSessionId)
         })
         setError('')
-      } catch (err) { if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err)) }
-      finally { if (!controller.signal.aborted) timer = setTimeout(() => { void poll() }, 2000) }
+      } catch (err) {
+        if (stopped) return
+        const message = err instanceof Error ? err.message : String(err)
+        setError(message)
+        onMetaError?.(message)
+      } finally {
+        clearTimeout(timeout)
+        if (!stopped) timer = setTimeout(() => { void poll() }, 2000)
+      }
     }
     void poll()
-    return () => { controller.abort(); clearTimeout(timer) }
-  }, [manual, preferredSessionId, onMetaUpdate])
+    return () => { stopped = true; request.abort(); clearTimeout(timer) }
+  }, [manual, preferredSessionId, onMetaUpdate, onMetaError, retryKey])
 
   const live = useLiveSession(active ? (selected || undefined) : undefined)
   const ticketId = selected.startsWith('worker-') ? selected.slice('worker-'.length) : undefined

@@ -56,10 +56,10 @@ export interface UIViewSlotPlugin {
    */
   tabBarId?: string
   /** Top-level tab label when this view's tab bar is shown (first member with a `tabBarLabel` wins). */
-  tabBarLabel?: ((lang: Lang, counts: UIViewSlotCounts) => string) | undefined
+  tabBarLabel?: ((lang: Lang, counts?: UIViewSlotCounts) => string) | undefined
   /** Position of the shared tab bar among top-level tabs. Defaults to the smallest member `order`. */
   tabBarOrder?: number | undefined
-  label: (lang: Lang, counts: UIViewSlotCounts) => string
+  label: (lang: Lang, counts?: UIViewSlotCounts) => string
 }
 
 /** A resolved top-level tab: one or more views sharing the same registered tab-bar name. */
@@ -67,7 +67,11 @@ export interface UIViewTabBarGroup {
   id: string
   order: number
   members: UIViewSlotPlugin[]
-  label: (lang: Lang, counts: UIViewSlotCounts) => string
+  label: (lang: Lang, counts?: UIViewSlotCounts) => string
+}
+
+function countedLabel(label: string, count?: number | string): string {
+  return count === undefined ? label : `${label} (${count})`
 }
 
 /** Groups visible views by their registered tab-bar name (`tabBarId`, defaulting to the view id). */
@@ -100,10 +104,7 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
     id: 'assistant',
     pluginId: 'dsh-claw-assistant',
     order: 10,
-    label: (lang, c) =>
-      lang === 'zh'
-        ? `个人助理 (${c.assistantCount})`
-        : `Personal Assistant (${c.assistantCount})`,
+    label: (lang, c) => countedLabel(lang === 'zh' ? '个人助理' : 'Personal Assistant', c?.assistantCount),
   },
   {
     id: 'workbench',
@@ -115,10 +116,7 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
     id: 'clawfeed',
     pluginId: 'dsh-clawfeed',
     order: 25,
-    label: (lang, c) =>
-      lang === 'zh'
-        ? `📱 手机通知 (${c.clawfeedCount})`
-        : `📱 Notifications (${c.clawfeedCount})`,
+    label: (lang, c) => countedLabel(lang === 'zh' ? '📱 手机通知' : '📱 Notifications', c?.clawfeedCount),
   },
   {
     id: 'rhtoolkit',
@@ -134,24 +132,15 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
     order: 30,
     tabBarId: 'knowledge',
     tabBarOrder: 30,
-    tabBarLabel: (lang, c) =>
-      lang === 'zh'
-        ? `记忆与知识库 (${c.memoryCount})`
-        : `Memory & Knowledge (${c.memoryCount})`,
-    label: (lang, c) =>
-      lang === 'zh'
-        ? `🧠 长期记忆库 (${c.memoryCount})`
-        : `🧠 Memory Library (${c.memoryCount})`,
+    tabBarLabel: (lang, c) => countedLabel(lang === 'zh' ? '记忆与知识库' : 'Memory & Knowledge', c?.memoryCount),
+    label: (lang, c) => countedLabel(lang === 'zh' ? '🧠 长期记忆库' : '🧠 Memory Library', c?.memoryCount),
   },
   {
     id: 'siyuan-kb',
     pluginId: 'dsh-personal-skills',
     order: 32,
     tabBarId: 'knowledge',
-    tabBarLabel: (lang, c) =>
-      lang === 'zh'
-        ? `记忆与知识库 (${c.memoryCount})`
-        : `Memory & Knowledge (${c.memoryCount})`,
+    tabBarLabel: (lang, c) => countedLabel(lang === 'zh' ? '记忆与知识库' : 'Memory & Knowledge', c?.memoryCount),
     label: lang => (lang === 'zh' ? '📚 思源知识库' : '📚 SiYuan KB'),
   },
   {
@@ -166,10 +155,7 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
   {
     id: 'plugin-center',
     order: 35,
-    label: (lang, c) =>
-      lang === 'zh'
-        ? `🧩 插件中心 (${c.enabledPlugins}/${c.totalPlugins})`
-        : `🧩 Plugin Center (${c.enabledPlugins}/${c.totalPlugins})`,
+    label: (lang, c) => countedLabel(lang === 'zh' ? '🧩 插件中心' : '🧩 Plugin Center', c && `${c.enabledPlugins}/${c.totalPlugins}`),
   },
   {
     id: 'live-inspector',
@@ -181,10 +167,7 @@ export const BUILTIN_UI_VIEW_SLOTS: UIViewSlotPlugin[] = [
     id: 'pipeline',
     pluginId: 'ui-pipeline',
     order: 40,
-    label: (lang, c) =>
-      lang === 'zh'
-        ? `管线追踪 (${c.pipelineCount})`
-        : `Pipeline (${c.pipelineCount})`,
+    label: (lang, c) => countedLabel(lang === 'zh' ? '管线追踪' : 'Pipeline', c?.pipelineCount),
   },
   {
     id: 'management',
